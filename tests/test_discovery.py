@@ -7,8 +7,8 @@ import platform
 from unittest.mock import patch
 
 from acp_proxy.discovery import (
-    _compatible_path_pattern,
-    _compatible_suffix,
+    _compatible_path_patterns,
+    _compatible_suffixes,
     _filter_process_paths,
     _is_compatible_path,
     _platform_config,
@@ -25,13 +25,24 @@ def _make_path(*segments: str) -> str:
     return os.path.join(home, *segments)
 
 
+def _with_unsupported_ide_version(path: str) -> str:
+    """Replace the supported IDE component in a compatible path with an unsupported one."""
+    parts = os.path.normpath(path).split(os.sep)
+    for index, part in enumerate(parts):
+        if part.startswith(("IntelliJIdea", "PyCharm")):
+            parts[index] = "IntelliJIdea2025.2"
+            return os.sep.join(parts)
+    raise AssertionError(f"No IDE component found in path: {path}")
+
+
 class TestIsCompatiblePath:
-    """_is_compatible_path checks: under home, contains IntelliJIdea2025.3, correct binary name."""
+    """_is_compatible_path checks home, supported IDE version, and binary name."""
 
     def test_correct_path_matches(self):
         """The exact expected path is accepted."""
-        expected = _compatible_path_pattern()
-        assert _is_compatible_path(expected)
+        expected = _compatible_path_patterns()
+
+        assert all(_is_compatible_path(e) for e in expected)
 
     def test_alternative_directory_structure_accepted(self):
         """A path with different intermediate dirs but correct home/IDE/binary is accepted."""
@@ -47,17 +58,6 @@ class TestIsCompatiblePath:
         )
         assert _is_compatible_path(alt)
 
-    def test_pycharm_rejected(self):
-        """A PyCharm binary is not compatible — wrong IDE directory."""
-        cfg = _platform_config()
-        bad = _make_path(
-            "Library/Application Support/JetBrains",
-            "PyCharm2025.3",
-            "plugins/github-copilot-intellij/copilot-agent/native",
-            cfg["arch"],
-            cfg["binary_name"],
-        )
-        assert not _is_compatible_path(bad)
 
     def test_older_intellij_rejected(self):
         """An older IntelliJ version is not compatible."""
@@ -125,10 +125,10 @@ class TestIsCompatiblePath:
 
     def test_home_directory_is_prefix_not_substring(self):
         """The home directory check uses a prefix match, not a substring match."""
-        expected = _compatible_path_pattern()
         home = _user_home()
-        bad = expected.replace(home, home + "2")
-        assert not _is_compatible_path(bad)
+        for expected in _compatible_path_patterns():
+            bad = expected.replace(home, home + "2")
+            assert not _is_compatible_path(bad)
 
     def test_ide_dir_as_substring_rejected(self):
         """IntelliJIdea2025.3 must be a path component, not a substring."""
@@ -144,19 +144,11 @@ class TestIsCompatiblePath:
 class TestCompatibleSuffix:
     """_compatible_suffix returns the IDE-and-below portion of the path."""
 
-    def test_suffix_starts_with_ide_dir(self):
-        suffix = _compatible_suffix()
-        assert suffix.startswith("IntelliJIdea2025.3")
 
     def test_suffix_ends_with_binary_name(self):
         cfg = _platform_config()
-        suffix = _compatible_suffix()
-        assert suffix.endswith(cfg["binary_name"])
-
-    def test_suffix_is_subset_of_full_path(self):
-        full = _compatible_path_pattern()
-        suffix = _compatible_suffix()
-        assert full.endswith(suffix)
+        suffixes = _compatible_suffixes()
+        assert all(suffix.endswith(cfg["binary_name"]) for suffix in suffixes)
 
 
 class TestPlatformConfig:
@@ -164,12 +156,8 @@ class TestPlatformConfig:
 
     def test_config_has_required_keys(self):
         cfg = _platform_config()
-        for key in ("base", "arch", "binary_name", "ide_dir", "home"):
+        for key in ("base", "arch", "binary_name", "home"):
             assert key in cfg
-
-    def test_ide_dir_is_intellij_2025_3(self):
-        cfg = _platform_config()
-        assert cfg["ide_dir"] == "IntelliJIdea2025.3"
 
     def test_binary_name_platform_appropriate(self):
         cfg = _platform_config()
@@ -186,100 +174,89 @@ class TestPlatformConfig:
 class TestFilterProcessPaths:
     """_filter_process_paths applies compatibility filtering to process output."""
 
-    def test_compatible_path_accepted(self):
-        expected = _compatible_path_pattern()
-        lines = [f"{expected} --acp --stdio"]
-        result = _filter_process_paths(lines, separator=" --")
-        assert result == expected
-
-    def test_incompatible_path_rejected(self):
-        bad = _compatible_path_pattern().replace("IntelliJIdea2025.3", "PyCharm2025.3")
-        lines = [f"{bad} --acp --stdio"]
-        result = _filter_process_paths(lines, separator=" --")
-        assert result is None
-
     def test_no_separator_uses_full_line(self):
         """When separator is None, the full line is used as the path (Windows style)."""
-        expected = _compatible_path_pattern()
-        lines = [f"  {expected}  "]
-        result = _filter_process_paths(lines, separator=None)
-        assert result == expected
+        for expected in _compatible_path_patterns():
+            lines = [f"  {expected}  "]
+            result = _filter_process_paths(lines, separator=None)
+            assert result == expected
 
     def test_grep_lines_filtered(self):
-        expected = _compatible_path_pattern()
-        lines = [
-            "grep copilot-language-server",
-            f"{expected} --acp --stdio",
-        ]
-        result = _filter_process_paths(lines, separator=" --")
-        assert result == expected
+        for expected in _compatible_path_patterns():
+            lines = [
+                "grep copilot-language-server",
+                f"{expected} --acp --stdio",
+            ]
+            result = _filter_process_paths(lines, separator=" --")
+            assert result == expected
 
     def test_duplicates_deduplicated(self):
-        expected = _compatible_path_pattern()
-        lines = [
-            f"{expected} --acp --stdio",
-            f"{expected} --acp --stdio --other",
-        ]
-        result = _filter_process_paths(lines, separator=" --")
-        assert result == expected
+        for expected in _compatible_path_patterns():
+            lines = [
+                f"{expected} --acp --stdio",
+                f"{expected} --acp --stdio --other",
+            ]
+            result = _filter_process_paths(lines, separator=" --")
+            assert result == expected
 
     def test_empty_lines_ignored(self):
         result = _filter_process_paths(["", "  ", "\n"], separator=" --")
         assert result is None
 
     def test_mixed_compatible_and_incompatible(self):
-        expected = _compatible_path_pattern()
-        bad = expected.replace("IntelliJIdea2025.3", "PyCharm2025.3")
-        lines = [
-            f"{bad} --acp --stdio",
-            f"{expected} --acp --stdio",
-        ]
-        result = _filter_process_paths(lines, separator=" --")
-        assert result == expected
+        for expected in _compatible_path_patterns():
+            bad = _with_unsupported_ide_version(expected)
+            lines = [
+                f"{bad} --acp --stdio",
+                f"{expected} --acp --stdio",
+            ]
+            result = _filter_process_paths(lines, separator=" --")
+            assert result == expected
 
 
 class TestFindBinaryFromProcesses:
     """Process-based discovery dispatches to the correct platform implementation."""
 
-    def _expected_path(self) -> str:
-        return _compatible_path_pattern()
+    def _expected_paths(self) -> list[str]:
+        return _compatible_path_patterns()
 
     def test_compatible_binary_found(self):
         """A running process with the compatible path is returned."""
-        expected = self._expected_path()
-        ps_output = f"COMMAND\n{expected} --acp --stdio\n/usr/bin/python3 script.py\n"
-        with patch("subprocess.check_output", return_value=ps_output):
-            result = find_binary_from_processes()
-        assert result == expected
+        for expected in self._expected_paths():
+            ps_output = f"COMMAND\n{expected} --acp --stdio\n/usr/bin/python3 script.py\n"
+            with patch("subprocess.check_output", return_value=ps_output):
+                result = find_binary_from_processes()
+            assert result == expected
 
     def test_incompatible_binary_rejected(self):
-        """A running copilot-language-server from the wrong IDE is rejected."""
-        bad_path = self._expected_path().replace("IntelliJIdea2025.3", "PyCharm2025.3")
-        ps_output = f"COMMAND\n{bad_path} --acp --stdio\n"
-        with patch("subprocess.check_output", return_value=ps_output):
-            result = find_binary_from_processes()
-        assert result is None
+        """A running copilot-language-server from an unsupported IDE version is rejected."""
+        for expected in self._expected_paths():
+            bad_path = _with_unsupported_ide_version(expected)
+            ps_output = f"COMMAND\n{bad_path} --acp --stdio\n"
+            with patch("subprocess.check_output", return_value=ps_output):
+                result = find_binary_from_processes()
+            assert result is None
 
     def test_mixed_compatible_and_incompatible(self):
         """Only the compatible binary is returned when both are running."""
-        expected = self._expected_path()
-        bad_path = self._expected_path().replace("IntelliJIdea2025.3", "PyCharm2025.3")
-        ps_output = f"COMMAND\n{bad_path} --acp --stdio\n{expected} --acp --stdio\n"
-        with patch("subprocess.check_output", return_value=ps_output):
-            result = find_binary_from_processes()
-        assert result == expected
+        for expected in self._expected_paths():
+            bad_path = _with_unsupported_ide_version(expected)
+            ps_output = f"COMMAND\n{bad_path} --acp --stdio\n{expected} --acp --stdio\n"
+            with patch("subprocess.check_output", return_value=ps_output):
+                result = find_binary_from_processes()
+            assert result == expected
 
     def test_duplicate_processes_deduplicated(self):
         """Same binary appearing multiple times in ps is deduplicated."""
-        expected = self._expected_path()
-        ps_output = (
-            "COMMAND\n"
-            f"{expected} --acp --stdio\n"
-            f"{expected} --acp --stdio --some-other-flag\n"
-        )
-        with patch("subprocess.check_output", return_value=ps_output):
-            result = find_binary_from_processes()
-        assert result == expected
+        for expected in self._expected_paths():
+            ps_output = (
+                "COMMAND\n"
+                f"{expected} --acp --stdio\n"
+                f"{expected} --acp --stdio --some-other-flag\n"
+            )
+            with patch("subprocess.check_output", return_value=ps_output):
+                result = find_binary_from_processes()
+            assert result == expected
 
     def test_no_copilot_processes(self):
         """No copilot-language-server in ps output returns None."""
@@ -296,11 +273,11 @@ class TestFindBinaryFromProcesses:
 
     def test_grep_lines_filtered(self):
         """Lines containing 'grep' are excluded (standard ps filtering)."""
-        expected = self._expected_path()
-        ps_output = f"COMMAND\ngrep copilot-language-server\n{expected} --acp --stdio\n"
-        with patch("subprocess.check_output", return_value=ps_output):
-            result = find_binary_from_processes()
-        assert result == expected
+        for expected in self._expected_paths():
+            ps_output = f"COMMAND\ngrep copilot-language-server\n{expected} --acp --stdio\n"
+            with patch("subprocess.check_output", return_value=ps_output):
+                result = find_binary_from_processes()
+            assert result == expected
 
 
 class TestWindowsProcessDiscovery:
@@ -386,20 +363,6 @@ class TestWindowsProcessDiscovery:
             result = find_binary_from_processes()
         assert result is None
 
-    def test_incompatible_path_rejected_on_windows(self):
-        """A PyCharm binary from Windows process listing is rejected."""
-        bad = _compatible_path_pattern().replace("IntelliJIdea2025.3", "PyCharm2025.1")
-        with (
-            patch("platform.system", return_value="Windows"),
-            patch(
-                "acp_proxy.discovery._query_processes_powershell",
-                return_value=[bad],
-            ),
-        ):
-            result = find_binary_from_processes()
-        assert result is None
-
-
 class TestFindBinaryFromJetbrains:
     """Filesystem-based discovery (ADR-006): checks expected path on disk."""
 
@@ -407,8 +370,8 @@ class TestFindBinaryFromJetbrains:
         """Returns path when binary exists and is executable."""
         with (
             patch(
-                "acp_proxy.discovery._compatible_path_pattern",
-                return_value=str(tmp_path / "binary"),
+                "acp_proxy.discovery._compatible_path_patterns",
+                return_value=[str(tmp_path / "binary")],
             ),
             patch("os.path.isfile", return_value=True),
             patch("os.access", return_value=True),
