@@ -24,7 +24,7 @@ import subprocess
 logger = logging.getLogger(__name__)
 
 # The IDE directory names that identify compatible IntelliJ versions.
-_IDE_DIRS = ("IntelliJIdea2025.3", "IntelliJIdea2026.1")
+_IDE_DIRS = ("IntelliJIdea2025.3", "IntelliJIdea2026.1", "PyCharm2025.3", "PyCharm2026.1")
 
 _PLUGIN_SUFFIX_PARTS = (
     "plugins",
