@@ -155,8 +155,15 @@ Key references: [session setup](https://agentclientprotocol.com/protocol/session
 | Flag              | Default           | Description                                                                    |
 |-------------------|-------------------|--------------------------------------------------------------------------------|
 | `--binary`        | auto-discovered   | Path to `copilot-language-server`                                              |
+| `--host`          | 127.0.0.1         | Address on which the HTTP server listens                                       |
 | `--port`          | 8765              | Port for the HTTP server                                                       |
 | `--cwd`           | current directory | Working directory for ACP sessions (default: `cwd` where acp_proxy is executed |
 | `--log-level`     | DEBUG             | DEBUG, INFO, WARNING, ERROR (DEBUG default during development phase)            |
 | `--log-file`      | logs/proxy.log    | Log file path (always DEBUG level)                                             |
 | `--system-prompt` | none              | Path to a file containing a system prompt to inject into each new session      |
+
+The default bind is loopback-only. Passing `--host 0.0.0.0` exposes the
+unauthenticated proxy on every IPv4 interface visible to the process; use it
+only inside an isolated container or on a trusted network. Meadow's Podman mode
+binds this address inside the container while publishing the host port only on
+`127.0.0.1`.

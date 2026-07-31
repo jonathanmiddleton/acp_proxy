@@ -10,6 +10,7 @@ Usage:
 
     --binary PATH       Path to copilot-language-server binary.
                         Auto-discovered if omitted (IntelliJ 2025.3 plugin only).
+    --host HOST         Address to bind (default: 127.0.0.1).
     --port PORT         Port to listen on (default: 8765). Use 0 for ephemeral.
     --cwd PATH          Working directory for ACP sessions (default: current dir)
     --log-level LEVEL   Console logging level (default: DEBUG)
@@ -82,7 +83,9 @@ def _configure_logging(console_level: str, log_file: str) -> None:
         uv_logger.propagate = True
 
 
-def _write_metadata_file(path: str, port: int) -> None:
+def _write_metadata_file(
+    path: str, port: int, host: str = "127.0.0.1"
+) -> None:
     """Write a JSON metadata file with process info and readiness status.
 
     This file doubles as a readiness signal — its existence means the
@@ -94,7 +97,7 @@ def _write_metadata_file(path: str, port: int) -> None:
     metadata = {
         "pid": os.getpid(),
         "port": port,
-        "host": "127.0.0.1",
+        "host": host,
         "status": "ready",
     }
     metadata_dir = os.path.dirname(path) or "."
@@ -129,6 +132,7 @@ async def run(
     system_prompt: str | None = None,
     subprocess_env: dict[str, str] | None = None,
     metadata_file: str | None = None,
+    host: str = "127.0.0.1",
 ) -> None:
     """Start the ACP client and HTTP server."""
     client = AcpClient(binary)
@@ -144,7 +148,7 @@ async def run(
 
     config = uvicorn.Config(
         app,
-        host="127.0.0.1",
+        host=host,
         port=port,
         log_level="warning",  # Suppress uvicorn's own logging; we route via root
     )
@@ -195,15 +199,16 @@ async def run(
     try:
         # --- Phase 1b: write metadata file before main_loop (readiness signal) ---
         if metadata_file is not None:
-            _write_metadata_file(metadata_file, actual_port)
+            _write_metadata_file(metadata_file, actual_port, host=host)
 
         # Run the server main loop in a background task
         server_task = asyncio.create_task(server.main_loop())
 
-        logger.info("Proxy listening on http://127.0.0.1:%d", actual_port)
-        logger.info("Models endpoint: http://127.0.0.1:%d/v1/models", actual_port)
+        logger.info("Proxy listening on http://%s:%d", host, actual_port)
+        logger.info("Models endpoint: http://%s:%d/v1/models", host, actual_port)
         logger.info(
-            "Completions endpoint: http://127.0.0.1:%d/v1/chat/completions",
+            "Completions endpoint: http://%s:%d/v1/chat/completions",
+            host,
             actual_port,
         )
 
@@ -227,13 +232,22 @@ async def run(
         logger.info("Proxy stopped.")
 
 
-def main() -> None:
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser without starting external services."""
     parser = argparse.ArgumentParser(
         description="ACP-to-OpenAI proxy for copilot-language-server"
     )
     parser.add_argument(
         "--binary",
         help="Path to copilot-language-server binary (auto-discovered if omitted)",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help=(
+            "Address to bind (default: 127.0.0.1; "
+            "0.0.0.0 exposes all IPv4 interfaces)"
+        ),
     )
     parser.add_argument(
         "--port",
@@ -271,7 +285,11 @@ def main() -> None:
         help="Comma-separated list of context filenames to inject, or 'none' to disable. "
         "Default: AGENTS.md,CLAUDE.md,COPILOT-INSTRUCTIONS.md",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = _build_parser().parse_args()
 
     _configure_logging(args.log_level, args.log_file)
 
@@ -334,6 +352,7 @@ def main() -> None:
             system_prompt=system_prompt,
             subprocess_env=subprocess_env,
             metadata_file=args.metadata_file,
+            host=args.host,
         )
     )
 

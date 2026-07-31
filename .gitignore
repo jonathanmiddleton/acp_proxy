@@ -7,3 +7,6 @@ __pycache__/
 ./logs/
 experiments/*/logs/
 .DS_Store
+logs/
+.meadow/
+tmp/
