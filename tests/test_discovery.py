@@ -6,6 +6,9 @@ import os
 import platform
 from unittest.mock import patch
 
+import pytest
+
+from acp_proxy import discovery
 from acp_proxy.discovery import (
     _compatible_path_patterns,
     _compatible_suffixes,
@@ -17,6 +20,19 @@ from acp_proxy.discovery import (
     find_binary_from_jetbrains,
     find_binary_from_processes,
 )
+
+
+@pytest.fixture(autouse=True)
+def _admit_path_shape_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep legacy path-shape tests focused below the version-probe seam."""
+
+    def inspect(path: str, *, require_supported_path: bool) -> object:
+        return discovery.BinaryAdmission(
+            path=os.path.realpath(path),
+            version=discovery.MIN_COPILOT_LANGUAGE_SERVER_VERSION,
+        )
+
+    monkeypatch.setattr(discovery, "_inspect_binary", inspect)
 
 
 def _make_path(*segments: str) -> str:
@@ -388,41 +404,70 @@ class TestFindBinaryFromJetbrains:
         assert result is None
 
 
-class TestFindBinaryFallback:
-    """find_binary tries processes first, then filesystem (ADR-006)."""
+class TestFindBinarySelection:
+    """find_binary ranks the union of process and filesystem candidates."""
 
-    def test_processes_checked_first(self):
-        """If processes find a binary, filesystem is not checked."""
-        with (
-            patch(
-                "acp_proxy.discovery.find_binary_from_processes",
-                return_value="/found/from/ps",
-            ) as mock_ps,
-            patch("acp_proxy.discovery.find_binary_from_jetbrains") as mock_jb,
-        ):
-            result = find_binary()
-        assert result == "/found/from/ps"
-        mock_ps.assert_called_once()
-        mock_jb.assert_not_called()
+    def test_higher_filesystem_version_beats_running_process(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        process_path = "/candidate/process"
+        disk_path = "/candidate/disk"
+        monkeypatch.setattr(
+            discovery,
+            "_candidate_paths_from_processes",
+            lambda: [process_path],
+        )
+        monkeypatch.setattr(
+            discovery,
+            "_candidate_paths_from_jetbrains",
+            lambda: [disk_path],
+        )
 
-    def test_falls_back_to_filesystem(self):
-        """If processes find nothing, filesystem is checked."""
-        with (
-            patch("acp_proxy.discovery.find_binary_from_processes", return_value=None),
-            patch(
-                "acp_proxy.discovery.find_binary_from_jetbrains",
-                return_value="/found/on/disk",
-            ) as mock_jb,
-        ):
-            result = find_binary()
-        assert result == "/found/on/disk"
-        mock_jb.assert_called_once()
+        def inspect(path: str, *, require_supported_path: bool) -> object:
+            version = (1, 523, 3) if path == process_path else (1, 600, 0)
+            return discovery.BinaryAdmission(path=path, version=version)
 
-    def test_both_fail_returns_none(self):
-        """If neither source finds a binary, returns None."""
-        with (
-            patch("acp_proxy.discovery.find_binary_from_processes", return_value=None),
-            patch("acp_proxy.discovery.find_binary_from_jetbrains", return_value=None),
-        ):
-            result = find_binary()
-        assert result is None
+        monkeypatch.setattr(discovery, "_inspect_binary", inspect)
+
+        assert find_binary() == disk_path
+
+    def test_empty_union_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            discovery,
+            "_candidate_paths_from_processes",
+            list,
+        )
+        monkeypatch.setattr(
+            discovery,
+            "_candidate_paths_from_jetbrains",
+            list,
+        )
+
+        assert find_binary() is None
+
+    def test_old_only_union_reports_observed_and_required_versions(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            discovery,
+            "_candidate_paths_from_processes",
+            lambda: ["/candidate/old"],
+        )
+        monkeypatch.setattr(
+            discovery,
+            "_candidate_paths_from_jetbrains",
+            list,
+        )
+
+        def reject(path: str, *, require_supported_path: bool) -> object:
+            raise discovery.BinaryCompatibilityError(
+                "copilot-language-server version 1.457.1 is below required "
+                "minimum 1.523.3"
+            )
+
+        monkeypatch.setattr(discovery, "_inspect_binary", reject)
+
+        with pytest.raises(discovery.BinaryCompatibilityError) as exc_info:
+            find_binary()
+        assert "1.457.1" in str(exc_info.value)
+        assert "1.523.3" in str(exc_info.value)

@@ -35,7 +35,7 @@ import tempfile
 
 import uvicorn
 
-from .client import AcpClient, CallbackPolicy
+from .client import AcpClient, CallbackPolicy, ModelAcknowledgementError
 from .config import (
     build_subprocess_env,
     compose_system_prompt,
@@ -45,7 +45,13 @@ from .config import (
 from .direct_protocol import DirectLimits
 from .direct_server import create_direct_app
 from .direct_service import DirectService
-from .discovery import find_binary
+from .discovery import (
+    MIN_COPILOT_LANGUAGE_SERVER_VERSION,
+    BinaryAdmission,
+    BinaryCompatibilityError,
+    admit_compatible_binary,
+    find_binary,
+)
 from .server import create_app
 
 logger = logging.getLogger(__name__)
@@ -109,6 +115,22 @@ def _direct_child_env(source: dict[str, str]) -> dict[str, str]:
         for key, value in source.items()
         if key in DIRECT_CHILD_ENV_KEYS or key.startswith("LC_")
     }
+
+
+def _direct_binary_capability_error(
+    admission: BinaryAdmission,
+    capability: str,
+) -> BinaryCompatibilityError:
+    """Build a versioned, model-text-safe direct compatibility diagnostic."""
+
+    observed = ".".join(str(part) for part in admission.version)
+    required = ".".join(
+        str(part) for part in MIN_COPILOT_LANGUAGE_SERVER_VERSION
+    )
+    return BinaryCompatibilityError(
+        f"copilot-language-server version {observed} meets required minimum "
+        f"{required} but failed required direct capability: {capability}"
+    )
 
 
 def _configure_logging(console_level: str, log_file: str) -> None:
@@ -264,6 +286,8 @@ async def run(
         system_prompt=system_prompt,
         direct_limits=direct_limits,
     )
+    admission = await asyncio.to_thread(admit_compatible_binary, binary)
+    binary = admission.path
     if consumer_mode == "opencode-legacy":
         logger.warning(
             "opencode-legacy mode is deprecated and will be removed in acp-proxy 0.3.0"
@@ -302,8 +326,25 @@ async def run(
         # are read-only and never create additional ACP sessions.
         catalog_session_id = await client.create_session(cwd)
         if consumer_mode == "meadow-direct":
+            default_model = client.default_model
+            if not isinstance(default_model, str) or not default_model:
+                raise _direct_binary_capability_error(
+                    admission,
+                    "startup model catalog with a usable default model",
+                )
+            try:
+                await client.acknowledge_session_model(
+                    catalog_session_id,
+                    default_model,
+                )
+            except ModelAcknowledgementError:
+                raise _direct_binary_capability_error(
+                    admission,
+                    "session/set_config_option complete exact-model acknowledgement",
+                ) from None
             logger.info(
-                "Created non-prompted catalog-probe ACP session; "
+                "Created and exactly acknowledged non-prompted catalog-probe "
+                "ACP session; "
                 "backend close is unsupported"
             )
         else:
@@ -544,23 +585,28 @@ def main() -> None:
 
     _configure_logging(args.log_level, args.log_file)
 
-    binary = args.binary
-    if not binary:
-        logger.info("Auto-discovering compatible copilot-language-server...")
-        binary = find_binary()
-    if not binary:
-        logger.error(
-            "Could not find a compatible copilot-language-server binary. "
-            "Supported JetBrains IDE/version paths are defined by discovery.py. "
-            "Pass --binary /path/to/copilot-language-server to override."
-        )
-        sys.exit(1)
-
     try:
         launch_secret = _validate_mode_options(args)
     except ValueError as exc:
         logger.error("Invalid consumer-mode configuration: %s", exc)
         sys.exit(2)
+
+    binary = args.binary
+    if not binary:
+        logger.info("Auto-discovering compatible copilot-language-server...")
+        try:
+            binary = find_binary()
+        except BinaryCompatibilityError as exc:
+            logger.error("Incompatible copilot-language-server: %s", exc)
+            sys.exit(1)
+    if not binary:
+        logger.error(
+            "Could not find a compatible copilot-language-server binary. "
+            "Supported JetBrains paths and the minimum language-server version "
+            "are defined by discovery.py. Pass --binary only to select another "
+            "version-admitted executable."
+        )
+        sys.exit(1)
 
     explicit_prompt = None
     if args.consumer_mode == "opencode-legacy" and args.system_prompt:
@@ -604,20 +650,24 @@ def main() -> None:
         else:
             logger.info("No legacy system prompt configured")
 
-    asyncio.run(
-        run(
-            binary,
-            args.port,
-            args.cwd,
-            system_prompt=system_prompt,
-            subprocess_env=subprocess_env,
-            metadata_file=args.metadata_file,
-            host=args.host,
-            consumer_mode=args.consumer_mode,
-            launch_secret=launch_secret,
-            execution_authority=args.execution_authority,
+    try:
+        asyncio.run(
+            run(
+                binary,
+                args.port,
+                args.cwd,
+                system_prompt=system_prompt,
+                subprocess_env=subprocess_env,
+                metadata_file=args.metadata_file,
+                host=args.host,
+                consumer_mode=args.consumer_mode,
+                launch_secret=launch_secret,
+                execution_authority=args.execution_authority,
+            )
         )
-    )
+    except BinaryCompatibilityError as exc:
+        logger.error("Incompatible copilot-language-server: %s", exc)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

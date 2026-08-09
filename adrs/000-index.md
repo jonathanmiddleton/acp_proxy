@@ -10,7 +10,7 @@ See [GUIDE.md](GUIDE.md) for how and when to write ADRs.
 - [ADR-004: Extract Only the Last User Message for ACP Sessions](004-last-user-message-extraction.md) — legacy mode only
 - [ADR-007: The ACP Server Owns Tools — Do Not Inject or Override](007-tool-ownership.md) — amended for direct callbacks
 - [ADR-011: Context Injection — Proxy Responsibilities and Consumer Boundary](011-context-injection-boundary.md) — legacy mode only
-- [ADR-012: Authenticated Meadow-Direct Consumer Protocol](012-meadow-direct-consumer-protocol.md)
+- [ADR-012: Authenticated Meadow-Direct Consumer Protocol](012-meadow-direct-consumer-protocol.md) — exact catalog-session acknowledgement before readiness
 
 ## Session and conversation management
 
@@ -19,7 +19,7 @@ See [GUIDE.md](GUIDE.md) for how and when to write ADRs.
 
 ## Binary lifecycle and deployment
 
-- [ADR-006: Version-Bounded JetBrains Binary Discovery](006-binary-discovery.md)
+- [ADR-006: Version-Bounded JetBrains Binary Discovery](006-binary-discovery.md) — global 1.523.3 floor and deterministic candidate selection
 - [ADR-008: Proxy as Substrate — Installable Command, cwd as Workspace](008-proxy-as-substrate.md) — amended by direct startup policy
 
 ## Testing and quality

@@ -44,8 +44,11 @@ path.** This proves the native connection sends OpenCode's tool definitions
 directly to Copilot's API as structured function definitions, bypassing the
 LSP. Through the proxy, custom tools are invisible.
 
-**`session/set_config_option` returns "Method not found."** There is no
-known ACP method to configure which tools the server exposes.
+**The older experimental binary returned "Method not found" for
+`session/set_config_option`.** The currently admitted 1.523.3+ language server
+supports that method for exact model configuration. Its complete model
+`configOptions` acknowledgement does not expose a tool-visibility control, and
+no known ACP method configures which tools the server exposes.
 
 ## Decision
 

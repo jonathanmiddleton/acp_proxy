@@ -335,23 +335,66 @@ class AcpClient:
                 f"Model {model_id!r} is not advertised. Available: {sorted(available)}"
             )
         session_id = await self.create_session(cwd)
+        observed = await self.acknowledge_session_model(session_id, model_id)
+        return AcpSessionDescriptor(session_id=session_id, model_id=observed)
+
+    async def acknowledge_session_model(
+        self, session_id: str, model_id: str
+    ) -> str:
+        """Require complete exact model acknowledgement on an existing session.
+
+        Direct startup uses this on its one non-prompted catalog session. Every
+        logical direct session uses the same primitive independently; startup
+        proof is never treated as acknowledgement for later sessions.
+        """
+
+        if session_id not in self._sessions:
+            raise ModelAcknowledgementError(
+                "cannot prove model configuration for an unknown ACP session"
+            )
         expected_model_updates = getattr(self, "_expected_model_updates", None)
         if expected_model_updates is None:
             expected_model_updates = {}
             self._expected_model_updates = expected_model_updates
         expected_model_updates[session_id] = model_id
         try:
-            result = await self._transport.send_request(
-                "session/set_config_option",
-                {"sessionId": session_id, "configId": "model", "value": model_id},
-            )
+            try:
+                result = await self._transport.send_request(
+                    "session/set_config_option",
+                    {
+                        "sessionId": session_id,
+                        "configId": "model",
+                        "value": model_id,
+                    },
+                )
+            except AcpError as exc:
+                method_missing = exc.error_obj.get("code") == -32601
+                if method_missing:
+                    logger.error(
+                        "ACP agent does not expose the required exact model "
+                        "configuration method"
+                    )
+                    message = (
+                        "copilot-language-server does not expose required exact "
+                        "model configuration"
+                    )
+                else:
+                    logger.error(
+                        "Could not prove the required exact model configuration "
+                        "capability"
+                    )
+                    message = (
+                        "could not prove copilot-language-server required exact "
+                        "model configuration"
+                    )
+                raise ModelAcknowledgementError(message) from None
         finally:
             expected_model_updates.pop(session_id, None)
         observed = self._model_from_config_options(result)
         if observed != model_id:
             self._sessions[session_id].model_id = None
             raise ModelAcknowledgementError(
-                f"ACP acknowledged model {observed!r}; requested {model_id!r}"
+                "copilot-language-server did not acknowledge the requested exact model"
             )
         self._sessions[session_id].model_id = observed
         if (
@@ -363,10 +406,14 @@ class AcpClient:
             logger.info(
                 "ACP acknowledged model %s for session %s", observed, session_id
             )
-        return AcpSessionDescriptor(session_id=session_id, model_id=observed)
+        return observed
 
     @staticmethod
     def _model_from_config_options(result: dict[str, Any]) -> str:
+        if not isinstance(result, dict):
+            raise ModelAcknowledgementError(
+                "session/set_config_option did not return complete configOptions"
+            )
         options = result.get("configOptions")
         if not isinstance(options, list):
             raise ModelAcknowledgementError(

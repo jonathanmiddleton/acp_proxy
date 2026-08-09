@@ -71,9 +71,18 @@ confinement. This profile also does not claim that ACP-agent internal tools are
 callback-confined.
 
 Startup creates exactly one internal, non-prompted ACP session to discover the
-model catalog. That session is not a Meadow logical session. Capability reads
-create no sessions. Backend close is reported as unsupported until ACP
-negotiation proves otherwise.
+model catalog. Before HTTP readiness, that same session must prove
+`session/set_config_option` by returning the complete `configOptions` state
+with the catalog default as the exact model `currentValue`. Method absence,
+malformed or incomplete state, or a different current model fails startup;
+there is no acknowledgement-free fallback. That session is not a Meadow
+logical session. Capability reads create no sessions. Backend close is reported
+as unsupported until ACP negotiation proves otherwise.
+
+ADR-006 owns executable discovery and the global minimum language-server
+version. Direct startup adds this behavioral capability proof because version
+admission alone is not exact model acknowledgement. Every later logical
+session independently repeats the same complete exact-model proof.
 
 This internal catalog session is control-plane startup work and necessarily
 precedes inbound authentication because ACP initialization has no catalog.

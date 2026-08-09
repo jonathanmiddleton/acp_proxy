@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -12,7 +14,34 @@ from typing import Any
 import pytest
 
 from acp_proxy import __main__ as cli
+from acp_proxy import discovery
+from acp_proxy.client import ModelAcknowledgementError
 from acp_proxy.direct_protocol import CreateSessionRequest, PromptRequest
+from acp_proxy.discovery import BinaryAdmission, BinaryCompatibilityError
+
+
+@pytest.fixture(autouse=True)
+def _admit_unit_test_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep server-wiring tests isolated from the real executable boundary."""
+
+    monkeypatch.setattr(
+        cli,
+        "admit_compatible_binary",
+        lambda path: BinaryAdmission(path=path, version=(1, 523, 3)),
+    )
+
+
+def _old_version_executable(tmp_path: Path) -> str:
+    """Create a real executable whose only behavior is an old version report."""
+
+    if os.name == "nt":
+        path = tmp_path / "copilot-language-server.cmd"
+        path.write_text("@echo 1.457.1\r\n", encoding="utf-8")
+    else:
+        path = tmp_path / "copilot-language-server"
+        path.write_text("#!/bin/sh\nprintf '1.457.1\\n'\n", encoding="utf-8")
+    path.chmod(0o755)
+    return str(path)
 
 
 @pytest.mark.parametrize(
@@ -116,10 +145,300 @@ async def test_run_passes_requested_bind_host_to_uvicorn(
     assert observed["shutdown"] is True
 
 
+@pytest.mark.asyncio
+async def test_programmatic_run_rejects_old_binary_before_client_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The programmatic entry point cannot bypass production admission."""
+
+    class ForbiddenClient:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("old binary reached AcpClient construction")
+
+    old_binary = _old_version_executable(tmp_path)
+    monkeypatch.setattr(cli, "admit_compatible_binary", discovery.admit_compatible_binary)
+    monkeypatch.setattr(cli, "AcpClient", ForbiddenClient)
+
+    with pytest.raises(BinaryCompatibilityError, match="1.457.1"):
+        await cli.run(
+            old_binary,
+            8765,
+            "/workspace",
+            consumer_mode="meadow-direct",
+            launch_secret="s" * 48,
+            execution_authority="trusted-host",
+        )
+
+
+def test_cli_explicit_old_binary_fails_before_client_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CLI ``--binary`` path crosses the same real version boundary."""
+
+    class ForbiddenClient:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("old binary reached AcpClient construction")
+
+    old_binary = _old_version_executable(tmp_path)
+    monkeypatch.setattr(cli, "admit_compatible_binary", discovery.admit_compatible_binary)
+    monkeypatch.setattr(cli, "AcpClient", ForbiddenClient)
+    monkeypatch.setattr(cli, "_configure_logging", lambda *_args: None)
+    monkeypatch.setattr(cli, "load_config", dict)
+    monkeypatch.setattr(cli, "build_subprocess_env", lambda _cfg: {})
+    monkeypatch.setattr(cli, "config_path", lambda: tmp_path / "config.json")
+    monkeypatch.setenv(cli.DIRECT_SECRET_ENV, "s" * 48)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "acp-proxy",
+            "--consumer-mode",
+            "meadow-direct",
+            "--execution-authority",
+            "trusted-host",
+            "--binary",
+            old_binary,
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+    assert exc_info.value.code == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_mode_shares_the_global_binary_floor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deprecation does not create a weaker language-server admission path."""
+
+    old_binary = _old_version_executable(tmp_path)
+    monkeypatch.setattr(cli, "admit_compatible_binary", discovery.admit_compatible_binary)
+
+    with pytest.raises(BinaryCompatibilityError, match="1.523.3"):
+        await cli.run(
+            old_binary,
+            8765,
+            "/workspace",
+            consumer_mode="opencode-legacy",
+        )
+
+
+@pytest.mark.asyncio
+async def test_direct_readiness_requires_catalog_model_acknowledgement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one catalog session must prove set_config_option before HTTP startup."""
+
+    observed: dict[str, Any] = {"server_constructed": False}
+
+    class IncompatibleCatalogClient:
+        def __init__(self, _binary: str, **_kwargs: Any) -> None:
+            self.models = [SimpleNamespace(model_id="model")]
+            self.default_model = "model"
+            self.stopped = False
+            observed["client"] = self
+
+        def on_transport_closed(self, _handler: Any) -> None:
+            return None
+
+        async def start(self, env: dict[str, str] | None = None) -> None:
+            return None
+
+        async def create_session(self, cwd: str) -> str:
+            observed["catalog_cwd"] = cwd
+            return "catalog-session"
+
+        async def acknowledge_session_model(
+            self, session_id: str, model_id: str
+        ) -> str:
+            observed["acknowledgement"] = (session_id, model_id)
+            raise ModelAcknowledgementError(
+                "copilot-language-server lacks required exact model configuration"
+            )
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+    class ForbiddenServer:
+        def __init__(self, _config: Any) -> None:
+            observed["server_constructed"] = True
+
+    metadata = tmp_path / "ready.json"
+    monkeypatch.setattr(cli, "AcpClient", IncompatibleCatalogClient)
+    monkeypatch.setattr(cli.uvicorn, "Server", ForbiddenServer)
+
+    with pytest.raises(BinaryCompatibilityError) as exc_info:
+        await cli.run(
+            "/fake/copilot-language-server",
+            8765,
+            str(tmp_path),
+            consumer_mode="meadow-direct",
+            launch_secret="s" * 48,
+            execution_authority="trusted-host",
+            metadata_file=str(metadata),
+        )
+
+    message = str(exc_info.value)
+    assert "1.523.3" in message
+    assert "session/set_config_option" in message
+    assert "gpt-" not in message
+    assert observed["acknowledgement"] == ("catalog-session", "model")
+    assert observed["server_constructed"] is False
+    assert not metadata.exists()
+    assert observed["client"].stopped is True
+
+
+@pytest.mark.asyncio
+async def test_direct_readiness_follows_catalog_then_exact_ack_without_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The startup control session is acknowledged before HTTP readiness."""
+
+    order: list[str] = []
+    metadata = tmp_path / "ready.json"
+
+    class ProvenCatalogClient:
+        def __init__(self, _binary: str, **kwargs: Any) -> None:
+            self.callback_policy = kwargs["callback_policy"]
+            self.models = [SimpleNamespace(model_id="catalog-model")]
+            self.default_model = "catalog-model"
+            self.protocol_version = 1
+            self.agent_info = {"name": "fake", "version": "1"}
+            self.agent_capabilities: dict[str, Any] = {}
+
+        def on_transport_closed(self, _handler: Any) -> None:
+            return None
+
+        async def start(self, env: dict[str, str] | None = None) -> None:
+            order.append("child-start")
+
+        async def create_session(self, cwd: str) -> str:
+            order.append("catalog-session")
+            return "catalog-session"
+
+        async def acknowledge_session_model(
+            self, session_id: str, model_id: str
+        ) -> str:
+            order.append("exact-ack")
+            assert (session_id, model_id) == ("catalog-session", "catalog-model")
+            return model_id
+
+        async def stop(self) -> None:
+            order.append("child-stop")
+
+    class FakeSocket:
+        def getsockname(self) -> tuple[str, int]:
+            return ("127.0.0.1", 8765)
+
+    class OrderedServer:
+        def __init__(self, _config: Any) -> None:
+            order.append("http-constructed")
+            self.servers = [SimpleNamespace(sockets=[FakeSocket()])]
+            self.should_exit = False
+
+        async def startup(self) -> None:
+            order.append("http-startup")
+
+        async def main_loop(self) -> None:
+            assert metadata.exists()
+            order.append("ready")
+
+        async def shutdown(self) -> None:
+            order.append("http-shutdown")
+
+    class FakeSignalLoop:
+        def add_signal_handler(self, *_args: Any) -> None:
+            return None
+
+    async def fake_app(
+        _scope: dict[str, Any], _receive: Any, _send: Any
+    ) -> None:
+        return None
+
+    monkeypatch.setattr(cli, "AcpClient", ProvenCatalogClient)
+    monkeypatch.setattr(cli, "create_direct_app", lambda _service: fake_app)
+    monkeypatch.setattr(cli.uvicorn, "Server", OrderedServer)
+    monkeypatch.setattr(cli.asyncio, "get_event_loop", lambda: FakeSignalLoop())
+
+    await cli.run(
+        "/fake/copilot-language-server",
+        8765,
+        str(tmp_path),
+        consumer_mode="meadow-direct",
+        launch_secret="s" * 48,
+        execution_authority="trusted-host",
+        metadata_file=str(metadata),
+    )
+
+    assert order.index("catalog-session") < order.index("exact-ack")
+    assert order.index("exact-ack") < order.index("http-constructed")
+    assert order.index("http-startup") < order.index("ready")
+    assert "session/prompt" not in order
+
+
 def test_consumer_mode_is_mandatory() -> None:
     """ADI-12: the proxy never guesses direct versus legacy caller semantics."""
     with pytest.raises(SystemExit):
         cli._build_parser().parse_args([])
+
+
+def test_cli_invalid_direct_config_never_probes_auto_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invalid authority fails before any candidate executes ``--version``."""
+
+    def forbidden_discovery() -> str | None:
+        raise AssertionError("invalid configuration reached version discovery")
+
+    monkeypatch.delenv(cli.DIRECT_SECRET_ENV, raising=False)
+    monkeypatch.setattr(cli, "_configure_logging", lambda *_args: None)
+    monkeypatch.setattr(cli, "find_binary", forbidden_discovery)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "acp-proxy",
+            "--consumer-mode",
+            "meadow-direct",
+            "--execution-authority",
+            "trusted-host",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+    assert exc_info.value.code == 2
+
+
+def test_cli_auto_discovery_reports_old_only_environment_without_traceback(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Auto-discovery converts typed old-only evidence into a clean CLI exit."""
+
+    def reject_old_only() -> str | None:
+        raise BinaryCompatibilityError(
+            "no auto-discovered copilot-language-server met admission requirements: "
+            "version 1.457.1 is below required minimum 1.523.3"
+        )
+
+    monkeypatch.setattr(cli, "_configure_logging", lambda *_args: None)
+    monkeypatch.setattr(cli, "find_binary", reject_old_only)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["acp-proxy", "--consumer-mode", "opencode-legacy"],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+    assert exc_info.value.code == 1
+    assert "1.457.1" in caplog.text
+    assert "1.523.3" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -176,6 +495,13 @@ async def test_programmatic_invalid_direct_startup_fails_before_child(
             constructed = True
 
     monkeypatch.setattr(cli, "AcpClient", ForbiddenClient)
+    monkeypatch.setattr(
+        cli,
+        "admit_compatible_binary",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("invalid configuration reached version admission")
+        ),
+    )
 
     with pytest.raises(ValueError, match=message):
         await cli.run(
@@ -252,6 +578,11 @@ async def test_child_loss_during_startup_invalidates_direct_service_and_cleans_u
 
         async def create_session(self, cwd: str) -> str:
             return "catalog-session"
+
+        async def acknowledge_session_model(
+            self, session_id: str, model_id: str
+        ) -> str:
+            return model_id
 
         async def stop(self) -> None:
             self.stopped = True
@@ -336,6 +667,11 @@ async def test_graceful_owner_shutdown_quarantines_active_direct_work_first(
 
         async def create_session(self, cwd: str) -> str:
             return "catalog"
+
+        async def acknowledge_session_model(
+            self, session_id: str, model_id: str
+        ) -> str:
+            return model_id
 
         async def create_session_exact(self, cwd: str, model_id: str) -> Any:
             return SimpleNamespace(session_id="backend", model_id=model_id)

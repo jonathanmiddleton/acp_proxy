@@ -30,7 +30,7 @@ These must be present in the environment before using the proxy.
 | **Python 3.11+**                                          | System package manager                                                | Runtime for the proxy itself                                                    |
 | **Node.js / npm**                                         | System package manager                                                | Required only for deprecated OpenCode compatibility                             |
 | **[OpenCode](https://opencode.ai)**                       | `npm i -g opencode-ai@latest`                                         | Optional legacy consumer                                                        |
-| **JetBrains IDE with GitHub Copilot plugin** (>= 1.442.0) | JetBrains Toolbox or standalone installer; plugin via IDE marketplace | Provides the `copilot-language-server` binary and cached Copilot authentication |
+| **JetBrains IDE with GitHub Copilot plugin** (`copilot-language-server` >= 1.523.3) | JetBrains Toolbox or standalone installer; plugin via IDE marketplace | Provides the version-admitted ACP binary and cached Copilot authentication |
 | **GitHub Copilot subscription**                           | Signed in via the JetBrains plugin                                    | The proxy uses the cached OAuth token at `~/.config/github-copilot/`            |
 
 Alternative installation paths exist for OpenCode (building from source, other
@@ -63,7 +63,11 @@ acp-proxy \
   --execution-authority trusted-host
 ```
 
-Direct readiness is negotiated at authenticated `GET /meadow/v1/capabilities`.
+Before direct HTTP readiness, the proxy uses its one non-prompted catalog
+session to require a complete `session/set_config_option` response whose model
+`currentValue` exactly matches the catalog default. A language server that
+cannot prove that capability fails startup. Direct readiness is then negotiated
+at authenticated `GET /meadow/v1/capabilities`.
 The response identifies the protocol major, continuity generation, canonical
 workspace, exact model catalog, execution authority, resource limits, evidence
 support, and underlying ACP capabilities. Every mutation pins that generation
@@ -110,11 +114,18 @@ other's traffic rather than guessing caller semantics.
 
 The current working directory (or `--cwd`) becomes the ACP workspace.
 
-The proxy auto-discovers the `copilot-language-server` binary from running processes or JetBrains plugin directories. To specify the path explicitly:
+The proxy combines candidates from running processes and supported JetBrains
+plugin directories, rejects versions below 1.523.3, and deterministically
+selects the highest admitted version (using canonical path as the stable
+tie-break). This minimum is global: deprecated legacy mode does not admit an
+older binary. To specify the path explicitly:
 
 ```bash
 acp-proxy --consumer-mode opencode-legacy --binary /path/to/copilot-language-server
 ```
+
+`--binary` bypasses candidate discovery only. The selected executable must
+still report a strict `MAJOR.MINOR.PATCH` version at or above 1.523.3.
 
 `python -m acp_proxy` supports the same mandatory options.
 
@@ -125,7 +136,13 @@ pip install -e ".[dev]"
 python -m pytest tests/ -v
 ```
 
-Integration tests require the `copilot-language-server` binary to be available. They **fail** (not skip) if the binary is not found — see [ADR-005](adrs/005-fail-loud-testing.md). Run unit tests only with: `python -m pytest tests/test_transport.py tests/test_server.py tests/test_discovery.py -v`
+Integration tests require the `copilot-language-server` binary to be available.
+They **fail** (not skip) if the binary is not found — see
+[ADR-005](adrs/005-fail-loud-testing.md). Run unit tests only with:
+
+```bash
+python -m pytest tests/test_transport.py tests/test_client.py tests/test_server.py tests/test_direct_*.py tests/test_discovery.py tests/test_binary_admission.py tests/test_main.py -v
+```
 The live direct integration probe requires the advertised
 `gpt-5.3-codex` model and exercises exact model acknowledgement plus two turns
 on one continuity generation.

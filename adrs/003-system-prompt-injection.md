@@ -53,10 +53,13 @@ The system prompt can:
 
 ## Rationale
 
-- **Only available control surface.** The ACP protocol provides no mechanism
-  to configure tool visibility, system prompts, or model behavior. The
-  `session/set_config_option` method returns "Method not found." First-turn
-  injection is the only empirically verified way to influence the model.
+- **Only verified legacy prompt control surface.** On the older language-server
+  binary used for the original experiment, `session/set_config_option`
+  returned "Method not found." The currently admitted 1.523.3+ surface uses
+  that method for exact model configuration, but supplies no evidence that it
+  controls tool visibility, system prompts, or general model behavior.
+  First-turn injection remains the only empirically verified legacy mechanism
+  for those prompt-level effects.
 - **Decouples proxy from OpenCode's prompt.** OpenCode's elaborate system
   prompt (describing its own tools, modes, coding standards) is designed for
   direct model access. Through the proxy, it creates conflicts. Stripping it

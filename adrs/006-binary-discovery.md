@@ -1,6 +1,6 @@
 # ADR-006: Version-Bounded JetBrains Binary Discovery
 
-**Status:** Accepted; supported path set amended 2026-08-09
+**Status:** Accepted; admission policy amended 2026-08-09
 **Date:** 2026-04-03  
 
 ## Context
@@ -30,11 +30,17 @@ case-sensitive and rejected the correct binary.
 the target environment). Hardcoding any user-specific path component would
 break on every other machine.
 
+**IDE release paths do not prove language-server compatibility.** A supported
+IntelliJ IDEA 2025.3 installation was observed with language server 1.457.1,
+which returned JSON-RPC method-not-found for `session/set_config_option`.
+Language server 1.523.3 exposed the required method and exact complete
+`configOptions` acknowledgement used by Meadow direct mode.
+
 ## Decision
 
 `discovery.py` is the single source of truth for binary resolution. It:
 
-1. **Validates three properties for compatibility.** A binary path must:
+1. **Validates three path properties for auto-discovery.** A candidate must:
    - Be under the current user's home directory.
    - Contain one supported IDE/version directory as a path component:
      `IntelliJIdea2025.3`, `IntelliJIdea2026.1`, `PyCharm2025.3`, or
@@ -49,15 +55,29 @@ break on every other machine.
    architecture directory), while macOS uses
    `.../copilot-agent/native/darwin-arm64/copilot-language-server`.
 
-2. **Auto-discovers from running processes.** On Unix, scans `ps` output.
+2. **Admits a strict language-server version globally.** Every selected
+   executable, including explicit `--binary` and programmatic `run()` inputs,
+   must exist, be executable, emit exactly `MAJOR.MINOR.PATCH` for `--version`,
+   and report at least 1.523.3. The floor applies to both Meadow direct and the
+   deprecated OpenCode legacy mode. Booleans, numbers, decorated/malformed
+   strings, failed or excessive output, and below-floor versions fail closed.
+   The probe uses a credential-free environment, bounded output retention, and
+   a timeout before the executable can be admitted.
+3. **Collects all auto-discovery candidates before choosing.** On Unix, scans
+   `ps` output.
    On Windows, uses PowerShell (`Get-Process`) with a wmic fallback. Each
    candidate's full path is validated against the three-property check.
    Incompatible binaries (other IDEs, other versions, other users) are
    rejected with a warning log.
-3. **Falls back to filesystem lookup.** If no matching process is found,
-   checks the expected JetBrains plugin directory on disk.
-4. **Explicit `--binary` override.** The CLI accepts an explicit path that
-   bypasses discovery, for environments where auto-discovery fails.
+   Filesystem candidates from the expected JetBrains plugin directories are
+   combined with process candidates. The highest admitted semantic version is
+   selected, with lexicographically smallest canonical path as a stable
+   tie-break. Process order, filesystem order, and source precedence cannot
+   select an older candidate.
+4. **Explicit `--binary` selection.** The CLI accepts an explicit path for
+   environments where auto-discovery fails. It bypasses the JetBrains path and
+   candidate-selection rules only; executable and minimum-version admission
+   remain mandatory.
 
 Both `__main__.py` and `test_integration.py` import from `discovery.py`. No
 duplicated discovery logic.
@@ -71,9 +91,8 @@ duplicated discovery logic.
 - **Single source of truth.** Before this change, `__main__.py` and
   `test_integration.py` had separate discovery logic that diverged. Extracting
   to a shared module eliminated the inconsistency.
-- **`ps`-based discovery handles the common case.** If JetBrains is running,
-  the binary is in `ps` output. This is faster and more reliable than
-  filesystem search (which requires knowing the exact user home path).
+- **Process and filesystem discovery provide one candidate set.** A running
+  older process cannot mask a newer supported plugin binary on disk.
 - **Rejecting incompatible binaries is the correct failure mode.** Finding *a*
   binary is not sufficient — it must be the *right* binary. The target
   environment proved this when the wrong binary was selected and the proxy
@@ -89,10 +108,14 @@ duplicated discovery logic.
   Windows target), the filesystem fallback won't find the binary. Process
   discovery will still work since it uses the relaxed three-property check.
   The `--binary` flag is the escape hatch.
-- **IDE must be running for process discovery.** If JetBrains is not running,
-  process scanning finds nothing and discovery falls back to filesystem
-  lookup. The user must have JetBrains installed (even if not running) for
-  filesystem lookup to work.
+- **An IDE need not be running for filesystem discovery.** The plugin must be
+  installed in an expected layout; otherwise an explicit version-admitted path
+  is required.
+- **A path-shaped binary is not sufficient.** Startup and integration tests
+  fail before child use when the selected executable cannot prove the global
+  1.523.3 floor. Meadow direct adds a behavioral `session/set_config_option`
+  proof before HTTP readiness because a version string alone is not capability
+  acknowledgement.
 
 ## Revision History
 
@@ -100,3 +123,4 @@ duplicated discovery logic.
 |------|--------|
 | 2026-04-07 | Relaxed path matching from exact full-path regex to three-property check (home dir, IDE dir component, binary name). Added Windows process discovery via PowerShell + wmic fallback. Confirmed Windows target uses a different directory layout (`bin/` instead of `native/{arch}/`). |
 | 2026-08-09 | Aligned the decision with production discovery for IntelliJ IDEA and PyCharm 2025.3/2026.1 paths. Arbitrary versions and products remain fail-loud. |
+| 2026-08-09 | Established the global 1.523.3 language-server floor, strict credential-free bounded version probing for all entry points, and deterministic highest-version selection across the combined process/filesystem candidate set. Explicit paths bypass discovery only. |

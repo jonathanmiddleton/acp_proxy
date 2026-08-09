@@ -18,7 +18,7 @@ from acp_proxy.__main__ import _direct_child_env
 from acp_proxy.client import AcpClient, CallbackPolicy
 from acp_proxy.direct_protocol import CreateSessionRequest, PromptRequest
 from acp_proxy.direct_service import DirectService
-from acp_proxy.discovery import find_binary
+from acp_proxy.discovery import BinaryCompatibilityError, find_binary
 
 REQUIRED_LIVE_MODEL = "gpt-5.3-codex"
 
@@ -37,7 +37,10 @@ def binary() -> str:
     intentional — the environment must have a supported JetBrains Copilot
     plugin installed with its bundled language server.
     """
-    result = find_binary()
+    try:
+        result = find_binary()
+    except BinaryCompatibilityError as exc:
+        pytest.fail(f"Incompatible copilot-language-server: {exc}")
     assert result is not None, (
         "No compatible copilot-language-server binary found. "
         "The environment must have a supported JetBrains Copilot plugin "
@@ -188,7 +191,18 @@ async def test_meadow_direct_exact_model_and_continuity_probe(binary: str) -> No
     client = AcpClient(binary, callback_policy=CallbackPolicy.DIRECT_DENY)
     try:
         await client.start(env=_live_child_env())
-        await client.create_session(os.getcwd())  # one non-prompted catalog probe
+        catalog_session_id = await client.create_session(
+            os.getcwd()
+        )  # one non-prompted catalog probe
+        catalog_default = client.default_model
+        assert isinstance(catalog_default, str) and catalog_default
+        assert (
+            await client.acknowledge_session_model(
+                catalog_session_id,
+                catalog_default,
+            )
+            == catalog_default
+        )
         assert requested_model in {model.model_id for model in client.models}
         service = DirectService(
             client,

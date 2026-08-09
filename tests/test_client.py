@@ -16,6 +16,7 @@ import pytest
 from acp_proxy.client import (
     AcpClient,
     CallbackPolicy,
+    ModelAcknowledgementError,
     ModelInfo,
     SessionState,
 )
@@ -1211,6 +1212,101 @@ class TestDirectAcpContract:
         )
 
     @pytest.mark.asyncio
+    async def test_catalog_session_proves_exact_current_model(self) -> None:
+        """Direct readiness uses the existing non-prompted catalog session."""
+        client = AcpClient.__new__(AcpClient)
+        client._sessions = {
+            "catalog": SessionState("catalog", model_id="gpt-5.3-codex")
+        }
+        client._expected_model_updates = {}
+        client._transport = AsyncMock()
+        client._transport.send_request.return_value = {
+            "configOptions": [
+                {
+                    "id": "model",
+                    "category": "model",
+                    "currentValue": "gpt-5.3-codex",
+                }
+            ]
+        }
+
+        observed = await client.acknowledge_session_model(
+            "catalog", "gpt-5.3-codex"
+        )
+
+        assert observed == "gpt-5.3-codex"
+        client._transport.send_request.assert_awaited_once_with(
+            "session/set_config_option",
+            {
+                "sessionId": "catalog",
+                "configId": "model",
+                "value": "gpt-5.3-codex",
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_catalog_session_method_not_found_fails_safely(self) -> None:
+        """An old language server cannot reach direct readiness."""
+        from acp_proxy.transport import AcpError
+
+        client = AcpClient.__new__(AcpClient)
+        client._sessions = {
+            "catalog": SessionState("catalog", model_id="gpt-5.3-codex")
+        }
+        client._expected_model_updates = {}
+        client._transport = AsyncMock()
+        client._transport.send_request.side_effect = AcpError(
+            '"Method not found": session/set_config_option',
+            {"code": -32601, "data": "sensitive child output"},
+        )
+
+        with pytest.raises(ModelAcknowledgementError) as exc_info:
+            await client.acknowledge_session_model("catalog", "gpt-5.3-codex")
+
+        message = str(exc_info.value)
+        assert "required exact model configuration" in message
+        assert "Method not found" not in message
+        assert "sensitive child output" not in message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "result",
+        [
+            {},
+            {"configOptions": []},
+            {"configOptions": [{"id": "model"}]},
+        ],
+    )
+    async def test_catalog_session_rejects_incomplete_config_options(
+        self, result: dict[str, Any]
+    ) -> None:
+        client = AcpClient.__new__(AcpClient)
+        client._sessions = {"catalog": SessionState("catalog", model_id="model")}
+        client._expected_model_updates = {}
+        client._transport = AsyncMock()
+        client._transport.send_request.return_value = result
+
+        with pytest.raises(ModelAcknowledgementError, match="configOptions|model"):
+            await client.acknowledge_session_model("catalog", "model")
+
+    @pytest.mark.asyncio
+    async def test_catalog_session_rejects_wrong_current_model(self) -> None:
+        client = AcpClient.__new__(AcpClient)
+        requested = "MODEL_TEXT_CANARY_REQUESTED"
+        observed = "MODEL_TEXT_CANARY_OBSERVED"
+        client._sessions = {"catalog": SessionState("catalog", model_id=requested)}
+        client._expected_model_updates = {}
+        client._transport = AsyncMock()
+        client._transport.send_request.return_value = {
+            "configOptions": [{"id": "model", "currentValue": observed}]
+        }
+
+        with pytest.raises(ModelAcknowledgementError) as exc_info:
+            await client.acknowledge_session_model("catalog", requested)
+        assert requested not in str(exc_info.value)
+        assert observed not in str(exc_info.value)
+
+    @pytest.mark.asyncio
     async def test_exact_model_selection_rejects_wrong_current_value(self) -> None:
         """ADI-03: an acknowledged default cannot substitute for the requested model."""
         client = AcpClient.__new__(AcpClient)
@@ -1235,7 +1331,7 @@ class TestDirectAcpContract:
             },
         ]
 
-        with pytest.raises(RuntimeError, match="acknowledged model"):
+        with pytest.raises(RuntimeError, match="acknowledge.*model"):
             await client.create_session_exact("/workspace", "gpt-5.3-codex")
 
     @pytest.mark.asyncio
