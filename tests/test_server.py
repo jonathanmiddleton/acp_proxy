@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, AsyncIterator
-from unittest.mock import AsyncMock, MagicMock, patch
+from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
-from acp_proxy.client import AcpClient, ModelInfo
+from acp_proxy.client import ModelInfo
 from acp_proxy.server import create_app
 
 
@@ -196,7 +196,17 @@ async def test_health_endpoint(client, fake_client):
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "ok"
+    assert data["consumer_mode"] == "opencode-legacy"
+    assert data["deprecated"] is True
     assert data["agent"]["name"] == "FakeAgent"
+
+
+@pytest.mark.asyncio
+async def test_legacy_mode_rejects_meadow_direct_endpoint(client, fake_client):
+    """ADI-12: legacy mode cannot accidentally admit strict direct traffic."""
+    response = await client.get("/meadow/v1/capabilities")
+    assert response.status_code == 410
+    assert response.json()["error"]["code"] == "meadow_direct_mode_required"
 
 
 @pytest.mark.asyncio

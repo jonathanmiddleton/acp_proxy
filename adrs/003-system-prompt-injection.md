@@ -1,6 +1,6 @@
 # ADR-003: System Prompt Injection as Primary Control Surface
 
-**Status:** Accepted  
+**Status:** Accepted for `opencode-legacy`; superseded for direct prompt ownership by [ADR-012](012-meadow-direct-consumer-protocol.md)
 **Date:** 2026-04-03  
 
 ## Context

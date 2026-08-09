@@ -8,15 +8,25 @@ means the environment is misconfigured, and skipping would mask that.
 
 from __future__ import annotations
 
-import asyncio
-import json
+import hashlib
 import os
 
-import pytest
 import httpx
+import pytest
 
-from acp_proxy.client import AcpClient
+from acp_proxy.__main__ import _direct_child_env
+from acp_proxy.client import AcpClient, CallbackPolicy
+from acp_proxy.direct_protocol import CreateSessionRequest, PromptRequest
+from acp_proxy.direct_service import DirectService
 from acp_proxy.discovery import find_binary
+
+REQUIRED_LIVE_MODEL = "gpt-5.3-codex"
+
+
+def _live_child_env() -> dict[str, str]:
+    """Project the ambient environment without exposing unrelated credentials."""
+
+    return _direct_child_env(dict(os.environ))
 
 
 @pytest.fixture(scope="module")
@@ -24,13 +34,13 @@ def binary() -> str:
     """Resolve the compatible copilot-language-server binary.
 
     Fails the test session if no compatible binary is found. This is
-    intentional — the environment must have the IntelliJ 2025.3 Copilot
+    intentional — the environment must have a supported JetBrains Copilot
     plugin installed with its bundled language server.
     """
     result = find_binary()
     assert result is not None, (
         "No compatible copilot-language-server binary found. "
-        "The environment must have the IntelliJ IDEA 2025.3 Copilot plugin "
+        "The environment must have a supported JetBrains Copilot plugin "
         "installed. Only the binary bundled with that plugin is supported."
     )
     assert os.path.isfile(result), f"Discovered binary path does not exist: {result}"
@@ -43,7 +53,7 @@ async def test_acp_client_initialize_and_discover_models(binary: str):
     """Start the ACP client and verify initialization + model discovery."""
     client = AcpClient(binary)
     try:
-        await client.start()
+        await client.start(env=_live_child_env())
         session_id = await client.create_session(os.getcwd())
 
         assert session_id is not None
@@ -62,8 +72,11 @@ async def test_acp_client_prompt_and_stream(binary: str):
     """Send a prompt and verify streaming response."""
     client = AcpClient(binary)
     try:
-        await client.start()
-        session_id = await client.create_session(os.getcwd())
+        await client.start(env=_live_child_env())
+        await client.create_session(os.getcwd())
+        session_id = (
+            await client.create_session_exact(os.getcwd(), REQUIRED_LIVE_MODEL)
+        ).session_id
 
         chunks: list[dict] = []
         async for update in client.prompt(
@@ -98,7 +111,7 @@ async def test_full_proxy_http_roundtrip(binary: str):
 
     client = AcpClient(binary)
     try:
-        await client.start()
+        await client.start(env=_live_child_env())
         await client.create_session(os.getcwd())
 
         app = create_app(client, os.getcwd())
@@ -117,7 +130,7 @@ async def test_full_proxy_http_roundtrip(binary: str):
             resp = await http.post(
                 "/v1/chat/completions",
                 json={
-                    "model": client.default_model,
+                    "model": REQUIRED_LIVE_MODEL,
                     "messages": [
                         {"role": "user", "content": "Reply with exactly: HTTP_OK"}
                     ],
@@ -134,38 +147,26 @@ async def test_full_proxy_http_roundtrip(binary: str):
 
 
 @pytest.mark.asyncio
-async def test_model_switching(binary: str):
-    """Verify that session/set_model actually changes the active model."""
+async def test_exact_required_model_prompt(binary: str):
+    """Verify exact gpt-5.3-codex selection without spending another model call."""
     client = AcpClient(binary)
     try:
-        await client.start()
-        session_id = await client.create_session(os.getcwd())
-
-        # Pick a model different from the default
-        default = client.default_model
-        available = [m.model_id for m in client.models]
-
-        # If there's only one model, that's an environment problem — not
-        # something to skip over. Model switching is a required capability.
-        assert len(available) >= 2, (
-            f"Only one model available ({available}). "
-            "Model switching requires at least two models. "
-            "Check that the Copilot subscription has access to multiple models."
+        await client.start(env=_live_child_env())
+        await client.create_session(os.getcwd())
+        available = {model.model_id for model in client.models}
+        assert REQUIRED_LIVE_MODEL in available
+        descriptor = await client.create_session_exact(
+            os.getcwd(), REQUIRED_LIVE_MODEL
         )
+        assert descriptor.model_id == REQUIRED_LIVE_MODEL
 
-        other = next(m for m in available if m != default)
-
-        # Switch model
-        await client.set_model(session_id, other)
-
-        # Verify by asking the model to identify itself
         text = ""
         async for update in client.prompt(
-            session_id,
+            descriptor.session_id,
             [
                 {
                     "role": "user",
-                    "content": "What model are you? Reply with just your model name, nothing else.",
+                    "content": "Reply with exactly: EXACT_MODEL_OK",
                 }
             ],
         ):
@@ -174,11 +175,95 @@ async def test_model_switching(binary: str):
                 if content.get("type") == "text":
                     text += content.get("text", "")
 
-        # The response should reference the new model, not the default
-        # (Loose check — model self-identification varies)
-        assert text.strip(), "Model returned empty response"
-        assert default not in text or other in text, (
-            f"Expected model {other} but got response mentioning {default}: {text}"
+        assert "EXACT_MODEL_OK" in text
+    finally:
+        await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_meadow_direct_exact_model_and_continuity_probe(binary: str) -> None:
+    """Live ADI-03/06/08: exact gpt-5.3-codex direct session settles twice."""
+
+    requested_model = REQUIRED_LIVE_MODEL
+    client = AcpClient(binary, callback_policy=CallbackPolicy.DIRECT_DENY)
+    try:
+        await client.start(env=_live_child_env())
+        await client.create_session(os.getcwd())  # one non-prompted catalog probe
+        assert requested_model in {model.model_id for model in client.models}
+        service = DirectService(
+            client,
+            cwd=os.getcwd(),
+            launch_secret="integration-test-launch-secret-000000000000",
+            execution_authority="trusted-host",
+            continuity_generation_id="integration-generation",
+        )
+        stable = ""
+        stable_digest = hashlib.sha256(stable.encode()).hexdigest()
+        create, _ = await service.admit_create(
+            CreateSessionRequest(
+                protocol_major=1,
+                continuity_generation_id=service.continuity_generation_id,
+                operation_id="live-create",
+                logical_session_id="live-session",
+                expected_canonical_workspace=service.canonical_workspace,
+                actor_ref="live-probe",
+                title="Live probe",
+                model_id=requested_model,
+                stable_instruction_digest=stable_digest,
+            )
+        )
+        created = await service.wait_for_operation(create)
+        assert created.state == "completed"
+
+        async def submit(
+            *, operation_id: str, invocation_id: str, phase: str
+        ) -> dict:
+            contract = "Return only the requested probe token as plain text."
+            kwargs = {
+                "protocol_major": 1,
+                "continuity_generation_id": service.continuity_generation_id,
+                "operation_id": operation_id,
+                "invocation_id": invocation_id,
+                "phase": phase,
+                "stable_instruction_digest": stable_digest,
+                "output_contract_digest": hashlib.sha256(
+                    contract.encode()
+                ).hexdigest(),
+                "execution_timeout_s": 120,
+                "prompt": (
+                    "Reply with exactly DIRECT_CONTINUITY_OK.\n\n"
+                    "## Legal Typed Routes\nNo routes are available."
+                ),
+                "output_contract": contract,
+            }
+            if phase == "initial":
+                kwargs["stable_instructions"] = stable
+            request = PromptRequest.model_validate(kwargs)
+            record, _ = await service.admit_prompt("live-session", request)
+            return (await service.wait_for_operation(record)).model_dump(
+                mode="json"
+            )
+
+        initial = await submit(
+            operation_id="live-initial",
+            invocation_id="live-invocation-one",
+            phase="initial",
+        )
+        later = await submit(
+            operation_id="live-later",
+            invocation_id="live-invocation-two",
+            phase="invocation",
+        )
+
+        assert initial["state"] == "completed"
+        assert later["state"] == "completed"
+        assert initial["result"]["model_id"] == requested_model
+        assert later["result"]["model_id"] == requested_model
+        assert "DIRECT_CONTINUITY_OK" in initial["result"]["response_text"]
+        assert "DIRECT_CONTINUITY_OK" in later["result"]["response_text"]
+        assert initial["result"]["instruction_submission"] == "submitted_once"
+        assert later["result"]["instruction_submission"] == (
+            "not_resubmitted_same_session"
         )
     finally:
         await client.stop()

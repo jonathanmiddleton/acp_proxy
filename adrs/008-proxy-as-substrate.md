@@ -1,6 +1,6 @@
 # ADR-008: Proxy as Substrate — Installable Command, cwd as Workspace
 
-**Status:** Accepted  
+**Status:** Accepted; startup contract amended by [ADR-012](012-meadow-direct-consumer-protocol.md)
 **Date:** 2026-04-03  
 
 ## Context

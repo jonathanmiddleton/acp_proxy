@@ -1,7 +1,14 @@
 # ADR-009: Intra-Process Session Scaling
 
-**Status:** Accepted  
+**Status:** Partially superseded by [ADR-012](012-meadow-direct-consumer-protocol.md); empirical scaling evidence retained
 **Date:** 2026-04-05  
+
+ADR-012 supersedes the pre-created pool, content-derived affinity, and
+per-session-only concurrency clauses for Meadow direct mode. The measured
+single-process scaling curve and same-session cancellation observation remain
+historical evidence. Direct mode creates explicitly identified sessions on
+demand and conservatively serializes prompts globally until a bounded live
+probe establishes safe cross-session cancellation isolation.
 
 ## Context
 

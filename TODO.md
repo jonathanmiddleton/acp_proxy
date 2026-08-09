@@ -2,20 +2,25 @@
 
 ## High Priority
 
-- [ ] **Analyze OpenCode REST API ↔ ACP protocol alignment** — Meadow talks to OpenCode via its own REST API (`POST /session`, `POST /session/{id}/message` with agent, model, system prompt, structured output schema). This is NOT OpenAI-compatible. Evaluate whether the proxy should expose the OpenCode API on its inbound side and translate to ACP, which would let Meadow connect directly to the proxy as a drop-in OpenCode replacement in the constrained environment. Key mappings to analyze:
-  - OpenCode `POST /session` → ACP `session/new` (both create sessions)
-  - OpenCode `model.providerID/modelID` → ACP `session/set_model` (both select models)
-  - OpenCode `system` field → ACP first-turn injection (system prompt)
-  - OpenCode `format.schema` → structured output (does ACP support this?)
-  - OpenCode `agent` field → no ACP equivalent (the ACP server IS the agent)
-  - OpenCode streaming events → ACP `session/update` notifications
-  - OpenCode `parts` → ACP `ContentBlock[]`
+- [x] **Implement explicit Meadow-direct ACP protocol** — Added the isolated,
+  authenticated `/meadow/v1` surface with negotiated capabilities, explicit
+  session/invocation/operation identity, exact model acknowledgement, bounded
+  at-most-once ledger/status/cancel/retire semantics, layered first-turn prompt
+  admission, ordered terminal/evidence correlation, reader-side event
+  byte/count limits, bounded callback tasks, child-loss quarantine, and
+  fail-closed direct callbacks. Stock OpenCode remains isolated behind deprecated
+  `opencode-legacy` mode through 0.2.x. *(Done 2026-08-09)*
 
 - [ ] **End-to-end test with OpenCode** — Test the refactored proxy (last-user-message extraction, per-conversation sessions, system prompt injection) with OpenCode connected. Verify: no context duplication, no session leakage, no "Operation cancelled by user" errors, title generator isolated.
 
-- [ ] **Design system prompt for Meadow integration** — What instructions to inject per session. Must cover: agent mode (build vs plan), workspace context (how to reference AGENTS.md content), tool behavior shaping, coding standards. The system prompt is the primary control surface now that we own the first turn.
+- [ ] **Design legacy OpenCode system prompt** — Direct Meadow owns its stable,
+  current, contract, and correction layers. Any proxy-owned system prompt work
+  applies only to deprecated OpenCode compatibility.
 
-- [ ] **Mode control via system prompt** — OpenCode communicates mode (build/plan) via `<system-reminder>` tags in message content. Since we strip everything except the last user message, these never reach the ACP session. Mode must be set via the injected system prompt. Open question: do we need dynamic mode switching mid-session, or is one mode per session sufficient?
+- [ ] **Legacy mode control via system prompt** — OpenCode communicates mode
+  through replayed reminders that the legacy adapter strips. Determine whether
+  explicit legacy mode needs dynamic switching. This does not apply to direct
+  Meadow prompt ownership.
 
 - [x] **Prompt-level timeout + structured errors** — `client.prompt()` enforces a 120s default deadline (`DEFAULT_PROMPT_TIMEOUT_S`). On expiry: cancels the prompt task, raises `PromptTimeout` with session ID, timeout, and partial text. Server returns HTTP 504 (non-streaming) or SSE error event (streaming). Session creation failures return HTTP 502. 8 new tests. *(Done 2026-04-08)*
 
@@ -29,7 +34,10 @@
 
 - [ ] **Synthetic tools (future)** — The ACP server owns tool execution. If we need custom tools (beyond what the ACP server provides), options are: (a) MCP servers via `session/new` (spec supports it, firm policy currently blocks MCP in Copilot plugin — revisit when policy evolves), (b) Synthetic tool patterns where the model emits a structured command in its text response and the proxy intercepts it. Brittle but possible.
 
-- [ ] **Test on target environment** — Pull latest, run `npm install`, start proxy with `--system-prompt`, verify behavior matches dev.
+- [ ] **Test legacy mode on target environment** — Pull latest, run `npm
+  install`, start explicit `opencode-legacy` mode with `--system-prompt`, and
+  verify the temporary compatibility behavior matches development. This does
+  not apply to Meadow direct mode.
 
 - [ ] **Stress test for failure case collection** — Design and run a stress test that deliberately provokes failure modes: concurrent requests to the same session, rapid session creation/teardown, long-running prompts, idle sessions left open for extended periods, large payloads. Catalog what actually breaks, how it fails (timeout, error response, hang, crash), and whether failures are transient or permanent. Results feed into the session health checking design.
 
@@ -37,7 +45,8 @@
 
 - [ ] **Session health checking and retry strategy** — Confirmed real failure mode: the copilot-language-server stops responding and the proxy hangs indefinitely. Important but not actionable until we have: (1) concrete failure cases from stress testing and production use, (2) `session/load` and `session/list` probe results, (3) clarity on which integration path is active (OpenCode in the middle vs direct consumer↔proxy). The retry design differs significantly between paths — OpenCode replays full history (fresh session is less costly) while direct communication loses all ACP-side context on session replacement. Potential recovery chain: timeout → `session/list` (session exists?) → `session/load` (reconnect with history replay) → `session/new` (fresh start, accept context loss).
 
-- [ ] **AGENTS.md context injection** — The ACP server scans the workspace from `cwd` and knows file names, but does NOT read file contents without using a tool. If we want AGENTS.md content available to the model without a tool call, inject it (or a summary) in the system prompt.
+- [ ] **Legacy AGENTS.md context injection** — Continue evaluating only for
+  deprecated OpenCode compatibility. Direct mode forbids proxy-authored context.
 
 ## Rejected / Deferred
 
@@ -72,15 +81,21 @@ These change the recovery strategy: instead of "session died → create new (los
 
 ## Notes
 
-- **ACP sessions are stateful** — context accumulates across turns. We send only the last user message to avoid duplication.
+- **ACP sessions are stateful** — context accumulates across turns. Direct mode
+  submits the current Meadow-owned layer; legacy OpenCode compatibility extracts
+  only the last user message to avoid replay duplication.
 - **Sessions keyed by `(model, hash(first_user_message))`** — stable across turns because OpenCode replays full history.
-- **System prompt injection confirmed effective** — first-turn instructions override ACP server's default tool reporting.
+- **Legacy system prompt injection was observed effective** — this is retained
+  only as compatibility evidence. Meadow direct mode forbids proxy-authored
+  prompt injection.
 - **ACP server has built-in GitHub MCP server** — provides github-mcp-server-* tools by default.
 - **`cwd` anchors the workspace** — part of the ACP spec, used by the server for file system boundary.
-- **Meadow uses OpenCode's REST API, not OpenAI-compatible** — `POST /session/{id}/message` with first-class `system`, `agent`, `model`, `format` (structured output schema), `parts`. This is richer than `/v1/chat/completions`.
-- **Current flow (OpenCode in the middle) is awkward but functional** — OpenCode's tools are stripped, system prompt is stripped, only the last user message reaches ACP. The value of OpenCode in this path is minimal (UI shell only). Keep until the OpenCode API → ACP proxy analysis is complete.
+- **Meadow uses the authenticated direct protocol** — direct mode maps Meadow
+  identity to real ACP sessions and does not use OpenAI replay semantics.
+- **OpenCode compatibility is explicit and temporary** — the heuristic path is
+  available only as `opencode-legacy` through 0.2.x and is removed in 0.3.0.
 - **Two integration paths for Meadow:**
   1. Normal environments: Meadow → OpenCode → native provider (existing, works)
-  2. Constrained environment: Meadow → proxy → ACP server (needs OpenCode API on inbound side OR Meadow learns OpenAI-compatible)
+  2. Constrained environment: Meadow → authenticated direct proxy → ACP server
 - **ACP spec reference:** https://agentclientprotocol.com — full index at https://agentclientprotocol.com/llms.txt
 - **Other ACP-to-OpenAI proxies exist** — [iot2020/rest-acp](https://github.com/iot2020/rest-acp) (TypeScript, uses `npx @github/copilot --acp --yolo`), [OpenSource03/harnss](https://github.com/OpenSource03/harnss) (desktop client for multiple ACP agents). Worth monitoring for ideas but neither has our session management or system prompt injection.

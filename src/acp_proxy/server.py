@@ -329,7 +329,32 @@ def create_app(
 
     @app.get("/health")
     async def health() -> JSONResponse:
-        return JSONResponse({"status": "ok", "agent": acp_client.agent_info})
+        return JSONResponse(
+            {
+                "status": "ok",
+                "consumer_mode": "opencode-legacy",
+                "deprecated": True,
+                "agent": acp_client.agent_info,
+            }
+        )
+
+    @app.api_route(
+        "/meadow/v1/{direct_path:path}",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    )
+    async def reject_direct(direct_path: str) -> JSONResponse:
+        return JSONResponse(
+            status_code=410,
+            content={
+                "error": {
+                    "code": "meadow_direct_mode_required",
+                    "message": (
+                        f"/meadow/v1/{direct_path} requires explicit "
+                        "--consumer-mode meadow-direct"
+                    ),
+                }
+            },
+        )
 
     return app
 

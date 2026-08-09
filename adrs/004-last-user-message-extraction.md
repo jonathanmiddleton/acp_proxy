@@ -1,6 +1,6 @@
 # ADR-004: Extract Only the Last User Message for ACP Sessions
 
-**Status:** Accepted  
+**Status:** Accepted for `opencode-legacy`; superseded for direct requests by [ADR-012](012-meadow-direct-consumer-protocol.md)
 **Date:** 2026-04-03  
 
 ## Context
@@ -59,8 +59,7 @@ Two static helpers in `client.py`:
   and fragile, we simply send only what's new.
 - **OpenCode's system prompt is stripped for three reasons:**
   1. **Collision.** It describes OpenCode's own tools and capabilities, which
-     conflict with the ACP server's tool definitions (see ADR-003, ADR-007,
-     ADR-010).
+     conflict with the ACP server's tool definitions (see ADR-003 and ADR-007).
   2. **Invalid information.** The prompt describes an environment (OpenCode's
      native tool surface, direct API access, specific behavioral contracts)
      that does not exist when the model operates through the ACP agent

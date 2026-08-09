@@ -10,12 +10,13 @@ surfacing, resilience policy, and testing philosophy.
 
 ## Project Overview
 
-This repo is an ACP-to-OpenAI proxy that bridges OpenCode to GitHub Copilot's
-`copilot-language-server` via the Agent Client Protocol. It is architecturally
-separate from Meadow.
+This repo owns two explicit inbound contracts over GitHub Copilot's
+`copilot-language-server` ACP interface: Meadow's authenticated direct protocol
+and a deprecated OpenAI-compatible adapter for stock OpenCode.
 
 ```
-OpenCode  →  ACP Proxy (localhost)  →  copilot-language-server  →  Copilot backend
+Meadow ───────────────→ ACP Proxy `/meadow/v1` ─→ copilot-language-server
+OpenCode (deprecated) → ACP Proxy `/v1` ─────────→ copilot-language-server
 ```
 
 ## ACP Specification Reference
@@ -57,22 +58,24 @@ The OpenAPI schema is at https://agentclientprotocol.com/api-reference/openapi.j
 
 | Module         | Owns                                                                                                                                                           | Does NOT own                                |
 |----------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------|
-| `transport.py` | NDJSON/stdio framing, subprocess lifecycle, JSON-RPC message correlation, bidirectional dispatch                                                               | Protocol semantics, session logic           |
-| `client.py`    | ACP initialization, session lifecycle, model selection, prompt execution, agent callback handling (permissions, fs, terminal)                                  | HTTP serving, OpenAI format translation     |
-| `server.py`    | FastAPI app, OpenAI-compatible endpoints, request/response translation, SSE streaming                                                                          | ACP protocol details, subprocess management |
-| `discovery.py` | Binary resolution (single source of truth). Only accepts IntelliJ IDEA 2025.3 Copilot plugin binary. Validates `ps` matches against the known-compatible path. | Protocol, sessions, serving                 |
-| `__main__.py`  | CLI entry point, argument parsing, wiring                                                                                                                      | Binary discovery logic, business logic      |
+| `transport.py` | Owned child lifecycle, NDJSON framing, bounded JSON-RPC correlation/callback tasks, ordered terminal signaling, and unexpected-close reporting | HTTP protocol and settlement policy          |
+| `client.py`    | ACP initialization, exact model acknowledgement, session/prompt primitives, mode-selected callback policy                                               | HTTP serving or direct operation identity   |
+| `direct_protocol.py`, `direct_state.py` | Strict Meadow wire shapes, generation-long operation ledger, and state vocabulary                                               | ACP method execution                         |
+| `direct_service.py`, `direct_server.py` | Authenticated direct orchestration, explicit identities, prompt lifetime, settlement, evidence, and resource limits                    | Legacy replay or prompt hashing              |
+| `server.py`    | Isolated deprecated OpenAI-compatible endpoints, replay heuristics, and SSE translation                                                                        | Meadow direct traffic                        |
+| `discovery.py` | Binary resolution for the supported IntelliJ IDEA/PyCharm 2025.3 and 2026.1 plugin paths                                                                        | Protocol, sessions, serving                  |
+| `__main__.py`  | Mandatory mode selection, bind/auth policy, owned lifecycle, and HTTP wiring                                                                                    | Binary discovery logic                       |
 
 ## Tests
 
 - Avoid mocks as much as possible
 - Test actual implementations, do not duplicate logic into tests
 - Favor writing property based tests
-- **Unit tests** (`test_transport.py`, `test_client.py`, `test_server.py`, `test_discovery.py`): Fake/mock objects, no real subprocess.
+- **Unit/property tests** (`test_transport.py`, `test_client.py`, `test_server.py`, `test_direct_*`, `test_discovery.py`): in-process boundaries, no real subprocess.
 - **Integration tests** (`test_integration.py`): Real copilot-language-server. **Fails** (not skips) if binary not found — a missing binary means the environment is misconfigured.
 - **No skips.** Tests must never use `skipif` or `pytest.skip()`. See CODING_STANDARDS.md.
 - Run all: `python -m pytest tests/ -v`
-- Run unit only: `python -m pytest tests/test_transport.py tests/test_client.py tests/test_server.py tests/test_discovery.py -v`
+- Run unit only: `python -m pytest tests/test_transport.py tests/test_client.py tests/test_server.py tests/test_direct_*.py tests/test_discovery.py -v`
 
 ## Architectural Decisions
 
@@ -87,9 +90,12 @@ particularly the failure modes that motivated each decision.
 | [ADR-003](adrs/003-system-prompt-injection.md)      | System prompt injection as primary control surface (why and how it works)                                     |
 | [ADR-004](adrs/004-last-user-message-extraction.md) | Extract only the last user message (why full history replay causes duplication)                               |
 | [ADR-005](adrs/005-fail-loud-testing.md)            | Fail-loud testing — no skips (why skips are banned, what they masked)                                         |
-| [ADR-006](adrs/006-binary-discovery.md)             | Binary discovery — IntelliJ IDEA 2025.3 only (why version specificity, what wrong-binary failure looked like) |
+| [ADR-006](adrs/006-binary-discovery.md)             | Version-bounded JetBrains binary discovery and wrong-binary failure evidence                     |
 | [ADR-007](adrs/007-tool-ownership.md)               | The ACP server owns tools — do not inject or override (protocol constraint, empirical evidence)               |
 | [ADR-008](adrs/008-proxy-as-substrate.md)           | Proxy as substrate — installable command, cwd as workspace                                                    |
+| [ADR-009](adrs/009-intra-process-session-scaling.md)| Retained scaling evidence; direct pool/affinity clauses superseded                                            |
+| [ADR-011](adrs/011-context-injection-boundary.md)   | Deprecated legacy context-injection boundary                                                                 |
+| [ADR-012](adrs/012-meadow-direct-consumer-protocol.md) | Authenticated direct protocol, migration, lifecycle, evidence, and authority policy                       |
 
 The ADRs explain the *why* behind the module ownership rules in the table
 above. A change that contradicts an accepted ADR requires a new ADR
@@ -113,7 +119,8 @@ maintains its own copy.
 
 ## Configuration
 
-**`opencode.json`** (repo root) configures OpenCode to use the proxy as its
+**`opencode.json`** (repo root) configures deprecated `opencode-legacy` mode as
+an OpenCode provider. It does not describe Meadow direct mode. It points OpenCode at the proxy as its
 Copilot provider. It points OpenCode at `http://127.0.0.1:8765/v1` with no
 auth, and declares the model IDs the proxy must handle: `gpt-4.1`, `gpt-4o`,
 `claude-sonnet-4`, `gemini-2.5-pro`, `auto`. When adding model routing logic,
@@ -144,7 +151,7 @@ code:
 - The target is a restricted enterprise environment. The copilot-language-server
   binary bundled with the JetBrains Copilot plugin is the only sanctioned path
   to Copilot.
-- Binary path varies by user. Auto-discovery via `ps` or JetBrains plugin
+- Binary path varies by user. Auto-discovery via `ps` or supported JetBrains plugin
   directory search. Never hardcode user-specific paths.
 - OpenCode is the stock prebuilt binary installed via npm. No source builds,
   no custom forks.

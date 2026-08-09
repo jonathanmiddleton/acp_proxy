@@ -1,6 +1,6 @@
 # ADR-007: The ACP Server Owns Tools — Do Not Inject or Override
 
-**Status:** Accepted  
+**Status:** Accepted; direct callback policy amended by [ADR-012](012-meadow-direct-consumer-protocol.md)
 **Date:** 2026-04-03  
 
 ## Context

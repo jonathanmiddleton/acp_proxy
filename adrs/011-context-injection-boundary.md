@@ -1,12 +1,12 @@
 # ADR-011: Context Injection — Proxy Responsibilities and Consumer Boundary
 
-**Status:** Accepted  
+**Status:** Accepted for `opencode-legacy`; superseded for direct prompt ownership by [ADR-012](012-meadow-direct-consumer-protocol.md)
 **Date:** 2026-04-07  
-**Related ADRs:** [ADR-003](003-system-prompt-injection.md), [ADR-004](004-last-user-message-extraction.md), [ADR-010](010-two-agent-runtime-collision.md)
+**Related ADRs:** [ADR-003](003-system-prompt-injection.md), [ADR-004](004-last-user-message-extraction.md), [ADR-012](012-meadow-direct-consumer-protocol.md)
 
 ## Context
 
-The two-agent-runtime collision (ADR-010) means that through the ACP path,
+The documented two-agent-runtime collision means that through the legacy ACP path,
 the model receives zero project context — no `AGENTS.md`, no coding
 standards, no repo structure information. The Copilot plugin injects
 `AGENTS.md` automatically, but the LSP in ACP mode does not.

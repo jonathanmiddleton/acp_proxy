@@ -1,6 +1,6 @@
 # ADR-001: Route OpenCode Through ACP Proxy to copilot-language-server
 
-**Status:** Accepted  
+**Status:** Accepted for `opencode-legacy`; Meadow-direct topology superseded by [ADR-012](012-meadow-direct-consumer-protocol.md)
 **Date:** 2026-04-03  
 
 ## Context

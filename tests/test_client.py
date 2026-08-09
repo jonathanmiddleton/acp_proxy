@@ -8,15 +8,17 @@ exercise client.py in isolation — no subprocess, no transport.
 from __future__ import annotations
 
 import asyncio
-import os
-import tempfile
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from acp_proxy.client import AcpClient, ModelInfo, SessionState
-
+from acp_proxy.client import (
+    AcpClient,
+    CallbackPolicy,
+    ModelInfo,
+    SessionState,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -246,6 +248,11 @@ class TestHandlePermissionRequest:
         client = AcpClient.__new__(AcpClient)
         client._sessions = {}
         client._update_queues = {}
+        client._direct_prompt_phases = {}
+        client._direct_update_budgets = {}
+        client._expected_model_updates = {}
+        client._available_commands_by_session = {}
+        client._provisional_session_ids = set()
         return client
 
     def test_prefers_allow_always(self):
@@ -372,6 +379,10 @@ class TestHandleAgentRequest:
         client = AcpClient.__new__(AcpClient)
         client._sessions = {}
         client._update_queues = {}
+        client._direct_prompt_phases = {}
+        client._direct_update_budgets = {}
+        client._expected_model_updates = {}
+        client._available_commands_by_session = {}
         return client
 
     def test_unknown_method_returns_none(self):
@@ -418,6 +429,11 @@ class TestHandleNotification:
         client = AcpClient.__new__(AcpClient)
         client._sessions = {}
         client._update_queues = {}
+        client._direct_prompt_phases = {}
+        client._direct_update_budgets = {}
+        client._expected_model_updates = {}
+        client._available_commands_by_session = {}
+        client._provisional_session_ids = set()
         return client
 
     def test_session_update_routed_to_queue(self):
@@ -464,6 +480,454 @@ class TestHandleNotification:
                 "method": "some/other_notification",
                 "params": {},
             }
+        )
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "unknown-session",
+                    "update": {"sessionUpdate": "agent_message_chunk"},
+                },
+            },
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "known-but-not-prompting",
+                    "update": {"sessionUpdate": "agent_message_chunk"},
+                },
+            },
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "active",
+                    "update": {"sessionUpdate": "future_unknown_update"},
+                },
+            },
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "active",
+                    "update": {
+                        "content": {"type": "text", "text": "missing kind"}
+                    },
+                },
+            },
+            {"method": "unknown/notification", "params": {}},
+        ],
+    )
+    def test_direct_unknown_late_or_malformed_update_fails_continuity(
+        self, message
+    ) -> None:
+        """ADI-08/10: direct mode never silently drops ambiguous evidence."""
+
+        client = self._make_client()
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._direct_prompt_phases = {"active": "active"}
+        client._sessions = {
+            "known-but-not-prompting": SessionState(
+                session_id="known-but-not-prompting"
+            ),
+            "active": SessionState(session_id="active"),
+        }
+        client._update_queues["active"] = asyncio.Queue()
+        transport = MagicMock()
+        client._transport = transport
+
+        client._handle_notification(message)
+
+        transport.fail_closed.assert_called_once_with(
+            "direct ACP session update protocol failure"
+        )
+
+    def test_direct_known_update_is_routed_without_failure(self) -> None:
+        """A well-formed active direct update remains ordered in its sole queue."""
+
+        client = self._make_client()
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._direct_prompt_phases = {"active": "active"}
+        client._sessions = {"active": SessionState(session_id="active")}
+        queue: asyncio.Queue = asyncio.Queue()
+        client._update_queues["active"] = queue
+        client._direct_update_budgets["active"] = {
+            "bytes": 0,
+            "count": 0,
+            "byte_limit": 10_000,
+            "count_limit": 10,
+        }
+        transport = MagicMock()
+        client._transport = transport
+        update = {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "hello"},
+        }
+
+        client._handle_notification(
+            {
+                "method": "session/update",
+                "params": {"sessionId": "active", "update": update},
+            }
+        )
+
+        assert queue.get_nowait() == update
+        transport.fail_closed.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "update",
+        [
+            {"sessionUpdate": "usage_update", "inputTokens": True},
+            {"sessionUpdate": "usage_update", "outputTokens": -1},
+            {"sessionUpdate": "usage_update", "totalTokens": "malformed"},
+            {
+                "sessionUpdate": "session_info_update",
+                "sessionInfo": [False, -2],
+            },
+        ],
+    )
+    def test_direct_unproven_usage_and_session_info_are_bounded_raw_updates(
+        self, update: dict[str, Any]
+    ) -> None:
+        """ADI-08: agent-defined diagnostics are retained but not interpreted."""
+
+        client = self._make_client()
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._direct_prompt_phases = {"active": "active"}
+        client._sessions = {"active": SessionState(session_id="active")}
+        queue: asyncio.Queue = asyncio.Queue()
+        client._update_queues["active"] = queue
+        client._direct_update_budgets["active"] = {
+            "bytes": 0,
+            "count": 0,
+            "byte_limit": 10_000,
+            "count_limit": 10,
+        }
+        client._transport = MagicMock()
+
+        client._handle_notification(
+            {
+                "method": "session/update",
+                "params": {"sessionId": "active", "update": update},
+            }
+        )
+
+        assert queue.get_nowait() == update
+        client._transport.fail_closed.assert_not_called()
+
+    def test_direct_out_of_prompt_model_drift_fails_continuity(self) -> None:
+        """ADI-03/08: a config notification cannot silently change the model."""
+
+        client = self._make_client()
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._sessions = {
+            "session": SessionState(
+                session_id="session", model_id="gpt-5.3-codex"
+            )
+        }
+        client._transport = MagicMock()
+
+        client._handle_notification(
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session",
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": [
+                            {
+                                "id": "model",
+                                "category": "model",
+                                "currentValue": "different-model",
+                            }
+                        ],
+                    },
+                },
+            }
+        )
+
+        client._transport.fail_closed.assert_called_once_with(
+            "direct ACP selected model drifted"
+        )
+
+    def test_direct_active_prompt_model_drift_fails_before_evidence_retention(
+        self,
+    ) -> None:
+        """ADI-03/08: active prompt evidence cannot normalize a model change."""
+
+        client = self._make_client()
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._sessions = {
+            "session": SessionState(
+                session_id="session", model_id="gpt-5.3-codex"
+            )
+        }
+        client._direct_prompt_phases = {"session": "active"}
+        queue: asyncio.Queue = asyncio.Queue()
+        client._update_queues = {"session": queue}
+        client._direct_update_budgets = {
+            "session": {
+                "bytes": 0,
+                "count": 0,
+                "byte_limit": 10_000,
+                "count_limit": 10,
+            }
+        }
+        client._transport = MagicMock()
+
+        client._handle_notification(
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session",
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": [
+                            {
+                                "id": "model",
+                                "currentValue": "different-model",
+                            }
+                        ],
+                    },
+                },
+            }
+        )
+
+        assert queue.empty()
+        client._transport.fail_closed.assert_called_once_with(
+            "direct ACP selected model drifted"
+        )
+
+    def test_direct_known_control_update_is_retained_outside_prompt(self) -> None:
+        """ADI-08: legitimate control-plane updates are validated, not dropped."""
+
+        client = self._make_client()
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._sessions = {"session": SessionState(session_id="session")}
+        client._transport = MagicMock()
+        commands = [{"name": "test", "description": "command"}]
+
+        client._handle_notification(
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session",
+                    "update": {
+                        "sessionUpdate": "available_commands_update",
+                        "availableCommands": commands,
+                    },
+                },
+            }
+        )
+
+        assert client._available_commands_by_session == {"session": commands}
+        client._transport.fail_closed.assert_not_called()
+
+    def test_direct_provisional_session_new_command_update_is_retained(self) -> None:
+        """Observed ACP ordering: commands may precede the session/new response."""
+
+        client = self._make_client()
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._transport = MagicMock()
+        client._transport.pending_request_count.return_value = 1
+        commands = [{"name": "test", "description": "command"}]
+
+        client._handle_notification(
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "provisional-session",
+                    "update": {
+                        "sessionUpdate": "available_commands_update",
+                        "availableCommands": commands,
+                    },
+                },
+            }
+        )
+
+        assert client._available_commands_by_session == {
+            "provisional-session": commands
+        }
+        client._transport.fail_closed.assert_not_called()
+
+    def test_direct_provisional_session_ids_are_bounded_to_pending_creates(
+        self,
+    ) -> None:
+        """ADI-08/15: unknown pre-response IDs cannot flood retained state."""
+
+        client = self._make_client()
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._transport = MagicMock()
+        client._transport.pending_request_count.return_value = 1
+
+        for session_id in ("provisional-one", "provisional-two"):
+            client._handle_notification(
+                {
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "available_commands_update",
+                            "availableCommands": [],
+                        },
+                    },
+                }
+            )
+
+        assert client._provisional_session_ids == {"provisional-one"}
+        assert set(client._available_commands_by_session) == {"provisional-one"}
+        client._transport.fail_closed.assert_called_once_with(
+            "direct ACP session update protocol failure"
+        )
+
+    def test_direct_provisional_session_response_mismatch_fails_and_clears(
+        self,
+    ) -> None:
+        """ADI-03/08: a returned session ID must match its provisional stream."""
+
+        client = self._make_client()
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._provisional_session_ids = {"provisional"}
+        client._available_commands_by_session = {"provisional": []}
+        client._transport = MagicMock()
+        client._transport.pending_request_count.return_value = 0
+
+        with pytest.raises(ConnectionError, match="provisional session identity"):
+            client._bind_provisional_session("different")
+
+        assert client._provisional_session_ids == set()
+        assert client._available_commands_by_session == {}
+        client._transport.fail_closed.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("byte_limit", "count_limit", "updates"),
+        [
+            (10_000, 1, ["one", "two"]),
+            (80, 10, ["x" * 200]),
+        ],
+    )
+    def test_direct_reader_side_evidence_limits_fail_before_queue_growth(
+        self,
+        byte_limit: int,
+        count_limit: int,
+        updates: list[str],
+    ) -> None:
+        """ADI-08/15: a fast child cannot outpace bounded evidence retention."""
+
+        client = self._make_client()
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._sessions = {"session": SessionState(session_id="session")}
+        client._direct_prompt_phases = {"session": "active"}
+        queue: asyncio.Queue = asyncio.Queue(maxsize=count_limit + 1)
+        client._update_queues = {"session": queue}
+        client._direct_update_budgets = {
+            "session": {
+                "bytes": 0,
+                "count": 0,
+                "byte_limit": byte_limit,
+                "count_limit": count_limit,
+            }
+        }
+        client._transport = MagicMock()
+
+        for text in updates:
+            client._handle_notification(
+                {
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "session",
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": text},
+                        },
+                    },
+                }
+            )
+
+        assert queue.qsize() <= count_limit
+        client._transport.fail_closed.assert_called_once_with(
+            "direct ACP evidence stream exceeded reader-side limits"
+        )
+
+    def test_direct_active_config_update_rejects_malformed_items(self) -> None:
+        """ADI-03/08: every complete config option item is structurally checked."""
+
+        client = self._make_client()
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._sessions = {
+            "session": SessionState(
+                session_id="session", model_id="gpt-5.3-codex"
+            )
+        }
+        client._direct_prompt_phases = {"session": "active"}
+        client._update_queues = {"session": asyncio.Queue()}
+        client._direct_update_budgets = {
+            "session": {
+                "bytes": 0,
+                "count": 0,
+                "byte_limit": 10_000,
+                "count_limit": 10,
+            }
+        }
+        client._transport = MagicMock()
+
+        client._handle_notification(
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session",
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": [42],
+                    },
+                },
+            }
+        )
+
+        assert client._update_queues["session"].empty()
+        client._transport.fail_closed.assert_called_once_with(
+            "direct ACP config update malformed"
+        )
+
+    @pytest.mark.parametrize("next_phase", ["terminal", "preparing"])
+    def test_direct_post_terminal_update_fails_before_or_during_next_prompt(
+        self, next_phase: str
+    ) -> None:
+        """ADI-08/10: terminal response is an ordered, closed evidence boundary."""
+
+        client = self._make_client()
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._sessions = {"active": SessionState(session_id="active")}
+        queue: asyncio.Queue = asyncio.Queue()
+        client._update_queues["active"] = queue
+        client._direct_prompt_phases = {"active": "active"}
+        transport = MagicMock()
+        transport.has_pending_incoming_requests.return_value = False
+        client._transport = transport
+
+        client._observe_response(
+            {"jsonrpc": "2.0", "id": 1, "result": {"stopReason": "end_turn"}},
+            "session/prompt",
+            {"sessionId": "active", "prompt": []},
+        )
+        assert queue.get_nowait() == {"__acp_prompt_terminal__": True}
+        client._direct_prompt_phases["active"] = next_phase
+
+        client._handle_notification(
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "active",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "late"},
+                    },
+                },
+            }
+        )
+
+        transport.fail_closed.assert_called_once_with(
+            "direct ACP session update protocol failure"
         )
 
 
@@ -586,6 +1050,328 @@ class TestTrySetModel:
 
         with pytest.raises(RuntimeError, match="Model selection not supported"):
             await client._try_set_model("s1", "gpt-4o")
+
+
+class TestDirectAcpContract:
+    """Strict ACP primitives used only by Meadow direct mode."""
+
+    @pytest.mark.asyncio
+    async def test_direct_client_logs_never_persist_control_payloads(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """ADI-02/09/15: direct client logs keep only bounded metadata."""
+
+        cwd_canary = "/private/T122-WORKSPACE-CREDENTIAL-SECRET"
+        session_canary = "T122-BACKEND-SESSION-SECRET"
+        agent_canary = "T122-AGENT-INFO-SECRET"
+        auth_canary = "T122-AUTH-METHOD-SECRET"
+        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        transport = AsyncMock()
+        transport.send_request.side_effect = [
+            {
+                "protocolVersion": 1,
+                "agentInfo": {"name": agent_canary, "version": "1"},
+                "agentCapabilities": {"secretCapability": auth_canary},
+                "authMethods": [{"name": auth_canary}],
+            },
+            {"sessionId": session_canary},
+        ]
+        transport.pending_request_count.return_value = 0
+        client._transport = transport
+        caplog.set_level("DEBUG", logger="acp_proxy.client")
+
+        await client._initialize()
+        assert await client.create_session(cwd_canary) == session_canary
+
+        for canary in (
+            cwd_canary,
+            session_canary,
+            agent_canary,
+            auth_canary,
+        ):
+            assert canary not in caplog.text
+        assert "session/new" in caplog.text
+        assert "protocol=1" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_direct_protocol_mismatch_never_exposes_agent_value(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """ADI-02/15: an agent-controlled protocol value cannot escape startup."""
+
+        protocol_canary = "T122-PROTOCOL-CREDENTIAL-SECRET"
+        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        transport = AsyncMock()
+        transport.send_request.return_value = {
+            "protocolVersion": protocol_canary,
+            "agentInfo": {},
+            "agentCapabilities": {},
+        }
+        client._transport = transport
+        caplog.set_level("DEBUG", logger="acp_proxy.client")
+
+        with pytest.raises(RuntimeError, match="direct ACP protocol version mismatch") as raised:
+            await client._initialize()
+
+        assert protocol_canary not in str(raised.value)
+        assert protocol_canary not in caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("invalid_protocol", [True, 1.0])
+    async def test_direct_protocol_version_requires_exact_integer(
+        self,
+        invalid_protocol: object,
+    ) -> None:
+        """ADI-02: bool/float values cannot alias ACP protocol v1."""
+
+        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        transport = AsyncMock()
+        transport.send_request.return_value = {
+            "protocolVersion": invalid_protocol,
+            "agentInfo": {},
+            "agentCapabilities": {},
+        }
+        client._transport = transport
+
+        with pytest.raises(RuntimeError, match="direct ACP protocol version mismatch"):
+            await client._initialize()
+
+    @pytest.mark.asyncio
+    async def test_initialize_retains_agent_capabilities_and_advertises_no_callbacks(
+        self,
+    ) -> None:
+        """ADI-02/09: direct initialization is truthful and least-capability."""
+        client = AcpClient.__new__(AcpClient)
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._protocol_version = None
+        client._agent_capabilities = {}
+        client._agent_name = None
+        client._agent_version = None
+        transport = AsyncMock()
+        transport.send_request.return_value = {
+            "protocolVersion": 1,
+            "agentInfo": {"name": "copilot", "version": "1.2.3"},
+            "agentCapabilities": {
+                "loadSession": True,
+                "sessionCapabilities": {"list": {}},
+            },
+        }
+        client._transport = transport
+
+        await client._initialize()
+
+        sent = transport.send_request.await_args.args
+        assert sent[0] == "initialize"
+        assert sent[1]["clientCapabilities"] == {}
+        assert client.protocol_version == 1
+        assert client.agent_capabilities["loadSession"] is True
+
+    @pytest.mark.asyncio
+    async def test_exact_model_selection_requires_complete_acknowledgement(self) -> None:
+        """ADI-03: method success is not model acknowledgement."""
+        client = AcpClient.__new__(AcpClient)
+        client._models = [ModelInfo("gpt-5.3-codex", "GPT-5.3 Codex")]
+        client._default_model = "gpt-5.5"
+        client._sessions = {}
+        client._transport = AsyncMock()
+        client._transport.send_request.side_effect = [
+            {
+                "sessionId": "session",
+                "models": {
+                    "availableModels": [
+                        {"modelId": "gpt-5.3-codex", "name": "GPT-5.3 Codex"}
+                    ],
+                    "currentModelId": "gpt-5.5",
+                },
+            },
+            {
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "category": "model",
+                        "currentValue": "gpt-5.3-codex",
+                    }
+                ]
+            },
+        ]
+
+        descriptor = await client.create_session_exact("/workspace", "gpt-5.3-codex")
+
+        assert descriptor.session_id == "session"
+        assert descriptor.model_id == "gpt-5.3-codex"
+        assert client._transport.send_request.await_args_list[1].args == (
+            "session/set_config_option",
+            {
+                "sessionId": "session",
+                "configId": "model",
+                "value": "gpt-5.3-codex",
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_exact_model_selection_rejects_wrong_current_value(self) -> None:
+        """ADI-03: an acknowledged default cannot substitute for the requested model."""
+        client = AcpClient.__new__(AcpClient)
+        client._models = [ModelInfo("gpt-5.3-codex", "GPT-5.3 Codex")]
+        client._default_model = "gpt-5.5"
+        client._sessions = {}
+        client._transport = AsyncMock()
+        client._transport.send_request.side_effect = [
+            {
+                "sessionId": "session",
+                "models": {
+                    "availableModels": [
+                        {"modelId": "gpt-5.3-codex", "name": "GPT-5.3 Codex"}
+                    ],
+                    "currentModelId": "gpt-5.5",
+                },
+            },
+            {
+                "configOptions": [
+                    {"id": "model", "currentValue": "gpt-5.5"}
+                ]
+            },
+        ]
+
+        with pytest.raises(RuntimeError, match="acknowledged model"):
+            await client.create_session_exact("/workspace", "gpt-5.3-codex")
+
+    @pytest.mark.asyncio
+    async def test_cancel_is_stable_session_notification(self) -> None:
+        """ADI-10: cancellation reaches ACP and is not local-task-only."""
+        client = AcpClient.__new__(AcpClient)
+        client._sessions = {"session": SessionState("session")}
+        client._transport = AsyncMock()
+
+        await client.cancel_session("session")
+
+        client._transport.send_notification.assert_awaited_once_with(
+            "session/cancel", {"sessionId": "session"}
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["stop", "abort"])
+    async def test_teardown_drains_full_update_queue_and_closes_transport(
+        self, method: str
+    ) -> None:
+        """ADI-13/15: evidence backpressure cannot prevent owned teardown."""
+
+        client = AcpClient.__new__(AcpClient)
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        queue.put_nowait({"sessionUpdate": "agent_message_chunk"})
+        client._update_queues = {"session": queue}
+        client._direct_prompt_phases = {"session": "active"}
+        client._direct_update_budgets = {"session": {}}
+        client._expected_model_updates = {}
+        client._available_commands_by_session = {}
+        client._provisional_session_ids = set()
+        client._sessions = {"session": SessionState("session")}
+        client._transport = AsyncMock()
+
+        await getattr(client, method)()
+
+        getattr(client._transport, method).assert_awaited_once()
+        assert queue.get_nowait() is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("result", [{}, {"stopReason": ""}, {"stopReason": "novel"}])
+    async def test_direct_prompt_requires_known_explicit_stop_reason(
+        self, result: dict[str, Any]
+    ) -> None:
+        """ADI-08/10: direct terminal state is never synthesized or unknown."""
+        client = AcpClient.__new__(AcpClient)
+        client._sessions = {"session": SessionState("session")}
+        client._update_queues = {}
+        transport = AsyncMock()
+        transport.send_request.return_value = result
+        client._transport = transport
+
+        with pytest.raises(RuntimeError, match="known non-empty stopReason"):
+            async for _ in client.prompt_blocks(
+                "session", [{"type": "text", "text": "prompt"}], timeout_s=1
+            ):
+                pass
+
+    def test_direct_callback_policy_denies_unadvertised_callbacks(self) -> None:
+        """ADI-09: direct callbacks fail closed and never select allow_always."""
+        client = AcpClient.__new__(AcpClient)
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        permission = client._handle_agent_request(
+            {
+                "method": "session/request_permission",
+                "params": {
+                    "options": [
+                        {"optionId": "always", "kind": "allow_always"},
+                        {"optionId": "once", "kind": "allow_once"},
+                    ]
+                },
+            }
+        )
+        assert permission == {"outcome": {"outcome": "cancelled"}}
+        with pytest.raises(PermissionError):
+            client._handle_agent_request(
+                {"method": "fs/read_text_file", "params": {"path": "/tmp/x"}}
+            )
+
+    def test_direct_callback_evidence_is_ordered_and_sanitized(self) -> None:
+        """ADI-08/09: denied callbacks retain outcome without raw sensitive params."""
+        client = AcpClient.__new__(AcpClient)
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        client._update_queues = {"session": queue}
+        client._direct_prompt_phases = {"session": "active"}
+        client._direct_update_budgets = {
+            "session": {
+                "bytes": 0,
+                "count": 0,
+                "byte_limit": 10_000,
+                "count_limit": 10,
+            }
+        }
+        client._transport = MagicMock()
+
+        client._observe_agent_request(
+            {
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "session",
+                    "secret": "must-not-survive",
+                    "options": [
+                        {
+                            "optionId": "private-option-id",
+                            "kind": "allow_always",
+                            "name": "private permission text",
+                        },
+                        {"optionId": "once", "kind": "allow_once"},
+                    ],
+                },
+            }
+        )
+        client._observe_agent_request(
+            {
+                "method": "fs/read_text_file",
+                "params": {
+                    "sessionId": "session",
+                    "path": "/private/sensitive/path",
+                },
+            }
+        )
+
+        permission = queue.get_nowait()
+        denied = queue.get_nowait()
+        assert permission == {
+            "sessionUpdate": "client_permission_request",
+            "outcome": "cancelled",
+            "offeredKinds": ["allow_always", "allow_once"],
+        }
+        assert denied == {
+            "sessionUpdate": "client_callback_denied",
+            "callbackMethod": "fs/read_text_file",
+            "outcome": "denied",
+        }
+        assert "private" not in repr((permission, denied)).lower()
 
     @pytest.mark.asyncio
     async def test_non_not_found_error_propagates(self):

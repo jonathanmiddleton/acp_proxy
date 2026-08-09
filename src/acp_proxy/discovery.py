@@ -1,14 +1,13 @@
 """
 Binary discovery for copilot-language-server.
 
-The only supported binary is the one bundled with the GitHub Copilot plugin
-for IntelliJ IDEA 2025.3 or 2026.1. Other versions (older IntelliJ, other JetBrains
-IDEs, standalone installs, Homebrew, npm) are known to be incompatible with
-the ACP protocol surface this proxy requires.
+Supported binaries are bundled with the GitHub Copilot plugin for IntelliJ IDEA
+or PyCharm 2025.3/2026.1. Other versions/products, standalone installs,
+Homebrew, and npm are outside the validated ACP surface.
 
 Supported platforms:
-- macOS (Darwin): binary at ~/Library/Application Support/JetBrains/IntelliJIdea2025.3/plugins/...
-- Windows: binary at %APPDATA%/JetBrains/IntelliJIdea2025.3/plugins/... (roaming profile)
+- macOS (Darwin): binary under a supported JetBrains IDE plugin directory.
+- Windows: binary under a supported `%APPDATA%/JetBrains` plugin directory.
 
 This module is the single source of truth for binary resolution. Both the
 CLI entry point and the test suite import from here.
@@ -24,7 +23,12 @@ import subprocess
 logger = logging.getLogger(__name__)
 
 # The IDE directory names that identify compatible IntelliJ versions.
-_IDE_DIRS = ("IntelliJIdea2025.3", "IntelliJIdea2026.1", "PyCharm2025.3", "PyCharm2026.1")
+_IDE_DIRS = (
+    "IntelliJIdea2025.3",
+    "IntelliJIdea2026.1",
+    "PyCharm2025.3",
+    "PyCharm2026.1",
+)
 
 _PLUGIN_SUFFIX_PARTS = (
     "plugins",

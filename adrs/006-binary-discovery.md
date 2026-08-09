@@ -1,6 +1,6 @@
-# ADR-006: Binary Discovery — IntelliJ IDEA 2025.3 Only
+# ADR-006: Version-Bounded JetBrains Binary Discovery
 
-**Status:** Accepted  
+**Status:** Accepted; supported path set amended 2026-08-09
 **Date:** 2026-04-03  
 
 ## Context
@@ -36,7 +36,9 @@ break on every other machine.
 
 1. **Validates three properties for compatibility.** A binary path must:
    - Be under the current user's home directory.
-   - Contain `IntelliJIdea2025.3` as a path component.
+   - Contain one supported IDE/version directory as a path component:
+     `IntelliJIdea2025.3`, `IntelliJIdea2026.1`, `PyCharm2025.3`, or
+     `PyCharm2026.1`.
    - Have the correct binary filename (`copilot-language-server` on Unix,
      `copilot-language-server.exe` on Windows).
 
@@ -64,8 +66,8 @@ duplicated discovery logic.
 
 - **Version specificity prevents silent incompatibility.** ACP behavior can
   differ between binary versions. The proxy was developed and tested against
-  the IntelliJ 2025.3 plugin binary (agent version 1.457.1 on dev, 1.442.0
-  on target). Accepting arbitrary versions risks silent behavioral differences.
+  specific JetBrains plugin families and versions. Accepting arbitrary
+  versions risks silent behavioral differences.
 - **Single source of truth.** Before this change, `__main__.py` and
   `test_integration.py` had separate discovery logic that diverged. Extracting
   to a shared module eliminated the inconsistency.
@@ -79,10 +81,8 @@ duplicated discovery logic.
 
 ## Consequences
 
-- **Only one IDE version supported.** If the user upgrades to IntelliJ 2026.1,
-  discovery will fail until the pattern is updated. This is intentional — the
-  proxy should be explicitly validated against new versions before accepting
-  them.
+- **Only an enumerated IDE/version set is supported.** A new JetBrains product
+  or release fails discovery until it is explicitly added and tested.
 - **Filesystem fallback assumes a specific directory structure.** The
   `find_binary_from_jetbrains()` path uses the full expected layout
   (including `native/{arch}/`). If the actual layout differs (as on the
@@ -99,3 +99,4 @@ duplicated discovery logic.
 | Date | Change |
 |------|--------|
 | 2026-04-07 | Relaxed path matching from exact full-path regex to three-property check (home dir, IDE dir component, binary name). Added Windows process discovery via PowerShell + wmic fallback. Confirmed Windows target uses a different directory layout (`bin/` instead of `native/{arch}/`). |
+| 2026-08-09 | Aligned the decision with production discovery for IntelliJ IDEA and PyCharm 2025.3/2026.1 paths. Arbitrary versions and products remain fail-loud. |

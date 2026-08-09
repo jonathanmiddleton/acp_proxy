@@ -1,6 +1,6 @@
 # ADR-002: Session-per-Conversation via First-Message Hash
 
-**Status:** Accepted  
+**Status:** Accepted for `opencode-legacy`; superseded for direct identity by [ADR-012](012-meadow-direct-consumer-protocol.md)
 **Date:** 2026-04-03  
 
 ## Context
