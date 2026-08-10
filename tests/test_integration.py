@@ -148,10 +148,10 @@ async def test_acp_client_prompt_and_stream(binary: str):
     client = AcpClient(binary)
     try:
         await client.start(env=_live_child_env())
-        await client.create_session(os.getcwd())
-        session_id = (
-            await client.create_session_exact(os.getcwd(), REQUIRED_LIVE_MODEL)
-        ).session_id
+        session_id = await client.create_session(
+            os.getcwd(),
+            model_id=REQUIRED_LIVE_MODEL,
+        )
 
         chunks: list[dict] = []
         async for update in client.prompt(
