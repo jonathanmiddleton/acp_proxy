@@ -8,8 +8,10 @@ means the environment is misconfigured, and skipping would mask that.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
+from pathlib import Path
 
 import httpx
 import pytest
@@ -20,6 +22,7 @@ from acp_proxy.copilot_auth import inject_prior_copilot_oauth
 from acp_proxy.direct_protocol import CreateSessionRequest, PromptRequest
 from acp_proxy.direct_service import DirectService
 from acp_proxy.discovery import BinaryCompatibilityError, find_binary
+from acp_proxy.transport import AcpError
 
 REQUIRED_LIVE_MODEL = "gpt-5.3-codex"
 
@@ -28,6 +31,36 @@ def _live_child_env() -> dict[str, str]:
     """Build the same authenticated child environment as direct CLI startup."""
 
     return _direct_child_env(inject_prior_copilot_oauth(dict(os.environ)))
+
+
+def _without_token_credentials(source: dict[str, str]) -> dict[str, str]:
+    """Remove ambient token credentials so persisted auth cannot mask the test."""
+
+    return {
+        key: value
+        for key, value in source.items()
+        if "TOKEN" not in key.upper()
+    }
+
+
+def _isolated_auth_env(source: dict[str, str], root: Path) -> dict[str, str]:
+    """Point every supported credential/config root at a fresh empty tree."""
+
+    locations = {
+        "LOCALAPPDATA": root / "local-app-data",
+        "APPDATA": root / "app-data",
+        "USERPROFILE": root / "user-profile",
+        "HOME": root / "home",
+        "XDG_CONFIG_HOME": root / "xdg-config",
+        "XDG_DATA_HOME": root / "xdg-data",
+        "XDG_STATE_HOME": root / "xdg-state",
+        "XDG_CACHE_HOME": root / "xdg-cache",
+    }
+    env = _direct_child_env(source)
+    for name, path in locations.items():
+        path.mkdir(parents=True)
+        env[name] = str(path)
+    return env
 
 
 @pytest.fixture(scope="module")
@@ -53,22 +86,60 @@ def binary() -> str:
 
 
 @pytest.mark.asyncio
-async def test_acp_client_initialize_and_discover_models(binary: str):
-    """Start the ACP client and verify initialization + model discovery."""
-    client = AcpClient(binary)
+async def test_acp_client_initialize_and_discover_models(
+    binary: str,
+    tmp_path: Path,
+) -> None:
+    """Prove isolated startup fails without injection and succeeds with it."""
+
+    ambient_without_tokens = _without_token_credentials(dict(os.environ))
+    unauthenticated_env = _isolated_auth_env(
+        ambient_without_tokens,
+        tmp_path / "without-token",
+    )
+    assert "GH_COPILOT_TOKEN" not in unauthenticated_env
+    assert "GITHUB_COPILOT_TOKEN" not in unauthenticated_env
+
+    unauthenticated_client = AcpClient(
+        binary,
+        callback_policy=CallbackPolicy.DIRECT_DENY,
+    )
     try:
-        await client.start(env=_live_child_env())
-        session_id = await client.create_session(os.getcwd())
+        await unauthenticated_client.start(env=unauthenticated_env)
+        with pytest.raises(AcpError) as exc_info:
+            await asyncio.wait_for(
+                unauthenticated_client.create_session(os.getcwd()),
+                timeout=30.0,
+            )
+        assert exc_info.value.error_obj.get("code") == -32000
+    finally:
+        await unauthenticated_client.stop()
+
+    authenticated_source = inject_prior_copilot_oauth(ambient_without_tokens)
+    authenticated_env = _isolated_auth_env(
+        authenticated_source,
+        tmp_path / "with-token",
+    )
+    assert "GH_COPILOT_TOKEN" not in authenticated_env
+    assert "GITHUB_COPILOT_TOKEN" in authenticated_env
+
+    authenticated_client = AcpClient(
+        binary,
+        callback_policy=CallbackPolicy.DIRECT_DENY,
+    )
+    try:
+        await authenticated_client.start(env=authenticated_env)
+        session_id = await authenticated_client.create_session(os.getcwd())
 
         assert session_id is not None
-        assert len(client.models) > 0
-        assert client.default_model is not None
-        assert client.agent_info["name"] is not None
+        assert len(authenticated_client.models) > 0
+        assert authenticated_client.default_model is not None
+        assert authenticated_client.agent_info["name"] is not None
 
-        model_ids = [m.model_id for m in client.models]
+        model_ids = [model.model_id for model in authenticated_client.models]
         assert len(model_ids) >= 1
     finally:
-        await client.stop()
+        await authenticated_client.stop()
 
 
 @pytest.mark.asyncio
