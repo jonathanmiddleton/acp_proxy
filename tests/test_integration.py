@@ -16,6 +16,7 @@ import pytest
 
 from acp_proxy.__main__ import _direct_child_env
 from acp_proxy.client import AcpClient, CallbackPolicy
+from acp_proxy.copilot_auth import inject_prior_copilot_oauth
 from acp_proxy.direct_protocol import CreateSessionRequest, PromptRequest
 from acp_proxy.direct_service import DirectService
 from acp_proxy.discovery import BinaryCompatibilityError, find_binary
@@ -24,9 +25,9 @@ REQUIRED_LIVE_MODEL = "gpt-5.3-codex"
 
 
 def _live_child_env() -> dict[str, str]:
-    """Project the ambient environment without exposing unrelated credentials."""
+    """Build the same authenticated child environment as direct CLI startup."""
 
-    return _direct_child_env(dict(os.environ))
+    return _direct_child_env(inject_prior_copilot_oauth(dict(os.environ)))
 
 
 @pytest.fixture(scope="module")
