@@ -176,6 +176,14 @@ only — the global environment is not modified. Shell environment variables
 (`HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`) take precedence over config file
 values if both are set.
 
+### GitHub environment forwarding
+
+The proxy forwards every environment variable whose name begins with `GH` or
+`GITHUB` unchanged to the `copilot-language-server` subprocess. This includes
+`GH_COPILOT_TOKEN` and `GITHUB_COPILOT_TOKEN`; if both are present, both are
+forwarded. Names are matched case-insensitively for stable Windows behavior,
+and no aliases are synthesized.
+
 ### Legacy context injection
 
 Only `opencode-legacy` mode injects workspace markdown files into the system

@@ -54,7 +54,7 @@ written to metadata or logs.
 The direct ACP child receives an allowlisted environment: process path/home,
 temporary and locale settings, XDG configuration/cache paths, certificate and
 network-proxy configuration, required OS runtime keys, and the non-secret
-Copilot enterprise URI. Provider API keys, generic GitHub tokens, Meadow
+Copilot enterprise URI. Provider API keys, Meadow
 credentials, launch attestation, and unrelated `*_TOKEN`, `*_SECRET`, or
 `*_API_KEY` values are excluded. Legacy mode retains its separate compatibility
 environment behavior.

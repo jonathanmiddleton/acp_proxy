@@ -885,10 +885,10 @@ def test_container_env_claim_without_runtime_boundary_fails_pre_child(
 
 
 @pytest.mark.parametrize("authority", ["trusted-host", "confined-container"])
-def test_direct_child_environment_is_an_exact_least_credential_allowlist(
+def test_direct_child_environment_allows_runtime_and_github_namespaces(
     authority: str,
 ) -> None:
-    """ADI-09/15: host and container children receive no unrelated credentials."""
+    """ADI-09/15: children receive GitHub but not unrelated credentials."""
     canary = "canary-secret-must-not-cross"
     source = {
         "PATH": "/usr/bin",
@@ -899,6 +899,12 @@ def test_direct_child_environment_is_an_exact_least_credential_allowlist(
         "HTTPS_PROXY": "http://required-proxy",
         "SSL_CERT_FILE": "/cert.pem",
         "GITHUB_COPILOT_ENTERPRISE_URI": "https://github.example",
+        "GH_COPILOT_TOKEN": "gh-copilot-credential",
+        "GITHUB_COPILOT_TOKEN": "github-copilot-credential",
+        "GH_TOKEN": "gh-general-credential",
+        "GITHUB_TOKEN": "github-general-credential",
+        "github_actions": "true",
+        "ghost_setting": "literal-gh-prefix",
         "SYSTEMROOT": r"C:\Windows",
         "appdata": r"C:\Users\worker\AppData\Roaming",
         cli.DIRECT_SECRET_ENV: canary,
@@ -906,8 +912,7 @@ def test_direct_child_environment_is_an_exact_least_credential_allowlist(
         "MEADOW_OPENAI_API_KEY": canary,
         "OPENAI_API_KEY": canary,
         "MOONSHOT_API_KEY": canary,
-        "GITHUB_TOKEN": canary,
-        "GH_TOKEN": canary,
+        "XGITHUB_TOKEN": canary,
         "UNRELATED_TOKEN": canary,
         "UNRELATED_SECRET": canary,
     }
@@ -923,9 +928,19 @@ def test_direct_child_environment_is_an_exact_least_credential_allowlist(
         "HTTPS_PROXY",
         "SSL_CERT_FILE",
         "GITHUB_COPILOT_ENTERPRISE_URI",
+        "GH_COPILOT_TOKEN",
+        "GITHUB_COPILOT_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "github_actions",
+        "ghost_setting",
         "SYSTEMROOT",
         "appdata",
     }
+    assert child["GH_COPILOT_TOKEN"] == "gh-copilot-credential"
+    assert child["GITHUB_COPILOT_TOKEN"] == "github-copilot-credential"
+    assert child["GH_TOKEN"] == "gh-general-credential"
+    assert child["GITHUB_TOKEN"] == "github-general-credential"
     assert canary not in child.values()
     assert authority in {"trusted-host", "confined-container"}
 

@@ -99,6 +99,7 @@ DIRECT_CHILD_ENV_KEYS = frozenset(
         "GITHUB_COPILOT_ENTERPRISE_URI",
     }
 )
+DIRECT_CHILD_ENV_PREFIXES = ("LC_", "GH", "GITHUB")
 
 
 def _has_observable_container_boundary() -> bool:
@@ -108,12 +109,13 @@ def _has_observable_container_boundary() -> bool:
 
 
 def _direct_child_env(source: dict[str, str]) -> dict[str, str]:
-    """Build the least-credential environment for the direct ACP child."""
+    """Build the allowlisted environment for the admitted direct ACP child."""
 
     return {
         key: value
         for key, value in source.items()
-        if key.upper() in DIRECT_CHILD_ENV_KEYS or key.upper().startswith("LC_")
+        if key.upper() in DIRECT_CHILD_ENV_KEYS
+        or key.upper().startswith(DIRECT_CHILD_ENV_PREFIXES)
     }
 
 
