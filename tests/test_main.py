@@ -18,6 +18,7 @@ from acp_proxy import __main__ as cli
 from acp_proxy import discovery
 from acp_proxy.application_policy import MIN_COPILOT_LANGUAGE_SERVER_VERSION
 from acp_proxy.client import ModelAcknowledgementError
+from acp_proxy.copilot_auth import CopilotOAuthCredentialError
 from acp_proxy.direct_protocol import CreateSessionRequest, PromptRequest
 from acp_proxy.discovery import BinaryAdmission, BinaryCompatibilityError
 
@@ -214,7 +215,11 @@ def test_cli_explicit_old_binary_fails_before_client_start(
     monkeypatch.setattr(cli, "AcpClient", ForbiddenClient)
     monkeypatch.setattr(cli, "_configure_logging", lambda *_args: None)
     monkeypatch.setattr(cli, "load_config", dict)
-    monkeypatch.setattr(cli, "build_subprocess_env", lambda _cfg: {})
+    monkeypatch.setattr(
+        cli,
+        "build_subprocess_env",
+        lambda _cfg: {"GITHUB_COPILOT_TOKEN": "synthetic-token"},
+    )
     monkeypatch.setattr(cli, "config_path", lambda: tmp_path / "config.json")
     monkeypatch.setenv(cli.DIRECT_SECRET_ENV, "s" * 48)
     monkeypatch.setattr(
@@ -234,6 +239,102 @@ def test_cli_explicit_old_binary_fails_before_client_start(
     with pytest.raises(SystemExit) as exc_info:
         cli.main()
     assert exc_info.value.code == 1
+
+
+def test_cli_direct_injects_prior_oauth_into_child_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct CLI startup augments only its local subprocess mapping."""
+
+    observed: dict[str, Any] = {}
+    token = "oauth-main-canary-never-log"
+    launch_secret = "s" * 48
+
+    def fake_inject(env: dict[str, str]) -> dict[str, str]:
+        child_env = dict(env)
+        child_env["GITHUB_COPILOT_TOKEN"] = token
+        return child_env
+
+    async def fake_run(*_args: Any, **kwargs: Any) -> None:
+        observed.update(kwargs)
+
+    monkeypatch.setattr(cli, "_configure_logging", lambda *_args: None)
+    monkeypatch.setattr(cli, "load_config", dict)
+    monkeypatch.setattr(
+        cli,
+        "build_subprocess_env",
+        lambda _cfg: {
+            "PATH": "synthetic-path",
+            cli.DIRECT_SECRET_ENV: launch_secret,
+        },
+    )
+    monkeypatch.setattr(cli, "inject_prior_copilot_oauth", fake_inject)
+    monkeypatch.setattr(cli, "config_path", lambda: tmp_path / "config.json")
+    monkeypatch.setattr(cli, "run", fake_run)
+    monkeypatch.setenv(cli.DIRECT_SECRET_ENV, launch_secret)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "acp-proxy",
+            "--consumer-mode",
+            "meadow-direct",
+            "--execution-authority",
+            "trusted-host",
+            "--binary",
+            "/synthetic/copilot-language-server",
+        ],
+    )
+
+    cli.main()
+
+    subprocess_env = observed["subprocess_env"]
+    assert subprocess_env["GITHUB_COPILOT_TOKEN"] == token
+    assert subprocess_env["PATH"] == "synthetic-path"
+    assert cli.DIRECT_SECRET_ENV not in subprocess_env
+
+
+def test_cli_direct_oauth_error_stops_before_child_start(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Credential discovery failures produce a clean, secret-free CLI exit."""
+
+    token = "oauth-error-canary-never-log"
+
+    async def forbidden_run(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("credential failure reached child startup")
+
+    def fail_injection(_env: dict[str, str]) -> dict[str, str]:
+        raise CopilotOAuthCredentialError("synthetic credential failure")
+
+    monkeypatch.setattr(cli, "_configure_logging", lambda *_args: None)
+    monkeypatch.setattr(cli, "load_config", dict)
+    monkeypatch.setattr(cli, "build_subprocess_env", lambda _cfg: {"CANARY": token})
+    monkeypatch.setattr(cli, "inject_prior_copilot_oauth", fail_injection)
+    monkeypatch.setattr(cli, "run", forbidden_run)
+    monkeypatch.setenv(cli.DIRECT_SECRET_ENV, "s" * 48)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "acp-proxy",
+            "--consumer-mode",
+            "meadow-direct",
+            "--execution-authority",
+            "trusted-host",
+            "--binary",
+            "/synthetic/copilot-language-server",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+
+    assert exc_info.value.code == 1
+    assert "synthetic credential failure" in caplog.text
+    assert token not in caplog.text
 
 
 @pytest.mark.asyncio

@@ -43,6 +43,10 @@ from .config import (
     config_path,
     load_config,
 )
+from .copilot_auth import (
+    CopilotOAuthCredentialError,
+    inject_prior_copilot_oauth,
+)
 from .direct_protocol import DirectLimits
 from .direct_server import create_direct_app
 from .direct_service import DirectService
@@ -630,6 +634,12 @@ def main() -> None:
     # The proxy launch credential authenticates inbound Meadow traffic only.
     # Never expose it to the separately controlled language-server subprocess.
     subprocess_env.pop(DIRECT_SECRET_ENV, None)
+    if args.consumer_mode == "meadow-direct":
+        try:
+            subprocess_env = inject_prior_copilot_oauth(subprocess_env)
+        except CopilotOAuthCredentialError as exc:
+            logger.error("Direct Copilot authentication setup failed: %s", exc)
+            sys.exit(1)
     logger.info("Config file: %s", config_path())
 
     # --- Phase 1c: CLI override for context files ---

@@ -184,6 +184,22 @@ The proxy forwards every environment variable whose name begins with `GH` or
 forwarded. Names are matched case-insensitively for stable Windows behavior,
 and no aliases are synthesized.
 
+For `meadow-direct` CLI startup, an explicit non-empty `GH_COPILOT_TOKEN` or
+`GITHUB_COPILOT_TOKEN` remains authoritative. If neither is set, the proxy
+loads the single prior OAuth `accessToken` from the GitHub Copilot
+`oauth.json` file and supplies it to the child as `GITHUB_COPILOT_TOKEN`.
+Windows uses `%LOCALAPPDATA%\github-copilot\oauth.json` (with the conventional
+`%USERPROFILE%\AppData\Local` fallback). Automatic file discovery is limited
+to this verified Windows layout; other platforms must use one of the explicit
+token variables. The file must contain exactly one OAuth account so the proxy
+never guesses between identities. Authority and endpoint routing remain owned
+by the surrounding `GH*`/`GITHUB*` environment and the company's proxy setup;
+those values are forwarded unchanged. Missing, malformed, empty, or ambiguous
+credentials stop startup before the language server is launched. Credential
+values are never logged, and the language server remains responsible for
+exchanging the durable OAuth credential for and refreshing its short-lived
+Copilot service token.
+
 ### Legacy context injection
 
 Only `opencode-legacy` mode injects workspace markdown files into the system
