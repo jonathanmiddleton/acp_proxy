@@ -36,7 +36,7 @@ import tempfile
 import uvicorn
 
 from .application_policy import MIN_COPILOT_LANGUAGE_SERVER_VERSION
-from .client import AcpClient, CallbackPolicy, ModelAcknowledgementError
+from .client import AcpClient, CallbackPolicy
 from .config import (
     build_subprocess_env,
     compose_system_prompt,
@@ -333,24 +333,19 @@ async def run(
         catalog_session_id = await client.create_session(cwd)
         if consumer_mode == "meadow-direct":
             default_model = client.default_model
-            if not isinstance(default_model, str) or not default_model:
+            advertised_models = {model.model_id for model in client.models}
+            if (
+                not isinstance(default_model, str)
+                or not default_model
+                or default_model not in advertised_models
+            ):
                 raise _direct_binary_capability_error(
                     admission,
-                    "startup model catalog with a usable default model",
+                    "startup model catalog with an advertised usable default model",
                 )
-            try:
-                await client.acknowledge_session_model(
-                    catalog_session_id,
-                    default_model,
-                )
-            except ModelAcknowledgementError:
-                raise _direct_binary_capability_error(
-                    admission,
-                    "session/set_config_option complete exact-model acknowledgement",
-                ) from None
             logger.info(
-                "Created and exactly acknowledged non-prompted catalog-probe "
-                "ACP session; "
+                "Created non-prompted catalog-probe ACP session with a usable "
+                "default model; "
                 "backend close is unsupported"
             )
         else:

@@ -222,12 +222,15 @@ async def test_full_proxy_http_roundtrip(binary: str):
 
 
 @pytest.mark.asyncio
-async def test_exact_required_model_prompt(binary: str):
-    """Verify exact gpt-5.3-codex selection without spending another model call."""
+async def test_required_model_prompt(binary: str):
+    """Bind gpt-5.3-codex and complete one prompt on the real server."""
     client = AcpClient(binary)
     try:
         await client.start(env=_live_child_env())
         await client.create_session(os.getcwd())
+        catalog_default = client.default_model
+        assert isinstance(catalog_default, str) and catalog_default
+        assert catalog_default != REQUIRED_LIVE_MODEL
         available = {model.model_id for model in client.models}
         assert REQUIRED_LIVE_MODEL in available
         descriptor = await client.create_session_exact(
@@ -256,25 +259,17 @@ async def test_exact_required_model_prompt(binary: str):
 
 
 @pytest.mark.asyncio
-async def test_meadow_direct_exact_model_and_continuity_probe(binary: str) -> None:
-    """Live ADI-03/06/08: exact gpt-5.3-codex direct session settles twice."""
+async def test_meadow_direct_model_binding_and_continuity_probe(binary: str) -> None:
+    """Live direct mode binds gpt-5.3-codex and settles two turns."""
 
     requested_model = REQUIRED_LIVE_MODEL
     client = AcpClient(binary, callback_policy=CallbackPolicy.DIRECT_DENY)
     try:
         await client.start(env=_live_child_env())
-        catalog_session_id = await client.create_session(
-            os.getcwd()
-        )  # one non-prompted catalog probe
+        await client.create_session(os.getcwd())  # one non-prompted catalog probe
         catalog_default = client.default_model
         assert isinstance(catalog_default, str) and catalog_default
-        assert (
-            await client.acknowledge_session_model(
-                catalog_session_id,
-                catalog_default,
-            )
-            == catalog_default
-        )
+        assert catalog_default != requested_model
         assert requested_model in {model.model_id for model in client.models}
         service = DirectService(
             client,

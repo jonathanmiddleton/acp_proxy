@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
@@ -933,6 +933,45 @@ class TestHandleNotification:
 
 
 # ---------------------------------------------------------------------------
+# create_session
+# ---------------------------------------------------------------------------
+
+
+class TestCreateSession:
+    """Legacy session creation applies a requested non-default model."""
+
+    @pytest.mark.asyncio
+    async def test_nondefault_model_is_set_before_it_is_recorded(self) -> None:
+        client = AcpClient("unused")
+        client._transport = AsyncMock()
+        client._transport.send_request.side_effect = [
+            {
+                "sessionId": "legacy-session",
+                "models": {
+                    "availableModels": [
+                        {"modelId": "auto", "name": "Auto"},
+                        {"modelId": "gpt-4o", "name": "GPT-4o"},
+                    ],
+                    "currentModelId": "auto",
+                },
+            },
+            {},
+        ]
+
+        session_id = await client.create_session("/workspace", model_id="gpt-4o")
+
+        assert session_id == "legacy-session"
+        assert client._transport.send_request.await_args_list == [
+            call("session/new", {"cwd": "/workspace", "mcpServers": []}),
+            call(
+                "session/set_model",
+                {"sessionId": "legacy-session", "modelId": "gpt-4o"},
+            ),
+        ]
+        assert client._sessions[session_id].model_id == "gpt-4o"
+
+
+# ---------------------------------------------------------------------------
 # _extract_models
 # ---------------------------------------------------------------------------
 
@@ -997,7 +1036,8 @@ class TestTrySetModel:
     async def test_first_method_succeeds(self):
         """session/set_model works — no fallback needed."""
         client = AcpClient.__new__(AcpClient)
-        client._sessions = {"s1": SessionState(session_id="s1")}
+        client._sessions = {"s1": SessionState(session_id="s1", model_id="auto")}
+        client._expected_model_updates = {}
 
         transport = AsyncMock()
         transport.send_request = AsyncMock(return_value={})
@@ -1008,6 +1048,7 @@ class TestTrySetModel:
             "session/set_model", {"sessionId": "s1", "modelId": "gpt-4o"}
         )
         assert client._sessions["s1"].model_id == "gpt-4o"
+        assert client._expected_model_updates == {}
 
     @pytest.mark.asyncio
     async def test_fallback_to_set_config_option(self):
@@ -1015,7 +1056,8 @@ class TestTrySetModel:
         from acp_proxy.transport import AcpError
 
         client = AcpClient.__new__(AcpClient)
-        client._sessions = {"s1": SessionState(session_id="s1")}
+        client._sessions = {"s1": SessionState(session_id="s1", model_id="auto")}
+        client._expected_model_updates = {}
 
         call_count = 0
 
@@ -1024,7 +1066,11 @@ class TestTrySetModel:
             call_count += 1
             if method == "session/set_model":
                 raise AcpError("Method not found", {"code": -32601})
-            return {}
+            return {
+                "configOptions": [
+                    {"id": "model", "currentValue": params["value"]}
+                ]
+            }
 
         transport = MagicMock()
         transport.send_request = mock_send
@@ -1033,14 +1079,16 @@ class TestTrySetModel:
         await client._try_set_model("s1", "gpt-4o")
         assert call_count == 2
         assert client._sessions["s1"].model_id == "gpt-4o"
+        assert client._expected_model_updates == {}
 
     @pytest.mark.asyncio
     async def test_both_methods_fail_raises(self):
-        """Both methods return 'not found' — RuntimeError raised."""
+        """Both methods return method-not-found and leave the default bound."""
         from acp_proxy.transport import AcpError
 
         client = AcpClient.__new__(AcpClient)
-        client._sessions = {"s1": SessionState(session_id="s1")}
+        client._sessions = {"s1": SessionState(session_id="s1", model_id="auto")}
+        client._expected_model_updates = {}
 
         async def mock_send(method, params):
             raise AcpError("Method not found", {"code": -32601})
@@ -1051,6 +1099,28 @@ class TestTrySetModel:
 
         with pytest.raises(RuntimeError, match="Model selection not supported"):
             await client._try_set_model("s1", "gpt-4o")
+        assert client._sessions["s1"].model_id == "auto"
+        assert client._expected_model_updates == {}
+
+    @pytest.mark.asyncio
+    async def test_legacy_rejected_setter_propagates(self) -> None:
+        """Legacy retains its existing raw ACP error behavior."""
+        from acp_proxy.transport import AcpError
+
+        client = AcpClient.__new__(AcpClient)
+        client._sessions = {"s1": SessionState(session_id="s1", model_id="auto")}
+        client._expected_model_updates = {}
+        client._transport = AsyncMock()
+        client._transport.send_request.side_effect = AcpError(
+            "rejected with sensitive detail",
+            {"code": -32000},
+        )
+
+        with pytest.raises(AcpError, match="rejected with sensitive detail"):
+            await client._try_set_model("s1", "gpt-4o")
+
+        assert client._sessions["s1"].model_id == "auto"
+        assert client._expected_model_updates == {}
 
 
 class TestDirectAcpContract:
@@ -1170,105 +1240,188 @@ class TestDirectAcpContract:
         assert client.agent_capabilities["loadSession"] is True
 
     @pytest.mark.asyncio
-    async def test_exact_model_selection_requires_complete_acknowledgement(self) -> None:
-        """ADI-03: method success is not model acknowledgement."""
-        client = AcpClient.__new__(AcpClient)
+    async def test_nondefault_model_uses_copilot_setter_before_return(self) -> None:
+        """A non-default direct model is bound by settled session/set_model."""
+        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
         client._models = [ModelInfo("gpt-5.3-codex", "GPT-5.3 Codex")]
-        client._default_model = "gpt-5.5"
-        client._sessions = {}
         client._transport = AsyncMock()
         client._transport.send_request.side_effect = [
             {
                 "sessionId": "session",
                 "models": {
                     "availableModels": [
-                        {"modelId": "gpt-5.3-codex", "name": "GPT-5.3 Codex"}
+                        {"modelId": "auto", "name": "Auto"},
+                        {"modelId": "gpt-5.3-codex", "name": "GPT-5.3 Codex"},
                     ],
-                    "currentModelId": "gpt-5.5",
+                    "currentModelId": "auto",
                 },
             },
-            {
-                "configOptions": [
-                    {
-                        "id": "model",
-                        "category": "model",
-                        "currentValue": "gpt-5.3-codex",
-                    }
-                ]
-            },
+            {},
         ]
 
         descriptor = await client.create_session_exact("/workspace", "gpt-5.3-codex")
 
         assert descriptor.session_id == "session"
         assert descriptor.model_id == "gpt-5.3-codex"
+        assert client._sessions["session"].model_id == "gpt-5.3-codex"
         assert client._transport.send_request.await_args_list[1].args == (
-            "session/set_config_option",
-            {
-                "sessionId": "session",
-                "configId": "model",
-                "value": "gpt-5.3-codex",
-            },
+            "session/set_model",
+            {"sessionId": "session", "modelId": "gpt-5.3-codex"},
         )
 
     @pytest.mark.asyncio
-    async def test_catalog_session_proves_exact_current_model(self) -> None:
-        """Direct readiness uses the existing non-prompted catalog session."""
-        client = AcpClient.__new__(AcpClient)
-        client._sessions = {
-            "catalog": SessionState("catalog", model_id="gpt-5.3-codex")
-        }
-        client._expected_model_updates = {}
+    async def test_requested_current_model_needs_no_setter(self) -> None:
+        """The current model reported for a new session is already bound."""
+        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        client._models = [ModelInfo("auto", "Auto")]
         client._transport = AsyncMock()
         client._transport.send_request.return_value = {
-            "configOptions": [
-                {
-                    "id": "model",
-                    "category": "model",
-                    "currentValue": "gpt-5.3-codex",
-                }
-            ]
+            "sessionId": "session",
+            "models": {
+                "availableModels": [{"modelId": "auto", "name": "Auto"}],
+                "currentModelId": "auto",
+            },
         }
 
-        observed = await client.acknowledge_session_model(
-            "catalog", "gpt-5.3-codex"
+        descriptor = await client.create_session_exact("/workspace", "auto")
+
+        assert descriptor.session_id == "session"
+        assert descriptor.model_id == "auto"
+        client._transport.send_request.assert_awaited_once_with(
+            "session/new",
+            {"cwd": "/workspace", "mcpServers": []},
         )
 
-        assert observed == "gpt-5.3-codex"
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "session_models",
+        [
+            None,
+            {
+                "availableModels": [{"modelId": "auto", "name": "Auto"}],
+                "currentModelId": "",
+            },
+            {
+                "availableModels": [],
+                "currentModelId": "auto",
+            },
+        ],
+    )
+    async def test_exact_session_requires_its_own_consistent_model_catalog(
+        self,
+        session_models: dict[str, Any] | None,
+    ) -> None:
+        """A logical session never inherits the catalog probe's default."""
+        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        client._models = [ModelInfo("auto", "Auto")]
+        client._default_model = "auto"
+        client._transport = AsyncMock()
+        response: dict[str, Any] = {"sessionId": "session"}
+        if session_models is not None:
+            response["models"] = session_models
+        client._transport.send_request.return_value = response
+
+        with pytest.raises(ModelAcknowledgementError, match="per-session model catalog"):
+            await client.create_session_exact("/workspace", "auto")
+
         client._transport.send_request.assert_awaited_once_with(
-            "session/set_config_option",
+            "session/new",
+            {"cwd": "/workspace", "mcpServers": []},
+        )
+        assert client._sessions["session"].model_id in {None, "auto"}
+
+    @pytest.mark.asyncio
+    async def test_exact_session_revalidates_requested_model_catalog(self) -> None:
+        """A model removed from the new session's catalog is not selected."""
+        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        client._models = [ModelInfo("target", "Target")]
+        client._transport = AsyncMock()
+        client._transport.send_request.return_value = {
+            "sessionId": "session",
+            "models": {
+                "availableModels": [{"modelId": "auto", "name": "Auto"}],
+                "currentModelId": "auto",
+            },
+        }
+
+        with pytest.raises(ModelAcknowledgementError, match="did not advertise"):
+            await client.create_session_exact("/workspace", "target")
+
+        client._transport.send_request.assert_awaited_once()
+        assert client._sessions["session"].model_id == "auto"
+
+    @pytest.mark.asyncio
+    async def test_rejected_session_cannot_replace_startup_model_catalog(self) -> None:
+        """Per-session divergence leaves generation capabilities immutable."""
+        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        client._transport = AsyncMock()
+        client._transport.send_request.side_effect = [
             {
                 "sessionId": "catalog",
-                "configId": "model",
-                "value": "gpt-5.3-codex",
+                "models": {
+                    "availableModels": [
+                        {"modelId": "auto", "name": "Auto"},
+                        {"modelId": "target", "name": "Target"},
+                    ],
+                    "currentModelId": "auto",
+                },
             },
-        )
+            {
+                "sessionId": "logical",
+                "models": {
+                    "availableModels": [{"modelId": "auto", "name": "Auto"}],
+                    "currentModelId": "auto",
+                },
+            },
+        ]
+        await client.create_session("/workspace")
+        startup_models = [model.model_id for model in client.models]
+        startup_default = client.default_model
+
+        with pytest.raises(ModelAcknowledgementError, match="did not advertise"):
+            await client.create_session_exact("/workspace", "target")
+
+        assert [model.model_id for model in client.models] == startup_models
+        assert client.default_model == startup_default
 
     @pytest.mark.asyncio
-    async def test_catalog_session_method_not_found_fails_safely(self) -> None:
-        """An old language server cannot reach direct readiness."""
+    async def test_missing_model_selectors_fail_session_safely(self) -> None:
+        """A non-default session is not returned when no selector exists."""
         from acp_proxy.transport import AcpError
 
-        client = AcpClient.__new__(AcpClient)
-        client._sessions = {
-            "catalog": SessionState("catalog", model_id="gpt-5.3-codex")
-        }
-        client._expected_model_updates = {}
+        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        client._models = [ModelInfo("gpt-5.3-codex", "GPT-5.3 Codex")]
         client._transport = AsyncMock()
-        client._transport.send_request.side_effect = AcpError(
-            '"Method not found": session/set_config_option',
-            {"code": -32601, "data": "sensitive child output"},
-        )
+        client._transport.send_request.side_effect = [
+            {
+                "sessionId": "session",
+                "models": {
+                    "availableModels": [
+                        {"modelId": "auto", "name": "Auto"},
+                        {"modelId": "gpt-5.3-codex", "name": "GPT-5.3 Codex"},
+                    ],
+                    "currentModelId": "auto",
+                },
+            },
+            AcpError(
+                '"Method not found": session/set_model',
+                {"code": -32601, "data": "sensitive child output"},
+            ),
+            AcpError(
+                '"Method not found": session/set_config_option',
+                {"code": -32601, "data": "sensitive child output"},
+            ),
+        ]
 
         with pytest.raises(ModelAcknowledgementError) as exc_info:
-            await client.acknowledge_session_model("catalog", "gpt-5.3-codex")
+            await client.create_session_exact("/workspace", "gpt-5.3-codex")
 
         message = str(exc_info.value)
-        assert "required exact model configuration" in message
+        assert "no supported session model selector" in message
         assert "Method not found" not in message
         assert "sensitive child output" not in message
+        assert client._sessions["session"].model_id == "auto"
 
-    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "result",
         [
@@ -1277,62 +1430,59 @@ class TestDirectAcpContract:
             {"configOptions": [{"id": "model"}]},
         ],
     )
-    async def test_catalog_session_rejects_incomplete_config_options(
+    def test_config_fallback_rejects_incomplete_config_options(
         self, result: dict[str, Any]
     ) -> None:
-        client = AcpClient.__new__(AcpClient)
-        client._sessions = {"catalog": SessionState("catalog", model_id="model")}
-        client._expected_model_updates = {}
-        client._transport = AsyncMock()
-        client._transport.send_request.return_value = result
-
         with pytest.raises(ModelAcknowledgementError, match="configOptions|model"):
-            await client.acknowledge_session_model("catalog", "model")
+            AcpClient._model_from_config_options(result)
 
     @pytest.mark.asyncio
-    async def test_catalog_session_rejects_wrong_current_model(self) -> None:
+    async def test_config_fallback_rejects_wrong_current_model(self) -> None:
+        from acp_proxy.transport import AcpError
+
         client = AcpClient.__new__(AcpClient)
         requested = "MODEL_TEXT_CANARY_REQUESTED"
         observed = "MODEL_TEXT_CANARY_OBSERVED"
-        client._sessions = {"catalog": SessionState("catalog", model_id=requested)}
+        client._sessions = {"session": SessionState("session", model_id="auto")}
         client._expected_model_updates = {}
         client._transport = AsyncMock()
-        client._transport.send_request.return_value = {
-            "configOptions": [{"id": "model", "currentValue": observed}]
-        }
+        client._transport.send_request.side_effect = [
+            AcpError("Method not found", {"code": -32601}),
+            {"configOptions": [{"id": "model", "currentValue": observed}]},
+        ]
 
         with pytest.raises(ModelAcknowledgementError) as exc_info:
-            await client.acknowledge_session_model("catalog", requested)
+            await client._settle_direct_model("session", requested)
         assert requested not in str(exc_info.value)
         assert observed not in str(exc_info.value)
+        assert client._sessions["session"].model_id == "auto"
 
     @pytest.mark.asyncio
-    async def test_exact_model_selection_rejects_wrong_current_value(self) -> None:
-        """ADI-03: an acknowledged default cannot substitute for the requested model."""
-        client = AcpClient.__new__(AcpClient)
+    async def test_rejected_nondefault_binding_retains_observed_current_model(self) -> None:
+        """A rejected setter cannot make the requested model appear bound."""
+        from acp_proxy.transport import AcpError
+
+        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
         client._models = [ModelInfo("gpt-5.3-codex", "GPT-5.3 Codex")]
-        client._default_model = "gpt-5.5"
-        client._sessions = {}
         client._transport = AsyncMock()
         client._transport.send_request.side_effect = [
             {
                 "sessionId": "session",
                 "models": {
                     "availableModels": [
-                        {"modelId": "gpt-5.3-codex", "name": "GPT-5.3 Codex"}
+                        {"modelId": "auto", "name": "Auto"},
+                        {"modelId": "gpt-5.3-codex", "name": "GPT-5.3 Codex"},
                     ],
-                    "currentModelId": "gpt-5.5",
+                    "currentModelId": "auto",
                 },
             },
-            {
-                "configOptions": [
-                    {"id": "model", "currentValue": "gpt-5.5"}
-                ]
-            },
+            AcpError("selection rejected", {"code": -32000}),
         ]
 
-        with pytest.raises(RuntimeError, match="acknowledge.*model"):
+        with pytest.raises(ModelAcknowledgementError, match="rejected"):
             await client.create_session_exact("/workspace", "gpt-5.3-codex")
+        assert client._sessions["session"].model_id == "auto"
+        assert len(client._transport.send_request.await_args_list) == 2
 
     @pytest.mark.asyncio
     async def test_cancel_is_stable_session_notification(self) -> None:
@@ -1471,11 +1621,11 @@ class TestDirectAcpContract:
 
     @pytest.mark.asyncio
     async def test_non_not_found_error_propagates(self):
-        """A non-'not found' error is re-raised immediately, no fallback."""
+        """A non-'not found' legacy error is re-raised without fallback."""
         from acp_proxy.transport import AcpError
 
         client = AcpClient.__new__(AcpClient)
-        client._sessions = {"s1": SessionState(session_id="s1")}
+        client._sessions = {"s1": SessionState(session_id="s1", model_id="auto")}
 
         async def mock_send(method, params):
             raise AcpError("Server exploded", {"code": -32000})
@@ -1486,6 +1636,7 @@ class TestDirectAcpContract:
 
         with pytest.raises(AcpError, match="Server exploded"):
             await client._try_set_model("s1", "gpt-4o")
+        assert client._sessions["s1"].model_id == "auto"
 
 
 # ---------------------------------------------------------------------------

@@ -284,10 +284,10 @@ class DirectService:
                 timeout=self.limits.session_creation_timeout_s,
             )
             backend_session_id = descriptor.session_id
-            observed_model = descriptor.model_id
-            if observed_model != session.model_id:
+            bound_model = descriptor.model_id
+            if bound_model != session.model_id:
                 raise DirectConflict(
-                    f"ACP acknowledged model {observed_model!r}, expected {session.model_id!r}"
+                    f"ACP bound model {bound_model!r}, expected {session.model_id!r}"
                 )
             async with self._state_lock:
                 session.backend_session_id = backend_session_id
@@ -297,7 +297,7 @@ class DirectService:
                     result={
                         "logical_session_id": session.logical_session_id,
                         "backend_session_id": backend_session_id,
-                        "model_id": observed_model,
+                        "model_id": bound_model,
                         "stable_instruction_digest": session.stable_instruction_digest,
                         "continuity_generation_id": generation.generation_id,
                     },
@@ -325,7 +325,7 @@ class DirectService:
                     OperationState.FAILED,
                     error={
                         "code": "session_configuration_failed",
-                        "message": "ACP did not acknowledge the requested session configuration",
+                        "message": "ACP did not settle the requested session configuration",
                     },
                 )
         except Exception as exc:  # noqa: BLE001 - ambiguous create must quarantine

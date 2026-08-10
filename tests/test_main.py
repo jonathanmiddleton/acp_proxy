@@ -17,7 +17,6 @@ import pytest
 from acp_proxy import __main__ as cli
 from acp_proxy import discovery
 from acp_proxy.application_policy import MIN_COPILOT_LANGUAGE_SERVER_VERSION
-from acp_proxy.client import ModelAcknowledgementError
 from acp_proxy.copilot_auth import CopilotOAuthCredentialError
 from acp_proxy.direct_protocol import CreateSessionRequest, PromptRequest
 from acp_proxy.discovery import BinaryAdmission, BinaryCompatibilityError
@@ -361,17 +360,30 @@ async def test_legacy_mode_shares_the_global_binary_floor(
 
 
 @pytest.mark.asyncio
-async def test_direct_readiness_requires_catalog_model_acknowledgement(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("catalog_model_ids", "catalog_default"),
+    [
+        (["model"], None),
+        ([], "model"),
+        (["other-model"], "model"),
+    ],
+)
+async def test_direct_readiness_requires_usable_catalog_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    catalog_model_ids: list[str],
+    catalog_default: str | None,
 ) -> None:
-    """The one catalog session must prove set_config_option before HTTP startup."""
+    """A catalog session without a usable current model cannot become ready."""
 
     observed: dict[str, Any] = {"server_constructed": False}
 
-    class IncompatibleCatalogClient:
+    class IncompleteCatalogClient:
         def __init__(self, _binary: str, **_kwargs: Any) -> None:
-            self.models = [SimpleNamespace(model_id="model")]
-            self.default_model = "model"
+            self.models = [
+                SimpleNamespace(model_id=model_id) for model_id in catalog_model_ids
+            ]
+            self.default_model = catalog_default
             self.stopped = False
             observed["client"] = self
 
@@ -385,14 +397,6 @@ async def test_direct_readiness_requires_catalog_model_acknowledgement(
             observed["catalog_cwd"] = cwd
             return "catalog-session"
 
-        async def acknowledge_session_model(
-            self, session_id: str, model_id: str
-        ) -> str:
-            observed["acknowledgement"] = (session_id, model_id)
-            raise ModelAcknowledgementError(
-                "copilot-language-server lacks required exact model configuration"
-            )
-
         async def stop(self) -> None:
             self.stopped = True
 
@@ -401,7 +405,7 @@ async def test_direct_readiness_requires_catalog_model_acknowledgement(
             observed["server_constructed"] = True
 
     metadata = tmp_path / "ready.json"
-    monkeypatch.setattr(cli, "AcpClient", IncompatibleCatalogClient)
+    monkeypatch.setattr(cli, "AcpClient", IncompleteCatalogClient)
     monkeypatch.setattr(cli.uvicorn, "Server", ForbiddenServer)
 
     with pytest.raises(BinaryCompatibilityError) as exc_info:
@@ -417,19 +421,18 @@ async def test_direct_readiness_requires_catalog_model_acknowledgement(
 
     message = str(exc_info.value)
     assert _version_text(MIN_COPILOT_LANGUAGE_SERVER_VERSION) in message
-    assert "session/set_config_option" in message
+    assert "advertised usable default model" in message
     assert "gpt-" not in message
-    assert observed["acknowledgement"] == ("catalog-session", "model")
     assert observed["server_constructed"] is False
     assert not metadata.exists()
     assert observed["client"].stopped is True
 
 
 @pytest.mark.asyncio
-async def test_direct_readiness_follows_catalog_then_exact_ack_without_prompt(
+async def test_direct_readiness_follows_catalog_without_model_setter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The startup control session is acknowledged before HTTP readiness."""
+    """The startup catalog is observed without mutating its default model."""
 
     order: list[str] = []
     metadata = tmp_path / "ready.json"
@@ -452,13 +455,6 @@ async def test_direct_readiness_follows_catalog_then_exact_ack_without_prompt(
         async def create_session(self, cwd: str) -> str:
             order.append("catalog-session")
             return "catalog-session"
-
-        async def acknowledge_session_model(
-            self, session_id: str, model_id: str
-        ) -> str:
-            order.append("exact-ack")
-            assert (session_id, model_id) == ("catalog-session", "catalog-model")
-            return model_id
 
         async def stop(self) -> None:
             order.append("child-stop")
@@ -507,8 +503,8 @@ async def test_direct_readiness_follows_catalog_then_exact_ack_without_prompt(
         metadata_file=str(metadata),
     )
 
-    assert order.index("catalog-session") < order.index("exact-ack")
-    assert order.index("exact-ack") < order.index("http-constructed")
+    assert order.index("catalog-session") < order.index("http-constructed")
+    assert "exact-ack" not in order
     assert order.index("http-startup") < order.index("ready")
     assert "session/prompt" not in order
 
@@ -717,11 +713,6 @@ async def test_child_loss_during_startup_invalidates_direct_service_and_cleans_u
         async def create_session(self, cwd: str) -> str:
             return "catalog-session"
 
-        async def acknowledge_session_model(
-            self, session_id: str, model_id: str
-        ) -> str:
-            return model_id
-
         async def stop(self) -> None:
             self.stopped = True
 
@@ -805,11 +796,6 @@ async def test_graceful_owner_shutdown_quarantines_active_direct_work_first(
 
         async def create_session(self, cwd: str) -> str:
             return "catalog"
-
-        async def acknowledge_session_model(
-            self, session_id: str, model_id: str
-        ) -> str:
-            return model_id
 
         async def create_session_exact(self, cwd: str, model_id: str) -> Any:
             return SimpleNamespace(session_id="backend", model_id=model_id)

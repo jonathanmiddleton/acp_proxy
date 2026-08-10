@@ -74,7 +74,7 @@ class PromptTimeout(Exception):
 
 
 class ModelAcknowledgementError(RuntimeError):
-    """ACP failed to report the exact requested model as current."""
+    """ACP failed to settle the requested session model binding."""
 
 
 def _summarize(obj: Any, max_len: int = 200) -> str:
@@ -101,7 +101,7 @@ class ModelInfo:
 
 @dataclass(frozen=True)
 class AcpSessionDescriptor:
-    """A real ACP session with the exact model acknowledged by the agent."""
+    """A real ACP session with its requested model binding settled."""
 
     session_id: str
     model_id: str
@@ -120,6 +120,7 @@ class SessionState:
 
     session_id: str
     model_id: str | None = None
+    available_model_ids: frozenset[str] | None = None
     created_at: float = field(default_factory=time.time)
 
 
@@ -294,19 +295,46 @@ class AcpClient:
         if direct_mode:
             self._bind_provisional_session(session_id)
 
-        # Extract models from session response if present
+        session_current_model: str | None = None
+        session_available_models: frozenset[str] | None = None
+        # Extract the global catalog while retaining evidence from this exact
+        # session separately. A later direct session must never inherit the
+        # catalog probe's current model when its own response omits that state.
         if "models" in result:
-            self._extract_models(result["models"])
+            models_data = result["models"]
+            if not direct_mode or not self._sessions:
+                self._extract_models(models_data)
+            current_model = models_data.get("currentModelId")
+            if isinstance(current_model, str) and current_model:
+                session_current_model = current_model
+            available_models = models_data.get("availableModels")
+            if isinstance(available_models, list):
+                session_available_models = frozenset(
+                    item["modelId"]
+                    for item in available_models
+                    if isinstance(item, dict)
+                    and isinstance(item.get("modelId"), str)
+                    and item["modelId"]
+                )
 
         session = SessionState(
             session_id=session_id,
-            model_id=model_id or self._default_model,
+            model_id=(
+                session_current_model
+                if direct_mode
+                else self._default_model
+            ),
+            available_model_ids=session_available_models,
         )
         self._sessions[session_id] = session
 
-        # Set model if specified and different from default
-        if model_id and model_id != self._default_model:
-            await self._try_set_model(session_id, model_id)
+        # ``session/new`` reports the model already active on this session.
+        # Only non-default requests require a separate selection operation.
+        if model_id and model_id != session.model_id:
+            if direct_mode:
+                await self._settle_direct_model(session_id, model_id)
+            else:
+                await self._try_set_model(session_id, model_id)
 
         if direct_mode:
             logger.info(
@@ -322,11 +350,14 @@ class AcpClient:
     async def create_session_exact(
         self, cwd: str, model_id: str
     ) -> AcpSessionDescriptor:
-        """Create a session and require exact stable model acknowledgement.
+        """Create a session and settle its requested model binding.
 
-        Direct mode never infers acknowledgement from method success.  ACP v1
-        returns the complete ``configOptions`` collection; the model option's
-        ``currentValue`` must equal the requested model.
+        ``session/new`` is authoritative when its per-session current model is
+        already the requested model. Otherwise the Copilot-specific
+        ``session/set_model`` operation must settle successfully before the
+        session is returned. The supported language server does not expose a
+        separate post-selection value, so non-default binding evidence is the
+        successful settlement of that exact request.
         """
 
         available = {model.model_id for model in self._models}
@@ -335,78 +366,28 @@ class AcpClient:
                 f"Model {model_id!r} is not advertised. Available: {sorted(available)}"
             )
         session_id = await self.create_session(cwd)
-        observed = await self.acknowledge_session_model(session_id, model_id)
-        return AcpSessionDescriptor(session_id=session_id, model_id=observed)
-
-    async def acknowledge_session_model(
-        self, session_id: str, model_id: str
-    ) -> str:
-        """Require complete exact model acknowledgement on an existing session.
-
-        Direct startup uses this on its one non-prompted catalog session. Every
-        logical direct session uses the same primitive independently; startup
-        proof is never treated as acknowledgement for later sessions.
-        """
-
-        if session_id not in self._sessions:
-            raise ModelAcknowledgementError(
-                "cannot prove model configuration for an unknown ACP session"
-            )
-        expected_model_updates = getattr(self, "_expected_model_updates", None)
-        if expected_model_updates is None:
-            expected_model_updates = {}
-            self._expected_model_updates = expected_model_updates
-        expected_model_updates[session_id] = model_id
-        try:
-            try:
-                result = await self._transport.send_request(
-                    "session/set_config_option",
-                    {
-                        "sessionId": session_id,
-                        "configId": "model",
-                        "value": model_id,
-                    },
-                )
-            except AcpError as exc:
-                method_missing = exc.error_obj.get("code") == -32601
-                if method_missing:
-                    logger.error(
-                        "ACP agent does not expose the required exact model "
-                        "configuration method"
-                    )
-                    message = (
-                        "copilot-language-server does not expose required exact "
-                        "model configuration"
-                    )
-                else:
-                    logger.error(
-                        "Could not prove the required exact model configuration "
-                        "capability"
-                    )
-                    message = (
-                        "could not prove copilot-language-server required exact "
-                        "model configuration"
-                    )
-                raise ModelAcknowledgementError(message) from None
-        finally:
-            expected_model_updates.pop(session_id, None)
-        observed = self._model_from_config_options(result)
-        if observed != model_id:
-            self._sessions[session_id].model_id = None
-            raise ModelAcknowledgementError(
-                "copilot-language-server did not acknowledge the requested exact model"
-            )
-        self._sessions[session_id].model_id = observed
+        session = self._sessions[session_id]
         if (
-            getattr(self, "_callback_policy", CallbackPolicy.LEGACY_PERMISSIVE)
-            is CallbackPolicy.DIRECT_DENY
+            not isinstance(session.model_id, str)
+            or not session.model_id
+            or session.available_model_ids is None
+            or session.model_id not in session.available_model_ids
         ):
-            logger.info("ACP acknowledged the requested direct model")
-        else:
-            logger.info(
-                "ACP acknowledged model %s for session %s", observed, session_id
+            raise ModelAcknowledgementError(
+                "session/new omitted a consistent per-session model catalog"
             )
-        return observed
+        if model_id not in session.available_model_ids:
+            raise ModelAcknowledgementError(
+                "session/new did not advertise the requested session model"
+            )
+        if session.model_id != model_id:
+            await self._settle_direct_model(session_id, model_id)
+        bound_model = session.model_id
+        if bound_model != model_id:
+            raise ModelAcknowledgementError(
+                "copilot-language-server did not settle the requested session model"
+            )
+        return AcpSessionDescriptor(session_id=session_id, model_id=bound_model)
 
     @staticmethod
     def _model_from_config_options(result: dict[str, Any]) -> str:
@@ -734,13 +715,8 @@ class AcpClient:
         self._default_model = models_data.get("currentModelId")
 
     async def _try_set_model(self, session_id: str, model_id: str) -> None:
-        """Set the model for a session.
+        """Select a model for the deprecated legacy adapter."""
 
-        Tries session/set_model (Copilot-specific) first, then falls back
-        to session/set_config_option (ACP spec standard). Raises if neither
-        method is supported — model selection is a required capability and
-        silent degradation to the default model is not acceptable.
-        """
         methods = [
             ("session/set_model", {"sessionId": session_id, "modelId": model_id}),
             (
@@ -751,6 +727,71 @@ class AcpClient:
         for method, params in methods:
             try:
                 await self._transport.send_request(method, params)
+                if session_id in self._sessions:
+                    self._sessions[session_id].model_id = model_id
+                logger.info(
+                    "Set model for session %s to %s (via %s)",
+                    session_id,
+                    model_id,
+                    method,
+                )
+                return
+            except AcpError as exc:
+                if "not found" in str(exc).lower():
+                    logger.debug("%s not supported, trying next method", method)
+                    continue
+                raise
+
+        raise RuntimeError(
+            f"Model selection not supported by this server. "
+            f"Tried: {[method for method, _ in methods]}. Requested model: {model_id}"
+        )
+
+    async def _settle_direct_model(self, session_id: str, model_id: str) -> None:
+        """Set a non-default session model and require request settlement.
+
+        Tries session/set_model (Copilot-specific) first, then falls back
+        to session/set_config_option (ACP spec standard). The standard response
+        is verified when used; the Copilot-specific method returns no selected
+        model value, so its successful JSON-RPC settlement is the available
+        evidence. Silent degradation to the default model is never allowed.
+        """
+        methods: list[tuple[str, dict[str, Any], bool]] = [
+            (
+                "session/set_model",
+                {"sessionId": session_id, "modelId": model_id},
+                False,
+            ),
+            (
+                "session/set_config_option",
+                {"sessionId": session_id, "configId": "model", "value": model_id},
+                True,
+            ),
+        ]
+        expected_model_updates = getattr(self, "_expected_model_updates", None)
+        if expected_model_updates is None:
+            expected_model_updates = {}
+            self._expected_model_updates = expected_model_updates
+        expected_model_updates[session_id] = model_id
+        try:
+            for method, params, verifies_current_value in methods:
+                try:
+                    result = await self._transport.send_request(method, params)
+                except AcpError as exc:
+                    if exc.error_obj.get("code") == -32601:
+                        logger.debug("%s not supported, trying next method", method)
+                        continue
+                    logger.error("ACP model selection request was rejected")
+                    raise ModelAcknowledgementError(
+                        "copilot-language-server rejected the requested session model"
+                    ) from None
+
+                if verifies_current_value:
+                    observed = self._model_from_config_options(result)
+                    if observed != model_id:
+                        raise ModelAcknowledgementError(
+                            "copilot-language-server returned a different session model"
+                        )
                 if session_id in self._sessions:
                     self._sessions[session_id].model_id = model_id
                 if (
@@ -770,15 +811,11 @@ class AcpClient:
                         method,
                     )
                 return
-            except AcpError as e:
-                if "not found" in str(e).lower():
-                    logger.debug("%s not supported, trying next method", method)
-                    continue
-                raise
+        finally:
+            expected_model_updates.pop(session_id, None)
 
-        raise RuntimeError(
-            f"Model selection not supported by this server. "
-            f"Tried: {[m for m, _ in methods]}. Requested model: {model_id}"
+        raise ModelAcknowledgementError(
+            "copilot-language-server exposes no supported session model selector"
         )
 
     @staticmethod

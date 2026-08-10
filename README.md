@@ -63,11 +63,12 @@ acp-proxy \
   --execution-authority trusted-host
 ```
 
-Before direct HTTP readiness, the proxy uses its one non-prompted catalog
-session to require a complete `session/set_config_option` response whose model
-`currentValue` exactly matches the catalog default. A language server that
-cannot prove that capability fails startup. Direct readiness is then negotiated
-at authenticated `GET /meadow/v1/capabilities`.
+Before direct HTTP readiness, the proxy uses one non-prompted catalog session
+to discover the available models and require an advertised, usable default.
+Each Meadow session then keeps that per-session default when it matches the
+requested model, or selects an advertised non-default through
+`session/set_model` before the session becomes ready. Direct readiness is
+negotiated at authenticated `GET /meadow/v1/capabilities`.
 The response identifies the protocol major, continuity generation, canonical
 workspace, exact model catalog, execution authority, resource limits, evidence
 support, and underlying ACP capabilities. Every mutation pins that generation
@@ -148,7 +149,7 @@ They **fail** (not skip) if the binary is not found — see
 python -m pytest tests/test_transport.py tests/test_client.py tests/test_server.py tests/test_direct_*.py tests/test_discovery.py tests/test_binary_admission.py tests/test_main.py -v
 ```
 The live direct integration probe requires the advertised
-`gpt-5.3-codex` model and exercises exact model acknowledgement plus two turns
+`gpt-5.3-codex` model and exercises non-default session binding plus two turns
 on one continuity generation.
 
 ## Configuration
