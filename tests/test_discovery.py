@@ -11,8 +11,8 @@ from typing import Any
 import pytest
 
 from acp_proxy import discovery
+from acp_proxy.application_policy import MIN_COPILOT_LANGUAGE_SERVER_VERSION
 from acp_proxy.discovery import (
-    MIN_COPILOT_LANGUAGE_SERVER_VERSION,
     BinaryCompatibilityError,
     _candidate_paths_from_jetbrains,
     _candidate_paths_from_processes,
@@ -270,6 +270,8 @@ class TestFindBinarySelection:
     ) -> None:
         process_path = _platform_binary(tmp_path, "process")
         disk_path = _platform_binary(tmp_path, "disk")
+        minimum = MIN_COPILOT_LANGUAGE_SERVER_VERSION
+        newer = minimum[0], minimum[1], minimum[2] + 1
         monkeypatch.setattr(
             discovery,
             "_candidate_paths_from_processes",
@@ -285,8 +287,8 @@ class TestFindBinarySelection:
             "_read_bounded_version_output",
             _version_probe(
                 {
-                    os.path.realpath(process_path): "1.523.3",
-                    os.path.realpath(disk_path): "1.600.0",
+                    os.path.realpath(process_path): _version_text(minimum),
+                    os.path.realpath(disk_path): _version_text(newer),
                 }
             ),
         )

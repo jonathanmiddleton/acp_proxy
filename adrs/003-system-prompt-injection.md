@@ -55,7 +55,7 @@ The system prompt can:
 
 - **Only verified legacy prompt control surface.** On the older language-server
   binary used for the original experiment, `session/set_config_option`
-  returned "Method not found." The currently admitted 1.523.3+ surface uses
+  returned "Method not found." The currently version-admitted surface uses
   that method for exact model configuration, but supplies no evidence that it
   controls tool visibility, system prompts, or general model behavior.
   First-turn injection remains the only empirically verified legacy mechanism

@@ -30,7 +30,7 @@ These must be present in the environment before using the proxy.
 | **Python 3.11+**                                          | System package manager                                                | Runtime for the proxy itself                                                    |
 | **Node.js / npm**                                         | System package manager                                                | Required only for deprecated OpenCode compatibility                             |
 | **[OpenCode](https://opencode.ai)**                       | `npm i -g opencode-ai@latest`                                         | Optional legacy consumer                                                        |
-| **JetBrains IDE with GitHub Copilot plugin** (`copilot-language-server` >= 1.523.3) | JetBrains Toolbox or standalone installer; plugin via IDE marketplace | Provides the version-admitted ACP binary and cached Copilot authentication |
+| **JetBrains IDE with GitHub Copilot plugin** (`copilot-language-server` meeting the configured minimum) | JetBrains Toolbox or standalone installer; plugin via IDE marketplace | Provides the version-admitted ACP binary and cached Copilot authentication |
 | **GitHub Copilot subscription**                           | Signed in via the JetBrains plugin                                    | The proxy uses the cached OAuth token at `~/.config/github-copilot/`            |
 
 Alternative installation paths exist for OpenCode (building from source, other
@@ -116,8 +116,9 @@ The current working directory (or `--cwd`) becomes the ACP workspace.
 
 The proxy combines named candidates from running processes with a recursive
 search below the platform JetBrains data directory, rejects reported language-
-server versions below 1.523.3, and deterministically selects the highest
-admitted version (using canonical path as the stable tie-break). IDE product,
+server versions below `MIN_COPILOT_LANGUAGE_SERVER_VERSION` in
+`application_policy.py`, and deterministically selects the highest admitted
+version (using canonical path as the stable tie-break). IDE product,
 release, plugin layout, and bundled architecture are not compatibility
 evidence. This minimum is global: deprecated legacy mode does not admit an
 older binary. To specify the path explicitly:
@@ -127,7 +128,8 @@ acp-proxy --consumer-mode opencode-legacy --binary /path/to/copilot-language-ser
 ```
 
 `--binary` bypasses candidate discovery only. The selected executable must
-still report a strict `MAJOR.MINOR.PATCH` version at or above 1.523.3.
+still report a strict `MAJOR.MINOR.PATCH` version at or above that configured
+application minimum.
 
 `python -m acp_proxy` supports the same mandatory options.
 

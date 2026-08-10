@@ -35,6 +35,7 @@ import tempfile
 
 import uvicorn
 
+from .application_policy import MIN_COPILOT_LANGUAGE_SERVER_VERSION
 from .client import AcpClient, CallbackPolicy, ModelAcknowledgementError
 from .config import (
     build_subprocess_env,
@@ -46,7 +47,6 @@ from .direct_protocol import DirectLimits
 from .direct_server import create_direct_app
 from .direct_service import DirectService
 from .discovery import (
-    MIN_COPILOT_LANGUAGE_SERVER_VERSION,
     BinaryAdmission,
     BinaryCompatibilityError,
     admit_compatible_binary,

@@ -10,12 +10,7 @@ ADR-006 correctly established strict, bounded `copilot-language-server
 --version` probing and deterministic highest-version selection. It also made
 IDE product and release directory names part of compatibility admission.
 
-That path policy does not track the executable contract. In a Windows 11 ARM
-development VM, a running binary was observed at a PyCharm 2026.2
-`win32-arm64` path while reporting language-server version 1.527.5. The primary
-Windows target is x64 and the primary macOS development environment is ARM64.
-Production discovery only knew a fixed IDE release set and its filesystem
-pattern assumed `win32-x64`. Adding each environment, IDE release, or
+That path policy does not track the executable contract. Adding each environment, IDE release, or
 architecture to those lists would preserve the same failure for the next
 plugin layout despite having direct version evidence from the executable.
 
@@ -30,7 +25,9 @@ Compatibility admission is based on the candidate executable's evidence:
 1. The path must resolve to an existing executable file.
 2. The executable must emit exactly `MAJOR.MINOR.PATCH` for `--version` through
    the credential-free, bounded, timed probe.
-3. The reported language-server version must meet the global 1.523.3 floor.
+3. The reported language-server version must meet the application-wide floor
+   defined once by `MIN_COPILOT_LANGUAGE_SERVER_VERSION` in
+   `application_policy.py`.
 4. When multiple candidates qualify, the highest semantic version wins, with
    canonical path as the stable tie-break.
 
@@ -51,12 +48,7 @@ The filename and JetBrains data root identify candidates. They do not establish
 compatibility; the reported language-server version does.
 
 Version admission is the shared executable boundary, not a substitute for
-consumer-specific capability acknowledgement. In the Windows 11 ARM VM, the
-admitted 1.527.5 server initialized and advertised models but returned
-JSON-RPC method-not-found for `session/set_config_option`. Meadow direct must
-therefore continue to prove that required method behavior before HTTP
-readiness, as ADR-012 requires. Legacy admission does not require that direct-
-only capability.
+consumer-specific capability acknowledgement.
 
 ## Consequences
 

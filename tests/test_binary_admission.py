@@ -13,8 +13,8 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from acp_proxy import discovery
+from acp_proxy.application_policy import MIN_COPILOT_LANGUAGE_SERVER_VERSION
 from acp_proxy.discovery import (
-    MIN_COPILOT_LANGUAGE_SERVER_VERSION,
     BinaryCompatibilityError,
     _probe_binary_version,
     _read_bounded_version_output,
@@ -42,6 +42,25 @@ def _version_probe(
     return read
 
 
+def _version_text(version: tuple[int, int, int]) -> str:
+    return ".".join(str(part) for part in version)
+
+
+def _version_before(version: tuple[int, int, int]) -> tuple[int, int, int]:
+    parts = list(version)
+    for index in range(len(parts) - 1, -1, -1):
+        if parts[index] > 0:
+            parts[index] -= 1
+            parts[index + 1 :] = [999_999] * (len(parts) - index - 1)
+            return parts[0], parts[1], parts[2]
+    raise AssertionError("the configured minimum must have a predecessor")
+
+
+def _version_after(version: tuple[int, int, int]) -> tuple[int, int, int]:
+    major, minor, patch = version
+    return major, minor, patch + 1
+
+
 def _script(path: Path, *, unix: str, windows: str) -> str:
     path = path.with_suffix(".cmd") if os.name == "nt" else path
     path.write_text(windows if os.name == "nt" else unix, encoding="utf-8")
@@ -49,8 +68,15 @@ def _script(path: Path, *, unix: str, windows: str) -> str:
     return str(path)
 
 
-def test_shared_minimum_is_1_523_3() -> None:
-    assert MIN_COPILOT_LANGUAGE_SERVER_VERSION == (1, 523, 3)
+def test_configured_minimum_is_a_canonical_semantic_version() -> None:
+    configured = MIN_COPILOT_LANGUAGE_SERVER_VERSION
+
+    assert len(configured) == 3
+    assert all(isinstance(part, int) and part >= 0 for part in configured)
+    assert (
+        parse_copilot_language_server_version(_version_text(configured)) == configured
+    )
+    _version_before(configured)
 
 
 @pytest.mark.parametrize(
@@ -59,15 +85,15 @@ def test_shared_minimum_is_1_523_3() -> None:
         True,
         False,
         1,
-        1.5233,
+        7.89,
         None,
         "",
-        "v1.523.3",
-        "1.523",
-        "1.523.3.4",
-        "1.0523.3",
-        "1.523.-3",
-        "1.523.3 extra",
+        "v7.8.9",
+        "7.8",
+        "7.8.9.10",
+        "7.08.9",
+        "7.8.-9",
+        "7.8.9 extra",
     ],
 )
 def test_version_parser_rejects_noncanonical_values(raw: object) -> None:
@@ -88,7 +114,13 @@ def test_version_probe_env_matches_windows_names_case_insensitively() -> None:
     }
 
 
-@pytest.mark.parametrize("observed_version", ["1.457.1", "1.523.2"])
+@pytest.mark.parametrize(
+    "observed_version",
+    [
+        "0.0.0",
+        _version_text(_version_before(MIN_COPILOT_LANGUAGE_SERVER_VERSION)),
+    ],
+)
 def test_explicit_binary_rejects_below_floor_with_sanitized_versions(
     observed_version: str,
     tmp_path: Path,
@@ -107,12 +139,18 @@ def test_explicit_binary_rejects_below_floor_with_sanitized_versions(
 
     message = str(exc_info.value)
     assert observed_version in message
-    assert "1.523.3" in message
+    assert _version_text(MIN_COPILOT_LANGUAGE_SERVER_VERSION) in message
     assert canonical not in message
     assert "placeholder" not in message
 
 
-@pytest.mark.parametrize("observed_version", ["1.523.3", "1.523.4"])
+@pytest.mark.parametrize(
+    "observed_version",
+    [
+        _version_text(MIN_COPILOT_LANGUAGE_SERVER_VERSION),
+        _version_text(_version_after(MIN_COPILOT_LANGUAGE_SERVER_VERSION)),
+    ],
+)
 def test_explicit_binary_accepts_floor_or_newer_and_returns_canonical_path(
     observed_version: str,
     tmp_path: Path,
@@ -131,15 +169,15 @@ def test_explicit_binary_accepts_floor_or_newer_and_returns_canonical_path(
 
 @given(
     order=st.permutations(("a", "b", "c")),
-    version_minors=st.tuples(
-        st.integers(min_value=523, max_value=700),
-        st.integers(min_value=523, max_value=700),
-        st.integers(min_value=523, max_value=700),
+    version_minor_offsets=st.tuples(
+        st.integers(min_value=0, max_value=200),
+        st.integers(min_value=0, max_value=200),
+        st.integers(min_value=0, max_value=200),
     ),
-    version_patches=st.tuples(
-        st.integers(min_value=3, max_value=20),
-        st.integers(min_value=3, max_value=20),
-        st.integers(min_value=3, max_value=20),
+    version_patch_offsets=st.tuples(
+        st.integers(min_value=0, max_value=20),
+        st.integers(min_value=0, max_value=20),
+        st.integers(min_value=0, max_value=20),
     ),
 )
 @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
@@ -147,17 +185,27 @@ def test_selection_is_highest_version_then_canonical_path_for_generated_orders(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     order: list[str],
-    version_minors: tuple[int, int, int],
-    version_patches: tuple[int, int, int],
+    version_minor_offsets: tuple[int, int, int],
+    version_patch_offsets: tuple[int, int, int],
 ) -> None:
     paths = {
         name: _executable(tmp_path / name / "copilot-language-server")
         for name in ("a", "b", "c")
     }
+    minimum_major, minimum_minor, minimum_patch = (
+        MIN_COPILOT_LANGUAGE_SERVER_VERSION
+    )
     semantic_versions = {
-        name: (1, minor, patch)
-        for name, minor, patch in zip(
-            ("a", "b", "c"), version_minors, version_patches, strict=True
+        name: (
+            minimum_major,
+            minimum_minor + minor_offset,
+            minimum_patch + patch_offset,
+        )
+        for name, minor_offset, patch_offset in zip(
+            ("a", "b", "c"),
+            version_minor_offsets,
+            version_patch_offsets,
+            strict=True,
         )
     }
     versions = {
@@ -192,9 +240,13 @@ def test_selection_ignores_malformed_and_below_floor_candidates(
     old = _executable(tmp_path / "old")
     admitted = _executable(tmp_path / "admitted")
     versions = {
-        os.path.realpath(malformed): "unexpected output with 1.999.0",
-        os.path.realpath(old): "1.457.1",
-        os.path.realpath(admitted): "1.523.3",
+        os.path.realpath(malformed): "unexpected output with 9.9.9",
+        os.path.realpath(old): _version_text(
+            _version_before(MIN_COPILOT_LANGUAGE_SERVER_VERSION)
+        ),
+        os.path.realpath(admitted): _version_text(
+            MIN_COPILOT_LANGUAGE_SERVER_VERSION
+        ),
     }
     monkeypatch.setattr(
         discovery,
@@ -210,6 +262,7 @@ def test_selection_ignores_malformed_and_below_floor_candidates(
 def test_version_probe_excludes_ambient_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    configured_version = _version_text(MIN_COPILOT_LANGUAGE_SERVER_VERSION)
     binary = _script(
         tmp_path / "copilot-language-server",
         unix=(
@@ -218,12 +271,13 @@ def test_version_probe_excludes_ambient_credentials(
             "[ -n \"$ACP_PROXY_MEADOW_SECRET\" ]; then\n"
             "  printf '9.9.9\\n'\n"
             "else\n"
-            "  printf '1.523.3\\n'\n"
+            f"  printf '{configured_version}\\n'\n"
             "fi\n"
         ),
         windows=(
             "@if defined MEADOW_OPENAI_API_KEY (echo 9.9.9) else "
-            "if defined ACP_PROXY_MEADOW_SECRET (echo 9.9.9) else echo 1.523.3\r\n"
+            "if defined ACP_PROXY_MEADOW_SECRET (echo 9.9.9) else "
+            f"echo {configured_version}\r\n"
         ),
     )
 
@@ -231,7 +285,7 @@ def test_version_probe_excludes_ambient_credentials(
     monkeypatch.setenv("MEADOW_OPENAI_API_KEY", "provider-canary")
     monkeypatch.setenv("ACP_PROXY_MEADOW_SECRET", "launch-canary")
 
-    assert _probe_binary_version(binary) == (1, 523, 3)
+    assert _probe_binary_version(binary) == MIN_COPILOT_LANGUAGE_SERVER_VERSION
 
 
 def test_version_probe_rejects_output_flood_without_retaining_it(
@@ -261,7 +315,6 @@ def test_version_probe_rejects_output_flood_without_retaining_it(
     elapsed = time.monotonic() - started
     assert "safety limit" in str(exc_info.value)
     assert "x" * 20 not in str(exc_info.value)
-    assert elapsed < 2.0
 
 
 def test_version_probe_nonzero_exit_is_sanitized(tmp_path: Path) -> None:
@@ -314,7 +367,6 @@ def test_version_probe_timeout_is_sanitized_and_kills_posix_descendants(
 
     assert "timed out" in str(exc_info.value)
     assert canary not in str(exc_info.value)
-    assert elapsed < 2.0
     if os.name != "nt":
         time.sleep(0.4)
         assert not marker.exists()

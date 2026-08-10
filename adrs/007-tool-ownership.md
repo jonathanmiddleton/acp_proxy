@@ -45,7 +45,7 @@ directly to Copilot's API as structured function definitions, bypassing the
 LSP. Through the proxy, custom tools are invisible.
 
 **The older experimental binary returned "Method not found" for
-`session/set_config_option`.** The currently admitted 1.523.3+ language server
+`session/set_config_option`.** The currently version-admitted language server
 supports that method for exact model configuration. Its complete model
 `configOptions` acknowledgement does not expose a tool-visibility control, and
 no known ACP method configures which tools the server exposes.

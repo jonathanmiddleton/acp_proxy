@@ -23,10 +23,9 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-logger = logging.getLogger(__name__)
+from .application_policy import MIN_COPILOT_LANGUAGE_SERVER_VERSION
 
-MIN_COPILOT_LANGUAGE_SERVER_VERSION = (1, 523, 3)
-"""Oldest copilot-language-server admitted by every production entry point."""
+logger = logging.getLogger(__name__)
 
 _VERSION_PATTERN = re.compile(
     r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"

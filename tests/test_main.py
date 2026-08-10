@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,9 +16,24 @@ import pytest
 
 from acp_proxy import __main__ as cli
 from acp_proxy import discovery
+from acp_proxy.application_policy import MIN_COPILOT_LANGUAGE_SERVER_VERSION
 from acp_proxy.client import ModelAcknowledgementError
 from acp_proxy.direct_protocol import CreateSessionRequest, PromptRequest
 from acp_proxy.discovery import BinaryAdmission, BinaryCompatibilityError
+
+
+def _version_text(version: tuple[int, int, int]) -> str:
+    return ".".join(str(part) for part in version)
+
+
+def _version_before(version: tuple[int, int, int]) -> tuple[int, int, int]:
+    parts = list(version)
+    for index in range(len(parts) - 1, -1, -1):
+        if parts[index] > 0:
+            parts[index] -= 1
+            parts[index + 1 :] = [999_999] * (len(parts) - index - 1)
+            return parts[0], parts[1], parts[2]
+    raise AssertionError("the configured minimum must have a predecessor")
 
 
 @pytest.fixture(autouse=True)
@@ -27,19 +43,28 @@ def _admit_unit_test_binary(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         cli,
         "admit_compatible_binary",
-        lambda path: BinaryAdmission(path=path, version=(1, 523, 3)),
+        lambda path: BinaryAdmission(
+            path=path,
+            version=MIN_COPILOT_LANGUAGE_SERVER_VERSION,
+        ),
     )
 
 
 def _old_version_executable(tmp_path: Path) -> str:
     """Create a real executable whose only behavior is an old version report."""
 
+    old_version = _version_text(
+        _version_before(MIN_COPILOT_LANGUAGE_SERVER_VERSION)
+    )
     if os.name == "nt":
         path = tmp_path / "copilot-language-server.cmd"
-        path.write_text("@echo 1.457.1\r\n", encoding="utf-8")
+        path.write_text(f"@echo {old_version}\r\n", encoding="utf-8")
     else:
         path = tmp_path / "copilot-language-server"
-        path.write_text("#!/bin/sh\nprintf '1.457.1\\n'\n", encoding="utf-8")
+        path.write_text(
+            f"#!/bin/sh\nprintf '{old_version}\\n'\n",
+            encoding="utf-8",
+        )
     path.chmod(0o755)
     return str(path)
 
@@ -160,7 +185,10 @@ async def test_programmatic_run_rejects_old_binary_before_client_start(
     monkeypatch.setattr(cli, "admit_compatible_binary", discovery.admit_compatible_binary)
     monkeypatch.setattr(cli, "AcpClient", ForbiddenClient)
 
-    with pytest.raises(BinaryCompatibilityError, match="1.457.1"):
+    old_version = _version_text(
+        _version_before(MIN_COPILOT_LANGUAGE_SERVER_VERSION)
+    )
+    with pytest.raises(BinaryCompatibilityError, match=re.escape(old_version)):
         await cli.run(
             old_binary,
             8765,
@@ -218,7 +246,11 @@ async def test_legacy_mode_shares_the_global_binary_floor(
     old_binary = _old_version_executable(tmp_path)
     monkeypatch.setattr(cli, "admit_compatible_binary", discovery.admit_compatible_binary)
 
-    with pytest.raises(BinaryCompatibilityError, match="1.523.3"):
+    required_version = _version_text(MIN_COPILOT_LANGUAGE_SERVER_VERSION)
+    with pytest.raises(
+        BinaryCompatibilityError,
+        match=re.escape(required_version),
+    ):
         await cli.run(
             old_binary,
             8765,
@@ -283,7 +315,7 @@ async def test_direct_readiness_requires_catalog_model_acknowledgement(
         )
 
     message = str(exc_info.value)
-    assert "1.523.3" in message
+    assert _version_text(MIN_COPILOT_LANGUAGE_SERVER_VERSION) in message
     assert "session/set_config_option" in message
     assert "gpt-" not in message
     assert observed["acknowledgement"] == ("catalog-session", "model")
@@ -420,10 +452,15 @@ def test_cli_auto_discovery_reports_old_only_environment_without_traceback(
 ) -> None:
     """Auto-discovery converts typed old-only evidence into a clean CLI exit."""
 
+    observed_version = _version_text(
+        _version_before(MIN_COPILOT_LANGUAGE_SERVER_VERSION)
+    )
+    required_version = _version_text(MIN_COPILOT_LANGUAGE_SERVER_VERSION)
+
     def reject_old_only() -> str | None:
         raise BinaryCompatibilityError(
             "no auto-discovered copilot-language-server met admission requirements: "
-            "version 1.457.1 is below required minimum 1.523.3"
+            f"version {observed_version} is below required minimum {required_version}"
         )
 
     monkeypatch.setattr(cli, "_configure_logging", lambda *_args: None)
@@ -437,8 +474,8 @@ def test_cli_auto_discovery_reports_old_only_environment_without_traceback(
     with pytest.raises(SystemExit) as exc_info:
         cli.main()
     assert exc_info.value.code == 1
-    assert "1.457.1" in caplog.text
-    assert "1.523.3" in caplog.text
+    assert observed_version in caplog.text
+    assert required_version in caplog.text
 
 
 @pytest.mark.asyncio
