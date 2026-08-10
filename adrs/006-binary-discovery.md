@@ -42,6 +42,13 @@ which returned JSON-RPC method-not-found for `session/set_config_option`.
 Language server 1.523.3 exposed the required method and exact complete
 `configOptions` acknowledgement used by Meadow direct mode.
 
+The official Darwin ARM64 language server 1.518.3 subsequently exposed the
+same exact `session/set_config_option` acknowledgement: the complete four-option
+collection reported the requested `gpt-5.3-codex` current value. Two bounded
+same-session prompt turns then completed with `end_turn` and preserved a nonce.
+This is sufficient to lower the version admission floor without weakening the
+consumer-specific readiness proof.
+
 ## Decision
 
 `discovery.py` is the single source of truth for binary resolution. It:
@@ -64,7 +71,7 @@ Language server 1.523.3 exposed the required method and exact complete
 2. **Admits a strict language-server version globally.** Every selected
    executable, including explicit `--binary` and programmatic `run()` inputs,
    must exist, be executable, emit exactly `MAJOR.MINOR.PATCH` for `--version`,
-   and report at least 1.523.3. The floor applies to both Meadow direct and the
+   and report at least 1.518.3. The floor applies to both Meadow direct and the
    deprecated OpenCode legacy mode. Booleans, numbers, decorated/malformed
    strings, failed or excessive output, and below-floor versions fail closed.
    The probe uses a credential-free environment, bounded output retention, and
@@ -119,7 +126,7 @@ duplicated discovery logic.
   is required.
 - **A path-shaped binary is not sufficient.** Startup and integration tests
   fail before child use when the selected executable cannot prove the global
-  1.523.3 floor. Meadow direct adds a behavioral `session/set_config_option`
+  1.518.3 floor. Meadow direct adds a behavioral `session/set_config_option`
   proof before HTTP readiness because a version string alone is not capability
   acknowledgement.
 
@@ -130,3 +137,4 @@ duplicated discovery logic.
 | 2026-04-07 | Relaxed path matching from exact full-path regex to three-property check (home dir, IDE dir component, binary name). Added Windows process discovery via PowerShell + wmic fallback. Confirmed Windows target uses a different directory layout (`bin/` instead of `native/{arch}/`). |
 | 2026-08-09 | Aligned the decision with production discovery for IntelliJ IDEA and PyCharm 2025.3/2026.1 paths. Arbitrary versions and products remain fail-loud. |
 | 2026-08-09 | Established the global 1.523.3 language-server floor, strict credential-free bounded version probing for all entry points, and deterministic highest-version selection across the combined process/filesystem candidate set. Explicit paths bypass discovery only. |
+| 2026-08-10 | Lowered the global floor to 1.518.3 after exact model acknowledgement and bounded two-turn continuity were observed on that release. Version admission remains an early filter; direct readiness still requires the same exact per-session capability proof. |
