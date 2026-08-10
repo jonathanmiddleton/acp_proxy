@@ -19,6 +19,7 @@ from acp_proxy.discovery import (
     _probe_binary_version,
     _read_bounded_version_output,
     _select_best_binary,
+    _version_probe_env,
     parse_copilot_language_server_version,
     require_compatible_binary,
 )
@@ -72,6 +73,19 @@ def test_shared_minimum_is_1_523_3() -> None:
 def test_version_parser_rejects_noncanonical_values(raw: object) -> None:
     with pytest.raises(BinaryCompatibilityError, match="MAJOR.MINOR.PATCH"):
         parse_copilot_language_server_version(raw)
+
+
+def test_version_probe_env_matches_windows_names_case_insensitively() -> None:
+    source = {
+        "SYSTEMROOT": r"C:\Windows",
+        "appdata": r"C:\Users\example\AppData\Roaming",
+        "ACP_PROXY_MEADOW_SECRET": "must-not-pass",
+    }
+
+    assert _version_probe_env(source) == {
+        "SYSTEMROOT": r"C:\Windows",
+        "appdata": r"C:\Users\example\AppData\Roaming",
+    }
 
 
 @pytest.mark.parametrize("observed_version", ["1.457.1", "1.523.2"])
@@ -167,7 +181,6 @@ def test_selection_is_highest_version_then_canonical_path_for_generated_orders(
     )
     selected = _select_best_binary(
         [paths[name] for name in order],
-        require_supported_path=False,
     )
     assert selected == os.path.realpath(paths[expected_name])
 
@@ -191,7 +204,6 @@ def test_selection_ignores_malformed_and_below_floor_candidates(
 
     assert _select_best_binary(
         [malformed, old, admitted],
-        require_supported_path=False,
     ) == os.path.realpath(admitted)
 
 

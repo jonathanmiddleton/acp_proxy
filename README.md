@@ -114,10 +114,12 @@ other's traffic rather than guessing caller semantics.
 
 The current working directory (or `--cwd`) becomes the ACP workspace.
 
-The proxy combines candidates from running processes and supported JetBrains
-plugin directories, rejects versions below 1.523.3, and deterministically
-selects the highest admitted version (using canonical path as the stable
-tie-break). This minimum is global: deprecated legacy mode does not admit an
+The proxy combines named candidates from running processes with a recursive
+search below the platform JetBrains data directory, rejects reported language-
+server versions below 1.523.3, and deterministically selects the highest
+admitted version (using canonical path as the stable tie-break). IDE product,
+release, plugin layout, and bundled architecture are not compatibility
+evidence. This minimum is global: deprecated legacy mode does not admit an
 older binary. To specify the path explicitly:
 
 ```bash

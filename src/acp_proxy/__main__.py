@@ -9,7 +9,7 @@ Usage:
     file operations to it.
 
     --binary PATH       Path to copilot-language-server binary.
-                        Auto-discovers supported JetBrains plugin paths.
+                        Auto-discovers named JetBrains plugin binaries.
     --host HOST         Address to bind (default: 127.0.0.1).
     --port PORT         Port to listen on (default: 8765). Use 0 for ephemeral.
     --cwd PATH          Working directory for ACP sessions (default: current dir)
@@ -92,7 +92,7 @@ DIRECT_CHILD_ENV_KEYS = frozenset(
         "APPDATA",
         "LOCALAPPDATA",
         "USERPROFILE",
-        "SystemRoot",
+        "SYSTEMROOT",
         "WINDIR",
         "COMSPEC",
         "PATHEXT",
@@ -113,7 +113,7 @@ def _direct_child_env(source: dict[str, str]) -> dict[str, str]:
     return {
         key: value
         for key, value in source.items()
-        if key in DIRECT_CHILD_ENV_KEYS or key.startswith("LC_")
+        if key.upper() in DIRECT_CHILD_ENV_KEYS or key.upper().startswith("LC_")
     }
 
 
@@ -602,9 +602,9 @@ def main() -> None:
     if not binary:
         logger.error(
             "Could not find a compatible copilot-language-server binary. "
-            "Supported JetBrains paths and the minimum language-server version "
-            "are defined by discovery.py. Pass --binary only to select another "
-            "version-admitted executable."
+            "Named candidates below the JetBrains data root and the minimum "
+            "reported language-server version are defined by discovery.py. "
+            "Pass --binary only to select another version-admitted executable."
         )
         sys.exit(1)
 

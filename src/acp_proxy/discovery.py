@@ -1,16 +1,13 @@
-"""
-Binary discovery for copilot-language-server.
+"""Discovery and version admission for ``copilot-language-server``.
 
-Supported binaries are bundled with the GitHub Copilot plugin for IntelliJ IDEA
-or PyCharm 2025.3/2026.1. Other versions/products, standalone installs,
-Homebrew, and npm are outside the validated ACP surface.
+Auto-discovery combines executable paths reported by running processes with a
+recursive search below the platform's JetBrains data directory. IDE product,
+release, plugin layout, and bundled architecture are discovery details, not
+compatibility evidence. Every candidate is admitted by its own strict
+``--version`` report before it can be selected or executed with credentials.
 
-Supported platforms:
-- macOS (Darwin): binary under a supported JetBrains IDE plugin directory.
-- Windows: binary under a supported `%APPDATA%/JetBrains` plugin directory.
-
-This module is the single source of truth for binary resolution. Both the
-CLI entry point and the test suite import from here.
+This module is the single source of truth for binary resolution. Both the CLI
+entry point and the test suite import from here.
 """
 
 from __future__ import annotations
@@ -50,7 +47,7 @@ _VERSION_PROBE_ENV_KEYS = frozenset(
         "APPDATA",
         "LOCALAPPDATA",
         "USERPROFILE",
-        "SystemRoot",
+        "SYSTEMROOT",
         "WINDIR",
         "COMSPEC",
         "PATHEXT",
@@ -95,7 +92,7 @@ def _version_probe_env(source: dict[str, str]) -> dict[str, str]:
     return {
         key: value
         for key, value in source.items()
-        if key in _VERSION_PROBE_ENV_KEYS or key.startswith("LC_")
+        if key.upper() in _VERSION_PROBE_ENV_KEYS or key.upper().startswith("LC_")
     }
 
 
@@ -251,11 +248,7 @@ def _probe_binary_version(binary_path: str) -> tuple[int, int, int]:
     return parse_copilot_language_server_version(decoded)
 
 
-def _inspect_binary(
-    binary_path: str,
-    *,
-    require_supported_path: bool,
-) -> BinaryAdmission:
+def _inspect_binary(binary_path: str) -> BinaryAdmission:
     """Canonicalize and admit one executable language-server candidate."""
 
     try:
@@ -268,11 +261,6 @@ def _inspect_binary(
         raise BinaryCompatibilityError(
             "copilot-language-server binary must be an existing executable file"
         )
-    if require_supported_path and not _is_compatible_path(canonical_path):
-        raise BinaryCompatibilityError(
-            "copilot-language-server binary is outside supported JetBrains paths"
-        )
-
     version = _probe_binary_version(canonical_path)
     if version < MIN_COPILOT_LANGUAGE_SERVER_VERSION:
         raise BinaryCompatibilityError(
@@ -286,7 +274,7 @@ def _inspect_binary(
 def admit_compatible_binary(binary_path: str) -> BinaryAdmission:
     """Admit an explicit/programmatic binary with retained version evidence."""
 
-    return _inspect_binary(binary_path, require_supported_path=False)
+    return _inspect_binary(binary_path)
 
 
 def require_compatible_binary(binary_path: str) -> str:
@@ -298,7 +286,6 @@ def require_compatible_binary(binary_path: str) -> str:
 def _select_best_binary(
     binary_paths: Iterable[str],
     *,
-    require_supported_path: bool,
     fail_if_candidates_rejected: bool = False,
 ) -> str | None:
     """Select highest admitted version with a stable canonical-path tie-break."""
@@ -315,9 +302,7 @@ def _select_best_binary(
     rejection_reasons: set[str] = set()
     for path in sorted(canonical_paths):
         try:
-            admitted.append(
-                _inspect_binary(path, require_supported_path=require_supported_path)
-            )
+            admitted.append(_inspect_binary(path))
         except BinaryCompatibilityError as exc:
             rejected += 1
             rejection_reasons.add(str(exc))
@@ -348,146 +333,81 @@ def _select_best_binary(
     )
     return selected.path
 
-# The IDE directory names that identify compatible IntelliJ versions.
-_IDE_DIRS = (
-    "IntelliJIdea2025.3",
-    "IntelliJIdea2026.1",
-    "PyCharm2025.3",
-    "PyCharm2026.1",
-)
-
-_PLUGIN_SUFFIX_PARTS = (
-    "plugins",
-    "github-copilot-intellij",
-    "copilot-agent",
-    "native",
-    "{arch}",
-    "{binary_name}",
-)
-
-
 def _platform_config() -> dict[str, str]:
     """Return platform-specific discovery configuration.
 
-    Returns a dict with keys: base, arch, binary_name, home.
+    The base is only an enumeration root. Product, release, plugin layout, and
+    bundled architecture below it are not compatibility evidence.
     """
     system = platform.system()
     home = os.path.expanduser("~")
 
     if system == "Darwin":
         return {
-            "home": home,
             "base": os.path.join(home, "Library/Application Support/JetBrains"),
-            "arch": "darwin-arm64" if platform.machine() == "arm64" else "darwin-x64",
             "binary_name": "copilot-language-server",
         }
-    elif system == "Windows":
-        # Windows uses %APPDATA% (roaming profile) for JetBrains config.
-        # The binary is an .exe on Windows.
+    if system == "Windows":
         appdata = os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming"))
         return {
-            "home": home,
             "base": os.path.join(appdata, "JetBrains"),
-            "arch": "win32-x64",
             "binary_name": "copilot-language-server.exe",
         }
-    else:
-        # Linux — included for completeness but not a current target
-        return {
-            "home": home,
-            "base": os.path.join(home, ".local/share/JetBrains"),
-            "arch": "linux-x64",
-            "binary_name": "copilot-language-server",
-        }
+    return {
+        "base": os.path.join(home, ".local/share/JetBrains"),
+        "binary_name": "copilot-language-server",
+    }
 
 
-def _compatible_path_patterns() -> list[str]:
-    """Return the expected full paths for the compatible binaries on this platform."""
-    cfg = _platform_config()
-    suffix_parts = [
-        p.format(arch=cfg["arch"], binary_name=cfg["binary_name"])
-        for p in _PLUGIN_SUFFIX_PARTS
+def _has_language_server_name(binary_path: str) -> bool:
+    """Return whether a process path names the platform language-server binary."""
+
+    return os.path.basename(os.path.normpath(binary_path)) == _platform_config()[
+        "binary_name"
     ]
-    return [os.path.join(cfg["base"], ide_dir, *suffix_parts) for ide_dir in _IDE_DIRS]
-
-
-def _compatible_suffixes() -> list[str]:
-    """Return the path suffixes from the IDE directories onward.
-
-    This is the portion that identifies a compatible binary regardless of
-    where the user's home directory is located. Used together with a home
-    directory check to validate paths from process listings.
-    """
-    cfg = _platform_config()
-    suffix_parts = [
-        p.format(arch=cfg["arch"], binary_name=cfg["binary_name"])
-        for p in _PLUGIN_SUFFIX_PARTS
-    ]
-    return [os.path.join(ide_dir, *suffix_parts) for ide_dir in _IDE_DIRS]
-
-
-def _user_home() -> str:
-    """Return the current user's home directory, normalized."""
-    return os.path.normpath(os.path.expanduser("~"))
-
-
-def _is_compatible_path(binary_path: str) -> bool:
-    """Check whether a binary path is a compatible IntelliJ binary.
-
-    Three conditions must hold:
-    1. The path is under the current user's home directory.
-    2. The path contains one of the supported IDE dirs as a path component.
-    3. The binary filename is the expected platform-specific name
-       (``copilot-language-server`` or ``copilot-language-server.exe``).
-
-    We do not assume anything else about the intermediate directory
-    structure — deployment paths vary across environments, and the
-    plugin layout may differ between IDE versions or install methods.
-    """
-    normalized = os.path.normpath(binary_path)
-    home = _user_home()
-    cfg = _platform_config()
-
-    # Must be under the current user's home
-    if not normalized.startswith(home + os.sep):
-        return False
-
-    # Must contain one of the IDE_DIRS as a path component
-    parts = normalized.split(os.sep)
-    if not any(ide_dir in parts for ide_dir in _IDE_DIRS):
-        return False
-
-    # Must end with the correct binary name
-    return os.path.basename(normalized) == cfg["binary_name"]
 
 
 def _candidate_paths_from_jetbrains() -> list[str]:
-    """Collect every executable in the supported JetBrains plugin paths."""
+    """Collect every named executable below the platform JetBrains data root."""
 
-    candidates = [
-        expected
-        for expected in _compatible_path_patterns()
-        if os.path.isfile(expected) and os.access(expected, os.X_OK)
-    ]
+    cfg = _platform_config()
+    base = cfg["base"]
+    binary_name = cfg["binary_name"]
+    if not os.path.isdir(base):
+        logger.debug("JetBrains discovery root does not exist")
+        return []
+
+    candidates: set[str] = set()
+
+    def log_walk_error(error: OSError) -> None:
+        logger.warning(
+            "Could not inspect part of the JetBrains discovery root: %s", error
+        )
+
+    for root, _directories, filenames in os.walk(base, onerror=log_walk_error):
+        if binary_name not in filenames:
+            continue
+        candidate = os.path.join(root, binary_name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            candidates.add(os.path.realpath(candidate))
+
     logger.debug("Found %d executable candidate(s) on disk", len(candidates))
-    return candidates
+    return sorted(candidates)
 
 
 def find_binary_from_jetbrains() -> str | None:
-    """Select the best admitted binary from supported plugin directories."""
+    """Select the best admitted binary found below the JetBrains data root."""
 
     return _select_best_binary(
         _candidate_paths_from_jetbrains(),
-        require_supported_path=True,
     )
 
 
 def _find_binary_from_processes_unix() -> str | None:
     """Find a compatible binary from running processes on Unix (macOS/Linux).
 
-    Scans ``ps`` output for copilot-language-server processes, but only
-    accepts those whose resolved path matches the IntelliJ plugin
-    location under the current user's home.
+    Scans ``ps`` output for named candidates and admits them by reported
+    language-server version.
     """
     try:
         out = subprocess.check_output(
@@ -499,7 +419,6 @@ def _find_binary_from_processes_unix() -> str | None:
 
     return _select_best_binary(
         _collect_process_paths(out.splitlines(), separator=" --"),
-        require_supported_path=True,
     )
 
 
@@ -524,7 +443,6 @@ def _find_binary_from_processes_windows() -> str | None:
 
     return _select_best_binary(
         _collect_process_paths(lines, separator=None),
-        require_supported_path=True,
     )
 
 
@@ -585,7 +503,7 @@ def _query_processes_wmic(binary_name: str) -> list[str] | None:
 
 
 def _collect_process_paths(lines: list[str], separator: str | None) -> list[str]:
-    """Collect path-compatible binaries from a process listing.
+    """Collect paths whose executable name identifies a language-server candidate.
 
     Args:
         lines: Output lines from ps, PowerShell, or wmic.
@@ -614,14 +532,14 @@ def _collect_process_paths(lines: list[str], separator: str | None) -> list[str]
         if not binary_path:
             continue
 
-        if _is_compatible_path(binary_path):
+        if _has_language_server_name(binary_path):
             candidates.add(os.path.realpath(binary_path))
         else:
             rejected += 1
 
     if rejected:
         logger.warning(
-            "Rejected %d process path(s) outside supported JetBrains locations",
+            "Rejected %d process path(s) with an unexpected executable name",
             rejected,
         )
     return sorted(candidates)
@@ -632,12 +550,11 @@ def _filter_process_paths(lines: list[str], separator: str | None) -> str | None
 
     return _select_best_binary(
         _collect_process_paths(lines, separator),
-        require_supported_path=True,
     )
 
 
 def _candidate_paths_from_processes() -> list[str]:
-    """Collect all path-compatible candidates from the platform process list."""
+    """Collect named candidates from the platform process list."""
 
     if platform.system() == "Windows":
         binary_name = _platform_config()["binary_name"]
@@ -666,12 +583,11 @@ def find_binary_from_processes() -> str | None:
     - Unix (macOS, Linux): scans ``ps`` output
     - Windows: uses PowerShell (preferred) or wmic (fallback)
 
-    Only accepts binaries whose path is under the current user's home
-    directory and matches the IntelliJ plugin structure.
+    Process paths identify candidates; their reported language-server versions
+    determine compatibility.
     """
     return _select_best_binary(
         _candidate_paths_from_processes(),
-        require_supported_path=True,
     )
 
 
@@ -687,6 +603,5 @@ def find_binary() -> str | None:
     ]
     return _select_best_binary(
         candidates,
-        require_supported_path=True,
         fail_if_candidates_rejected=True,
     )

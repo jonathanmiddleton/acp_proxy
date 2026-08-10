@@ -1,7 +1,13 @@
 # ADR-006: Version-Bounded JetBrains Binary Discovery
 
-**Status:** Accepted; admission policy amended 2026-08-09
+**Status:** Partially superseded by ADR-013; version probing and deterministic
+selection remain accepted
 **Date:** 2026-04-03  
+
+> **Supersession note (2026-08-10):** ADR-013 removes the IDE product/release,
+> home-directory, plugin-layout, and architecture allowlist from compatibility
+> admission. This ADR remains the historical record for the global version
+> floor, bounded probe, and deterministic selection policy.
 
 ## Context
 

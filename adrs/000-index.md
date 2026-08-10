@@ -19,7 +19,8 @@ See [GUIDE.md](GUIDE.md) for how and when to write ADRs.
 
 ## Binary lifecycle and deployment
 
-- [ADR-006: Version-Bounded JetBrains Binary Discovery](006-binary-discovery.md) — global 1.523.3 floor and deterministic candidate selection
+- [ADR-006: Version-Bounded JetBrains Binary Discovery](006-binary-discovery.md) — historical path policy; version probing and deterministic selection retained
+- [ADR-013: Version-Reported Language-Server Admission](013-version-reported-binary-admission.md) — reported server version is compatibility evidence; IDE releases are enumeration details
 - [ADR-008: Proxy as Substrate — Installable Command, cwd as Workspace](008-proxy-as-substrate.md) — amended by direct startup policy
 
 ## Testing and quality

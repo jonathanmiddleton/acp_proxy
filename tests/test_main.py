@@ -862,6 +862,8 @@ def test_direct_child_environment_is_an_exact_least_credential_allowlist(
         "HTTPS_PROXY": "http://required-proxy",
         "SSL_CERT_FILE": "/cert.pem",
         "GITHUB_COPILOT_ENTERPRISE_URI": "https://github.example",
+        "SYSTEMROOT": r"C:\Windows",
+        "appdata": r"C:\Users\worker\AppData\Roaming",
         cli.DIRECT_SECRET_ENV: canary,
         cli.CONTAINER_BOUNDARY_ENV: "1",
         "MEADOW_OPENAI_API_KEY": canary,
@@ -884,6 +886,8 @@ def test_direct_child_environment_is_an_exact_least_credential_allowlist(
         "HTTPS_PROXY",
         "SSL_CERT_FILE",
         "GITHUB_COPILOT_ENTERPRISE_URI",
+        "SYSTEMROOT",
+        "appdata",
     }
     assert canary not in child.values()
     assert authority in {"trusted-host", "confined-container"}

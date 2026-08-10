@@ -45,7 +45,7 @@ def main():
     cls_path = find_binary()
     if not cls_path:
         print("ERROR: No compatible copilot-language-server binary found.")
-        print("Only the IntelliJ IDEA 2025.3 Copilot plugin binary is supported.")
+        print("No named candidate reported the minimum language-server version.")
         sys.exit(1)
 
     print(f"Starting copilot-language-server in ACP mode...")
