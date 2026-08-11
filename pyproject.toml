@@ -1,6 +1,6 @@
 [project]
 name = "acp-proxy"
-version = "0.2.0"
+version = "0.2.1"
 description = "Explicit Meadow-direct and deprecated OpenCode ACP proxy"
 requires-python = ">=3.11"
 dependencies = [

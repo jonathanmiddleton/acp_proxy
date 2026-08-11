@@ -36,9 +36,27 @@ def copilot_oauth_path(
     if platform_name != "nt":
         host_system = platform.system() if system_name is None else system_name
         if platform_name != "posix" or host_system != "Darwin":
+            explicit_root = (
+                source.get("XDG_CONFIG_HOME")
+                if platform_name == "posix"
+                else None
+            )
+            if explicit_root and posixpath.isabs(explicit_root):
+                # Non-Darwin POSIX hosts (for example Linux containers) have
+                # no supported ambient prior-login default and deliberately
+                # no HOME fallback: HOME always exists in a container image,
+                # so falling back would turn discovery ambient. Discovery is
+                # therefore launcher-opt-in only — an explicit absolute
+                # configuration root — and an unconfigured environment stays
+                # fail-closed exactly as before.
+                return posixpath.join(
+                    explicit_root, "github-copilot", "oauth.json"
+                )
             raise CopilotOAuthCredentialError(
-                "Automatic prior OAuth discovery is supported only on Windows and "
-                "macOS; set GH_COPILOT_TOKEN or GITHUB_COPILOT_TOKEN explicitly"
+                "Automatic prior OAuth discovery is supported only on Windows "
+                "and macOS, or from an explicit absolute XDG_CONFIG_HOME on "
+                "other POSIX hosts; set GH_COPILOT_TOKEN or "
+                "GITHUB_COPILOT_TOKEN explicitly otherwise"
             )
 
         config_home = source.get("XDG_CONFIG_HOME")

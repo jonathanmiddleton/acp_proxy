@@ -101,6 +101,40 @@ def test_unsupported_platform_file_discovery_requires_explicit_token() -> None:
         copilot_oauth_path({}, os_name="posix", system_name="Linux")
 
 
+def test_linux_oauth_path_uses_explicit_absolute_xdg_config_home() -> None:
+    env = {
+        "XDG_CONFIG_HOME": "/synthetic/launcher-root",
+        "HOME": "/root",
+    }
+
+    assert copilot_oauth_path(
+        env,
+        os_name="posix",
+        system_name="Linux",
+    ) == posixpath.join(
+        env["XDG_CONFIG_HOME"], "github-copilot", "oauth.json"
+    )
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"HOME": "/root"},
+        {"XDG_CONFIG_HOME": "relative-root", "HOME": "/root"},
+        {"XDG_CONFIG_HOME": "", "HOME": "/root"},
+    ],
+)
+def test_linux_oauth_path_never_falls_back_to_home(
+    env: dict[str, str],
+) -> None:
+    """HOME always exists inside a container image, so a HOME fallback would
+    make discovery ambient; only a launcher-provided absolute configuration
+    root enables it."""
+
+    with pytest.raises(CopilotOAuthCredentialError, match="Windows and macOS"):
+        copilot_oauth_path(env, os_name="posix", system_name="Linux")
+
+
 def test_load_oauth_token_preserves_the_exact_value_and_authority(
     tmp_path: Path,
 ) -> None:
