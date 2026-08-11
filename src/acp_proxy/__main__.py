@@ -32,6 +32,7 @@ import platform
 import signal
 import sys
 import tempfile
+from collections.abc import Callable
 
 import uvicorn
 
@@ -104,6 +105,26 @@ DIRECT_CHILD_ENV_KEYS = frozenset(
     }
 )
 DIRECT_CHILD_ENV_PREFIXES = ("LC_", "GH", "GITHUB")
+
+
+def _install_shutdown_signal_handlers(
+    loop: asyncio.AbstractEventLoop,
+    handler: Callable[[], None],
+) -> None:
+    """Install the platform signals used for graceful owned shutdown."""
+
+    def _windows_handler(*_: object) -> None:
+        handler()
+
+    if sys.platform == "win32":
+        # CREATE_NEW_PROCESS_GROUP disables targeted CTRL+C delivery. Its
+        # group-addressable graceful signal is CTRL+BREAK / SIGBREAK.
+        for sig in (signal.SIGINT, signal.SIGBREAK):
+            signal.signal(sig, _windows_handler)
+        return
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, handler)
 
 
 def _has_observable_container_boundary() -> bool:
@@ -412,11 +433,7 @@ async def run(
             logger.info("Shutdown signal received")
             shutdown_event.set()
 
-        if sys.platform == "win32":
-            signal.signal(signal.SIGINT, lambda *_: _signal_handler())
-        else:
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                loop.add_signal_handler(sig, _signal_handler)
+        _install_shutdown_signal_handlers(loop, _signal_handler)
 
         # This reproduces uvicorn 0.44's internal setup so port 0 can be
         # reported atomically in the readiness metadata.

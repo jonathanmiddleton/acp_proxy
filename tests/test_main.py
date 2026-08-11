@@ -94,7 +94,39 @@ def test_metadata_records_requested_bind_host(tmp_path: Path) -> None:
     cli._write_metadata_file(str(metadata_path), 8765, host="0.0.0.0")
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["pid"] == os.getpid()
     assert metadata["host"] == "0.0.0.0"
+
+
+def test_windows_shutdown_handles_ctrl_break(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A targeted Windows process group can shut down through CTRL+BREAK."""
+
+    registered: dict[object, Any] = {}
+    shutdowns: list[str] = []
+
+    class NoPosixSignalLoop:
+        def add_signal_handler(self, *_args: Any) -> None:
+            raise AssertionError("Windows must use synchronous signal handlers")
+
+    sigbreak = object()
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+    monkeypatch.setattr(cli.signal, "SIGBREAK", sigbreak, raising=False)
+    monkeypatch.setattr(
+        cli.signal,
+        "signal",
+        lambda sig, callback: registered.setdefault(sig, callback),
+    )
+
+    cli._install_shutdown_signal_handlers(
+        NoPosixSignalLoop(),
+        lambda: shutdowns.append("shutdown"),
+    )
+
+    assert set(registered) == {cli.signal.SIGINT, sigbreak}
+    registered[sigbreak](sigbreak, None)
+    assert shutdowns == ["shutdown"]
 
 
 @pytest.mark.asyncio

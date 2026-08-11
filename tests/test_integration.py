@@ -251,10 +251,11 @@ def _terminate_process_tree(
 
     if os.name == "nt":
         if process.poll() is None and graceful:
-            process.send_signal(getattr(signal, "CTRL_C_EVENT"))
             try:
+                # Windows process groups disable CTRL+C but accept CTRL+BREAK.
+                process.send_signal(getattr(signal, "CTRL_BREAK_EVENT"))
                 return process.wait(timeout=_PROXY_STOP_TIMEOUT_S)
-            except subprocess.TimeoutExpired:
+            except (OSError, subprocess.TimeoutExpired):
                 pass
         if process.poll() is None:
             subprocess.run(
@@ -446,7 +447,12 @@ def _running_proxy(
             debug_log_path,
             sensitive_values,
         )
-        assert type(metadata["pid"]) is int and metadata["pid"] == process.pid
+        metadata_pid = metadata["pid"]
+        assert type(metadata_pid) is int and metadata_pid > 0
+        # A Windows venv python.exe is a redirector: Popen owns the launcher
+        # and process group, while metadata correctly names the serving child.
+        if os.name != "nt":
+            assert metadata_pid == process.pid
         assert metadata["status"] == "ready"
         assert metadata["host"] == "127.0.0.1"
         assert metadata["consumer_mode"] == consumer_mode
