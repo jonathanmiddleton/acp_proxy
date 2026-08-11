@@ -6,6 +6,8 @@ import json
 import logging
 import ntpath
 import os
+import platform
+import posixpath
 from collections.abc import Mapping
 from typing import Any
 
@@ -25,15 +27,30 @@ def copilot_oauth_path(
     environ: Mapping[str, str] | None = None,
     *,
     os_name: str | None = None,
+    system_name: str | None = None,
 ) -> str:
-    """Return the verified Windows location of Copilot's ``oauth.json``."""
+    """Return the verified platform location of Copilot's ``oauth.json``."""
 
     source = os.environ if environ is None else environ
-    if (os.name if os_name is None else os_name) != "nt":
-        raise CopilotOAuthCredentialError(
-            "Automatic prior OAuth discovery is supported only on Windows; "
-            "set GH_COPILOT_TOKEN or GITHUB_COPILOT_TOKEN explicitly"
-        )
+    platform_name = os.name if os_name is None else os_name
+    if platform_name != "nt":
+        host_system = platform.system() if system_name is None else system_name
+        if platform_name != "posix" or host_system != "Darwin":
+            raise CopilotOAuthCredentialError(
+                "Automatic prior OAuth discovery is supported only on Windows and "
+                "macOS; set GH_COPILOT_TOKEN or GITHUB_COPILOT_TOKEN explicitly"
+            )
+
+        config_home = source.get("XDG_CONFIG_HOME")
+        if not config_home or not posixpath.isabs(config_home):
+            home = source.get("HOME")
+            if not home:
+                raise CopilotOAuthCredentialError(
+                    "Cannot locate prior Copilot OAuth on macOS: HOME is unset and "
+                    "XDG_CONFIG_HOME is not an absolute path"
+                )
+            config_home = posixpath.join(home, ".config")
+        return posixpath.join(config_home, "github-copilot", "oauth.json")
 
     config_home = source.get("LOCALAPPDATA")
     if not config_home:
@@ -104,6 +121,7 @@ def inject_prior_copilot_oauth(
     *,
     oauth_path: str | os.PathLike[str] | None = None,
     os_name: str | None = None,
+    system_name: str | None = None,
 ) -> dict[str, str]:
     """Return a child environment with prior OAuth when no token is explicit."""
 
@@ -122,7 +140,11 @@ def inject_prior_copilot_oauth(
         return child_env
 
     path = (
-        copilot_oauth_path(child_env, os_name=platform_name)
+        copilot_oauth_path(
+            child_env,
+            os_name=platform_name,
+            system_name=system_name,
+        )
         if oauth_path is None
         else oauth_path
     )

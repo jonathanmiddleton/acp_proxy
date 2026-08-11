@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import ntpath
 import os
+import posixpath
 from pathlib import Path
 
 import pytest
@@ -60,9 +61,44 @@ def test_windows_oauth_path_falls_back_to_user_profile() -> None:
     )
 
 
-def test_non_windows_file_discovery_requires_explicit_token() -> None:
-    with pytest.raises(CopilotOAuthCredentialError, match="only on Windows"):
-        copilot_oauth_path({}, os_name="posix")
+def test_macos_oauth_path_uses_absolute_xdg_config_home() -> None:
+    env = {
+        "XDG_CONFIG_HOME": "/synthetic/xdg-config",
+        "HOME": "/synthetic/home",
+    }
+
+    assert copilot_oauth_path(
+        env,
+        os_name="posix",
+        system_name="Darwin",
+    ) == posixpath.join(
+        env["XDG_CONFIG_HOME"], "github-copilot", "oauth.json"
+    )
+
+
+def test_macos_oauth_path_falls_back_to_home_dot_config() -> None:
+    env = {
+        "XDG_CONFIG_HOME": "relative-config",
+        "HOME": "/synthetic/home",
+    }
+
+    assert copilot_oauth_path(
+        env,
+        os_name="posix",
+        system_name="Darwin",
+    ) == posixpath.join(
+        env["HOME"], ".config", "github-copilot", "oauth.json"
+    )
+
+
+def test_macos_oauth_path_requires_a_config_root() -> None:
+    with pytest.raises(CopilotOAuthCredentialError, match="HOME is unset"):
+        copilot_oauth_path({}, os_name="posix", system_name="Darwin")
+
+
+def test_unsupported_platform_file_discovery_requires_explicit_token() -> None:
+    with pytest.raises(CopilotOAuthCredentialError, match="Windows and macOS"):
+        copilot_oauth_path({}, os_name="posix", system_name="Linux")
 
 
 def test_load_oauth_token_preserves_the_exact_value_and_authority(
@@ -162,6 +198,31 @@ def test_prior_oauth_is_injected_only_into_the_child_environment(
         "GITHUB_COPILOT_API_URL": "https://company-managed-endpoint.example",
     }
     assert dict(os.environ) == ambient_before
+    assert _TOKEN_A not in caplog.text
+
+
+def test_macos_prior_oauth_is_discovered_from_home(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    oauth_dir = tmp_path / ".config" / "github-copilot"
+    oauth_dir.mkdir(parents=True)
+    oauth_path = oauth_dir / "oauth.json"
+    oauth_path.write_text(json.dumps(_oauth_document(_TOKEN_A)), encoding="utf-8")
+    env = {"HOME": str(tmp_path)}
+    caplog.set_level("DEBUG", logger="acp_proxy.copilot_auth")
+
+    child_env = inject_prior_copilot_oauth(
+        env,
+        os_name="posix",
+        system_name="Darwin",
+    )
+
+    assert child_env == {
+        **env,
+        "GITHUB_COPILOT_TOKEN": _TOKEN_A,
+    }
+    assert env == {"HOME": str(tmp_path)}
     assert _TOKEN_A not in caplog.text
 
 

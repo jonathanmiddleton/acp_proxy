@@ -190,16 +190,18 @@ For `meadow-direct` CLI startup, an explicit non-empty `GH_COPILOT_TOKEN` or
 loads the single prior OAuth `accessToken` from the GitHub Copilot
 `oauth.json` file and supplies it to the child as `GITHUB_COPILOT_TOKEN`.
 Windows uses `%LOCALAPPDATA%\github-copilot\oauth.json` (with the conventional
-`%USERPROFILE%\AppData\Local` fallback). Automatic file discovery is limited
-to this verified Windows layout; other platforms must use one of the explicit
-token variables. The file must contain exactly one OAuth account so the proxy
-never guesses between identities. Authority and endpoint routing remain owned
-by the surrounding `GH*`/`GITHUB*` environment and the company's proxy setup;
-those values are forwarded unchanged. Missing, malformed, empty, or ambiguous
-credentials stop startup before the language server is launched. Credential
-values are never logged, and the language server remains responsible for
-exchanging the durable OAuth credential for and refreshing its short-lived
-Copilot service token.
+`%USERPROFILE%\AppData\Local` fallback). On macOS, it uses an absolute
+`$XDG_CONFIG_HOME/github-copilot/oauth.json` when configured and otherwise
+`$HOME/.config/github-copilot/oauth.json`. Automatic file discovery is limited
+to these verified Windows and macOS layouts; other platforms must use one of
+the explicit token variables. The file must contain exactly one OAuth account
+so the proxy never guesses between identities. Authority and endpoint routing
+remain owned by the surrounding `GH*`/`GITHUB*` environment and the company's
+proxy setup; those values are forwarded unchanged. Missing, malformed, empty,
+or ambiguous credentials stop startup before the language server is launched.
+Credential values are never logged, and the language server remains
+responsible for exchanging the durable OAuth credential for and refreshing its
+short-lived Copilot service token.
 
 ### Legacy context injection
 
