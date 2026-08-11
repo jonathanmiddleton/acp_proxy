@@ -474,12 +474,14 @@ async def run(
         # Wait for shutdown signal or server to stop
         signal_task = asyncio.create_task(shutdown_event.wait())
         child_task = asyncio.create_task(child_lost_event.wait())
-        done, pending = await asyncio.wait(
+        done, _pending = await asyncio.wait(
             [server_task, signal_task, child_task],
             return_when=asyncio.FIRST_COMPLETED,
         )
-        for task in pending:
-            task.cancel()
+        for watcher in (signal_task, child_task):
+            if not watcher.done():
+                watcher.cancel()
+        await asyncio.gather(signal_task, child_task, return_exceptions=True)
 
         if child_task in done and child_lost_event.is_set():
             logger.error("Owned ACP child transport closed; stopping proxy")
@@ -490,10 +492,10 @@ async def run(
                     "owned ACP child transport closed"
                 )
 
-        if not server_task.done():
+        if server_task not in done:
             server.should_exit = True
             await server_task
-        elif server_task in done:
+        else:
             await server_task
     finally:
         if generation_loss_task is not None and not generation_loss_task.done():

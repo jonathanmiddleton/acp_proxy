@@ -150,9 +150,9 @@ They **fail** (not skip) if the binary is not found — see
 python -m pytest tests/test_transport.py tests/test_client.py tests/test_server.py tests/test_direct_*.py tests/test_discovery.py tests/test_binary_admission.py tests/test_main.py -v
 ```
 The live direct integration probe requires the advertised
-`gpt-5.3-codex` model, proves that the target setter accepts an advertised ID
-and rejects an unadvertised control, and exercises two turns on one continuity
-generation.
+`gpt-5.3-codex` model, proves exact advertised-model binding through the public
+Meadow contract, verifies that its catalog gate rejects an unadvertised
+control, and exercises two turns on one continuity generation.
 
 ## Configuration
 
