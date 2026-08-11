@@ -48,6 +48,13 @@ DIRECT_SESSION_UPDATE_TYPES = {
     "usage_update",
     "user_message_chunk",
 }
+_DIRECT_SESSION_STATE_UPDATE_TYPES = {
+    "available_commands_update",
+    "config_option_update",
+    "current_mode_update",
+    "session_info_update",
+    "usage_update",
+}
 _DIRECT_PROMPT_TERMINAL_MARKER = {"__acp_prompt_terminal__": True}
 _MAX_DIRECT_CONTROL_UPDATE_BYTES = 256_000
 _MAX_DIRECT_AVAILABLE_COMMANDS = 1024
@@ -162,8 +169,8 @@ class AcpClient:
         self._direct_prompt_phases: dict[str, str] = {}
         self._direct_update_budgets: dict[str, dict[str, int]] = {}
         self._expected_model_updates: dict[str, str] = {}
-        self._available_commands_by_session: dict[str, list[Any]] = {}
         self._provisional_session_ids: set[str] = set()
+        self._session_new_response_ids: set[str] = set()
         self._agent_name: str | None = None
         self._agent_version: str | None = None
         self._protocol_version: int | None = None
@@ -264,8 +271,8 @@ class AcpClient:
         self._direct_prompt_phases.clear()
         self._direct_update_budgets.clear()
         self._expected_model_updates.clear()
-        self._available_commands_by_session.clear()
         self._provisional_session_ids.clear()
+        self._session_new_response_ids.clear()
         self._sessions.clear()
         self._direct_model_binding_strategy = None
         self._direct_model_binding_negotiation = None
@@ -1072,9 +1079,10 @@ class AcpClient:
             is CallbackPolicy.DIRECT_DENY
         )
         if direct_mode:
+            self._log_direct_session_update(method, params)
             if not self._direct_model_integrity_holds(params):
                 return
-            if self._handle_direct_control_update(method, params):
+            if self._handle_direct_state_update(method, params):
                 return
             if not self._is_valid_direct_session_update(method, params):
                 self._transport.fail_closed(
@@ -1104,6 +1112,92 @@ class AcpClient:
             if queue:
                 queue.put_nowait(update)
 
+    def _log_direct_session_update(self, method: Any, params: Any) -> None:
+        """Log correlation-safe structure for a direct session update."""
+
+        if method != "session/update" or not logger.isEnabledFor(logging.DEBUG):
+            return
+        session_id = params.get("sessionId") if isinstance(params, dict) else None
+        update = params.get("update") if isinstance(params, dict) else None
+        kind = update.get("sessionUpdate") if isinstance(update, dict) else None
+        if not isinstance(kind, str):
+            kind = "invalid"
+        elif kind not in DIRECT_SESSION_UPDATE_TYPES:
+            kind = "unrecognized"
+        known_session = isinstance(session_id, str) and session_id in self._sessions
+        provisional_session = (
+            isinstance(session_id, str) and session_id in self._provisional_session_ids
+        )
+        response_observed = (
+            isinstance(session_id, str)
+            and session_id in self._session_new_response_ids
+        )
+        prompt_phase = (
+            self._direct_prompt_phases.get(session_id)
+            if isinstance(session_id, str)
+            else None
+        )
+        if prompt_phase not in {"preparing", "active", "terminal"}:
+            prompt_phase = "none"
+        pending_session_new = self._transport.pending_request_count("session/new")
+        if type(pending_session_new) is not int:
+            pending_session_new = -1
+        logger.debug(
+            "Direct ACP session update: kind=%s session_id_present=%s "
+            "session_known=%s provisional_session=%s response_observed=%s "
+            "prompt_phase=%s "
+            "pending_session_new=%d update_queue_present=%s",
+            kind,
+            isinstance(session_id, str) and bool(session_id),
+            known_session,
+            provisional_session,
+            response_observed,
+            prompt_phase,
+            pending_session_new,
+            isinstance(session_id, str) and session_id in self._update_queues,
+        )
+        if kind == "config_option_update":
+            self._log_direct_config_option_shape(update)
+
+    @staticmethod
+    def _log_direct_config_option_shape(update: dict[str, Any]) -> None:
+        """Log bounded semantic counts for a configuration snapshot."""
+
+        options = update.get("configOptions")
+        if not isinstance(options, list):
+            logger.debug("Direct ACP config option shape: options_list=False")
+            return
+        invalid_options = 0
+        model_options = 0
+        mode_options = 0
+        thought_level_options = 0
+        other_options = 0
+        for option in options:
+            if not isinstance(option, dict):
+                invalid_options += 1
+                continue
+            option_id = option.get("id")
+            category = option.get("category")
+            if option_id == "model" or category == "model":
+                model_options += 1
+            elif option_id == "mode" or category == "mode":
+                mode_options += 1
+            elif option_id == "reasoning_effort" or category == "thought_level":
+                thought_level_options += 1
+            else:
+                other_options += 1
+        logger.debug(
+            "Direct ACP config option shape: options_list=True option_count=%d "
+            "invalid_options=%d model_options=%d mode_options=%d "
+            "thought_level_options=%d other_options=%d",
+            len(options),
+            invalid_options,
+            model_options,
+            mode_options,
+            thought_level_options,
+            other_options,
+        )
+
     def _direct_model_integrity_holds(self, params: Any) -> bool:
         """Fail continuity when any config update changes the selected model."""
 
@@ -1125,6 +1219,7 @@ class AcpClient:
             session_id,
             session.model_id if session is not None else None,
         )
+        model_option_seen = False
         for option in options:
             if (
                 not isinstance(option, dict)
@@ -1136,71 +1231,87 @@ class AcpClient:
                 )
                 return False
             if option.get("id") == "model" or option.get("category") == "model":
+                model_option_seen = True
                 current = option.get("currentValue")
-                if not isinstance(current, str) or current != selected_model:
+                if not isinstance(current, str) or not current:
+                    self._transport.fail_closed(
+                        "direct ACP config update malformed"
+                    )
+                    return False
+                if isinstance(selected_model, str) and current != selected_model:
                     self._transport.fail_closed(
                         "direct ACP selected model drifted"
                     )
                     return False
+        if isinstance(selected_model, str) and selected_model and not model_option_seen:
+            self._transport.fail_closed(
+                "direct ACP selected model state missing"
+            )
+            return False
         return True
 
-    def _handle_direct_control_update(self, method: Any, params: Any) -> bool:
-        """Validate and retain legitimate known-session updates outside prompts."""
+    def _handle_direct_state_update(self, method: Any, params: Any) -> bool:
+        """Validate and discard correlated session state outside active prompts."""
 
         if method != "session/update" or not isinstance(params, dict):
             return False
         session_id = params.get("sessionId")
         update = params.get("update")
         kind = update.get("sessionUpdate") if isinstance(update, dict) else None
-        provisional_session = (
-            isinstance(session_id, str)
-            and session_id not in self._sessions
-            and kind == "available_commands_update"
-            and self._admit_provisional_session_id(session_id)
-        )
         if (
             not isinstance(session_id, str)
-            or (session_id not in self._sessions and not provisional_session)
+            or not session_id
             or not isinstance(update, dict)
+            or not isinstance(kind, str)
+            or kind not in _DIRECT_SESSION_STATE_UPDATE_TYPES
             or getattr(self, "_direct_prompt_phases", {}).get(session_id) == "active"
         ):
             return False
+        if not self._is_bounded_direct_state_update(kind, update):
+            return False
+        if (
+            session_id not in self._sessions
+            and session_id not in self._session_new_response_ids
+            and not self._admit_provisional_session_id(session_id)
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _is_bounded_direct_state_update(kind: str, update: dict[str, Any]) -> bool:
+        """Validate one recognized state envelope without retaining its payload."""
+
+        try:
+            control_bytes = len(
+                json.dumps(
+                    update,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+        except (TypeError, ValueError):
+            return False
+        if control_bytes > _MAX_DIRECT_CONTROL_UPDATE_BYTES:
+            return False
         if kind == "available_commands_update":
             commands = update.get("availableCommands")
-            try:
-                control_bytes = len(
-                    json.dumps(
-                        update,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                )
-            except (TypeError, ValueError):
-                return False
-            if (
-                not isinstance(commands, list)
-                or len(commands) > _MAX_DIRECT_AVAILABLE_COMMANDS
-                or control_bytes > _MAX_DIRECT_CONTROL_UPDATE_BYTES
-            ):
-                return False
-            available_commands = getattr(
-                self, "_available_commands_by_session", None
+            return (
+                isinstance(commands, list)
+                and len(commands) <= _MAX_DIRECT_AVAILABLE_COMMANDS
+                and all(isinstance(command, dict) for command in commands)
             )
-            if available_commands is None:
-                available_commands = {}
-                self._available_commands_by_session = available_commands
-            available_commands[session_id] = list(commands)
-            return True
-        if kind != "config_option_update":
-            return False
-        options = update.get("configOptions")
-        if not isinstance(options, list):
-            return False
-        for option in options:
-            if not isinstance(option, dict):
-                return False
-        return True
+        if kind == "config_option_update":
+            options = update.get("configOptions")
+            return isinstance(options, list) and all(
+                isinstance(option, dict) for option in options
+            )
+        if kind == "current_mode_update":
+            current_mode = update.get("currentModeId")
+            return isinstance(current_mode, str) and bool(current_mode)
+        # usage_update and session_info_update are recognized ACP session-state
+        # envelopes, but Meadow v1 derives no claim from their payload fields.
+        return kind in {"usage_update", "session_info_update"}
 
     def _admit_provisional_session_id(self, session_id: str) -> bool:
         """Bind at most one provisional ID per unresolved session/new request."""
@@ -1215,22 +1326,69 @@ class AcpClient:
         return True
 
     def _bind_provisional_session(self, session_id: str) -> None:
-        """Resolve pre-response command state to the returned session identity."""
+        """Resolve creation-correlated state to the returned session identity."""
 
         provisional = self._provisional_session_ids
+        self._session_new_response_ids.discard(session_id)
         if session_id in provisional:
             provisional.remove(session_id)
             return
         if provisional and self._transport.pending_request_count("session/new") == 0:
-            for orphaned_session_id in provisional:
-                self._available_commands_by_session.pop(
-                    orphaned_session_id, None
-                )
             provisional.clear()
+            self._session_new_response_ids.clear()
             self._transport.fail_closed(
                 "direct ACP provisional session identity mismatch"
             )
             raise ConnectionError(
+                "direct ACP provisional session identity mismatch"
+            )
+
+    def _observe_session_new_response(self, message: dict[str, Any]) -> None:
+        """Bridge session state from response dispatch to coroutine registration."""
+
+        pending_creates = self._transport.pending_request_count("session/new")
+        if type(pending_creates) is not int or pending_creates <= 0:
+            self._transport.fail_closed(
+                "direct ACP session/new response correlation failure"
+            )
+            return
+        remaining_creates = pending_creates - 1
+        result = message.get("result")
+        session_id = result.get("sessionId") if isinstance(result, dict) else None
+        provisional = self._provisional_session_ids
+
+        if isinstance(session_id, str) and session_id:
+            response_ids = self._session_new_response_ids
+            if session_id in self._sessions or session_id in response_ids:
+                self._transport.fail_closed(
+                    "direct ACP session/new response identity failure"
+                )
+                return
+            provisional.discard(session_id)
+            if len(provisional) > remaining_creates:
+                provisional.clear()
+                response_ids.clear()
+                self._transport.fail_closed(
+                    "direct ACP provisional session identity mismatch"
+                )
+                return
+            response_ids.add(session_id)
+            return
+
+        if "error" not in message:
+            provisional.clear()
+            self._session_new_response_ids.clear()
+            self._transport.fail_closed(
+                "direct ACP session/new response identity failure"
+            )
+            return
+
+        # An error response has no session identity. Any excess provisional ID
+        # must therefore have belonged to the request that just settled.
+        if len(provisional) > remaining_creates:
+            provisional.clear()
+            self._session_new_response_ids.clear()
+            self._transport.fail_closed(
                 "direct ACP provisional session identity mismatch"
             )
 
@@ -1301,7 +1459,7 @@ class AcpClient:
         if getattr(self, "_direct_prompt_phases", {}).get(session_id) != "active":
             return False
         kind = update.get("sessionUpdate")
-        if kind not in DIRECT_SESSION_UPDATE_TYPES:
+        if not isinstance(kind, str) or kind not in DIRECT_SESSION_UPDATE_TYPES:
             return False
         if kind in {
             "agent_message_chunk",
@@ -1363,12 +1521,15 @@ class AcpClient:
         method: str,
         params: dict[str, Any] | None,
     ) -> None:
-        """Put a terminal marker in the same ordered stream as direct updates."""
+        """Correlate session creation or order a prompt's terminal marker."""
 
         if (
             getattr(self, "_callback_policy", CallbackPolicy.LEGACY_PERMISSIVE)
             is not CallbackPolicy.DIRECT_DENY
         ):
+            return
+        if method == "session/new":
+            self._observe_session_new_response(_message)
             return
         if method != "session/prompt":
             return

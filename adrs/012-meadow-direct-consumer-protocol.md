@@ -1,7 +1,15 @@
 # ADR-012: Authenticated Meadow-Direct Consumer Protocol
 
-**Status:** Accepted
+**Status:** Accepted; out-of-prompt session-state retention partially
+superseded by [ADR-014](014-correlate-direct-session-state.md)
 **Date:** 2026-08-09
+
+> **Partial supersession note (2026-08-11):** ADR-014 replaces the requirement
+> to retain known out-of-prompt command and configuration state. Recognized
+> state-only updates are correlated, bounded, structurally validated and
+> logged, then discarded unless they enforce an explicit Meadow contract.
+> Exact selected-model integrity and prompt-scoped ordered event evidence
+> remain binding.
 
 ## Context
 
@@ -169,9 +177,19 @@ The transport inserts the terminal `session/prompt` response into the same
 ordered internal stream as session updates. Prompt completion cannot overtake
 an unsettled permission/callback response. Late prompt output, tool, or thought
 updates after that terminal boundary, unknown response IDs, malformed or
-unknown direct updates, and selected-model drift revoke continuity. Known
-out-of-prompt command/config updates are validated and retained as client
-state; model config updates must preserve the exactly acknowledged model.
+unknown direct updates, and selected-model drift revoke continuity. Recognized
+session-state updates outside an active prompt may race ahead of `session/new`
+settlement. Direct mode admits them only when boundedly correlated to an
+outstanding create or a known session and confirms every provisional identity
+against an eventual `session/new` response. It validates their recognized
+envelopes and control-update bounds and logs their structural shape, but does
+not retain command, current-mode, non-model configuration, usage, or
+session-information payloads because Meadow v1 neither exposes nor acts on
+them. Selected-model state is the exception: a configuration update must agree
+with an in-progress binding expectation and, after exact acknowledgement, with
+the session's acknowledged model. Malformed or drifting selected-model state
+revokes continuity. Message, thought, plan, and tool updates outside an active
+prompt remain invalid and revoke continuity.
 
 ### Evidence and authority
 
@@ -182,10 +200,12 @@ silently truncate a successful result: overflow sends cancellation, waits for
 settlement, fails visibly, and retains the exact bounded evidence prefix with
 an explicit completeness flag.
 
-ACP `usage_update` and `session_info_update` payloads have no normalized shape
-proven by this implementation. Direct v1 retains them only as bounded ordered
-raw diagnostics, advertises usage reporting as unsupported, and derives no
-counter or session-information claim from their contents.
+When received during an active prompt, ACP `usage_update` and
+`session_info_update` payloads have no normalized shape proven by this
+implementation. Direct v1 retains them only as bounded ordered raw diagnostics,
+advertises usage reporting as unsupported, and derives no counter or
+session-information claim from their contents. Outside an active prompt they
+are correlated, structurally validated, logged, and discarded under ADR-014.
 
 The reader bounds cumulative event bytes and event count before queue
 retention, in addition to the normalized result limits. Incoming callback

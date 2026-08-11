@@ -96,6 +96,7 @@ particularly the failure modes that motivated each decision.
 | [ADR-009](adrs/009-intra-process-session-scaling.md)| Retained scaling evidence; direct pool/affinity clauses superseded                                            |
 | [ADR-011](adrs/011-context-injection-boundary.md)   | Deprecated legacy context-injection boundary                                                                 |
 | [ADR-012](adrs/012-meadow-direct-consumer-protocol.md) | Authenticated direct protocol, migration, lifecycle, evidence, and authority policy                       |
+| [ADR-014](adrs/014-correlate-direct-session-state.md) | Correlate and validate direct session state without retaining unsupported payloads                         |
 
 The ADRs explain the *why* behind the module ownership rules in the table
 above. A change that contradicts an accepted ADR requires a new ADR

@@ -95,10 +95,12 @@ Later results report that stable instructions were not resubmitted on the same
 ACP session; they do not claim behavioral recall. Event bytes, event count,
 response bytes, request bytes, sessions, operations, queued prompts, and
 deadlines are all negotiated and fail closed at their respective boundaries.
-Agent-defined `usage_update` and `session_info_update` payloads remain bounded,
+Prompt-scoped `usage_update` and `session_info_update` payloads remain bounded,
 ordered raw diagnostics in direct v1. The proxy advertises usage reporting as
 unsupported and never reinterprets booleans, negative values, or unknown fields
-as normalized token counters.
+as normalized token counters. Recognized state updates outside a prompt are
+boundedly correlated, structurally validated and logged, then discarded unless
+they enforce the acknowledged model.
 
 ### Deprecated OpenCode compatibility
 

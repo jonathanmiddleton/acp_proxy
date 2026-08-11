@@ -8,6 +8,7 @@ exercise client.py in isolation — no subprocess, no transport.
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call
 
@@ -22,6 +23,7 @@ from acp_proxy.client import (
     ModelInfo,
     SessionState,
 )
+from acp_proxy.transport import AcpTransport
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -254,8 +256,8 @@ class TestHandlePermissionRequest:
         client._direct_prompt_phases = {}
         client._direct_update_budgets = {}
         client._expected_model_updates = {}
-        client._available_commands_by_session = {}
         client._provisional_session_ids = set()
+        client._session_new_response_ids = set()
         return client
 
     def test_prefers_allow_always(self):
@@ -385,7 +387,6 @@ class TestHandleAgentRequest:
         client._direct_prompt_phases = {}
         client._direct_update_budgets = {}
         client._expected_model_updates = {}
-        client._available_commands_by_session = {}
         return client
 
     def test_unknown_method_returns_none(self):
@@ -435,8 +436,8 @@ class TestHandleNotification:
         client._direct_prompt_phases = {}
         client._direct_update_budgets = {}
         client._expected_model_updates = {}
-        client._available_commands_by_session = {}
         client._provisional_session_ids = set()
+        client._session_new_response_ids = set()
         return client
 
     def test_session_update_routed_to_queue(self):
@@ -516,6 +517,13 @@ class TestHandleNotification:
                     "update": {
                         "content": {"type": "text", "text": "missing kind"}
                     },
+                },
+            },
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "active",
+                    "update": {"sessionUpdate": ["not", "a", "kind"]},
                 },
             },
             {"method": "unknown/notification", "params": {}},
@@ -653,6 +661,165 @@ class TestHandleNotification:
             "direct ACP selected model drifted"
         )
 
+    def test_direct_binding_model_update_matches_expected_without_mutating_state(
+        self,
+    ) -> None:
+        """A binding notification corroborates but does not settle the model RPC."""
+
+        client = self._make_client()
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._sessions = {
+            "session": SessionState(session_id="session", model_id="auto")
+        }
+        client._expected_model_updates = {"session": "target"}
+        client._transport = MagicMock()
+
+        client._handle_notification(
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session",
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": [
+                            {
+                                "id": "model",
+                                "category": "model",
+                                "currentValue": "target",
+                            },
+                            {
+                                "id": "mode",
+                                "category": "mode",
+                                "currentValue": "agent",
+                            },
+                        ],
+                    },
+                },
+            }
+        )
+
+        assert client._sessions["session"].model_id == "auto"
+        client._transport.fail_closed.assert_not_called()
+
+    def test_direct_binding_model_update_mismatch_fails_continuity(self) -> None:
+        """The target being bound, rather than the old catalog value, is invariant."""
+
+        client = self._make_client()
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._sessions = {
+            "session": SessionState(session_id="session", model_id="auto")
+        }
+        client._expected_model_updates = {"session": "target"}
+        client._transport = MagicMock()
+
+        client._handle_notification(
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session",
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": [
+                            {
+                                "id": "model",
+                                "category": "model",
+                                "currentValue": "auto",
+                            }
+                        ],
+                    },
+                },
+            }
+        )
+
+        client._transport.fail_closed.assert_called_once_with(
+            "direct ACP selected model drifted"
+        )
+
+    @pytest.mark.parametrize(
+        "expected_model_updates",
+        [{}, {"session": "target"}],
+    )
+    def test_direct_config_snapshot_cannot_omit_selected_model(
+        self,
+        expected_model_updates: dict[str, str],
+    ) -> None:
+        """A complete config snapshot must preserve ready and binding models."""
+
+        client = self._make_client()
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._sessions = {
+            "session": SessionState(session_id="session", model_id="ready-model")
+        }
+        client._expected_model_updates = expected_model_updates
+        client._transport = MagicMock()
+
+        client._handle_notification(
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session",
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": [
+                            {
+                                "id": "mode",
+                                "category": "mode",
+                                "currentValue": "agent",
+                            }
+                        ],
+                    },
+                },
+            }
+        )
+
+        client._transport.fail_closed.assert_called_once_with(
+            "direct ACP selected model state missing"
+        )
+
+    def test_direct_ready_model_update_matches_without_retaining_config(self) -> None:
+        """A matching post-binding snapshot is validated and discarded."""
+
+        client = self._make_client()
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._sessions = {
+            "session": SessionState(session_id="session", model_id="target")
+        }
+        client._transport = MagicMock()
+
+        client._handle_notification(
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session",
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": [
+                            {
+                                "id": "model",
+                                "category": "model",
+                                "currentValue": "target",
+                            },
+                            {
+                                "id": "reasoning_effort",
+                                "category": "thought_level",
+                                "currentValue": "sensitive-payload",
+                            },
+                        ],
+                    },
+                },
+            }
+        )
+
+        assert client._sessions["session"].model_id == "target"
+        assert "sensitive-payload" not in repr(
+            {
+                key: value
+                for key, value in client.__dict__.items()
+                if key != "_transport"
+            }
+        )
+        client._transport.fail_closed.assert_not_called()
+
     def test_direct_active_prompt_model_drift_fails_before_evidence_retention(
         self,
     ) -> None:
@@ -701,8 +868,10 @@ class TestHandleNotification:
             "direct ACP selected model drifted"
         )
 
-    def test_direct_known_control_update_is_retained_outside_prompt(self) -> None:
-        """ADI-08: legitimate control-plane updates are validated, not dropped."""
+    def test_direct_known_command_update_is_validated_and_discarded_outside_prompt(
+        self,
+    ) -> None:
+        """Known state is accepted without retaining an unused command snapshot."""
 
         client = self._make_client()
         client._callback_policy = CallbackPolicy.DIRECT_DENY
@@ -723,35 +892,329 @@ class TestHandleNotification:
             }
         )
 
-        assert client._available_commands_by_session == {"session": commands}
         client._transport.fail_closed.assert_not_called()
 
-    def test_direct_provisional_session_new_command_update_is_retained(self) -> None:
-        """Observed ACP ordering: commands may precede the session/new response."""
+    @pytest.mark.parametrize(
+        ("update_kind", "expected_kind"),
+        [
+            ("current_mode_update", "current_mode_update"),
+            ("sensitive-unrecognized-kind", "unrecognized"),
+            (None, "invalid"),
+        ],
+    )
+    def test_direct_session_update_logging_is_structural_and_payload_safe(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        update_kind: str | None,
+        expected_kind: str,
+    ) -> None:
+        """Diagnostics identify update shape without retaining agent-controlled data."""
 
         client = self._make_client()
         client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._transport = MagicMock()
         client._transport.pending_request_count.return_value = 1
-        commands = [{"name": "test", "description": "command"}]
+        sensitive_session_id = "sensitive-session-id"
+        sensitive_payload = "sensitive-update-payload"
+        update = {
+            "sessionUpdate": update_kind,
+            "currentModeId": sensitive_payload,
+        }
+        caplog.set_level("DEBUG", logger="acp_proxy.client")
+
+        client._handle_notification(
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": sensitive_session_id,
+                    "update": update,
+                },
+            }
+        )
+
+        assert f"kind={expected_kind}" in caplog.text
+        assert "session_id_present=True" in caplog.text
+        assert "session_known=False" in caplog.text
+        assert "provisional_session=False" in caplog.text
+        assert "response_observed=False" in caplog.text
+        assert "prompt_phase=none" in caplog.text
+        assert "pending_session_new=1" in caplog.text
+        assert "update_queue_present=False" in caplog.text
+        assert sensitive_session_id not in caplog.text
+        assert sensitive_payload not in caplog.text
+        assert "sensitive-unrecognized-kind" not in caplog.text
+
+    def test_direct_config_update_logging_classifies_without_logging_values(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Config diagnostics expose semantic shape without option data."""
+
+        client = self._make_client()
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._transport = MagicMock()
+        client._transport.pending_request_count.return_value = 1
+        sensitive_value = "sensitive-current-value"
+        caplog.set_level("DEBUG", logger="acp_proxy.client")
+
+        client._handle_notification(
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "sensitive-session-id",
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": [
+                            {
+                                "id": "model",
+                                "currentValue": sensitive_value,
+                            },
+                            {"category": "mode", "currentValue": sensitive_value},
+                            {
+                                "category": "thought_level",
+                                "currentValue": sensitive_value,
+                            },
+                            {"id": sensitive_value, "currentValue": sensitive_value},
+                            42,
+                        ],
+                    },
+                },
+            }
+        )
+
+        assert "kind=config_option_update" in caplog.text
+        assert "options_list=True" in caplog.text
+        assert "option_count=5" in caplog.text
+        assert "invalid_options=1" in caplog.text
+        assert "model_options=1" in caplog.text
+        assert "mode_options=1" in caplog.text
+        assert "thought_level_options=1" in caplog.text
+        assert "other_options=1" in caplog.text
+        assert sensitive_value not in caplog.text
+        assert "sensitive-session-id" not in caplog.text
+
+    @pytest.mark.parametrize(
+        "update",
+        [
+            {
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [
+                    {"name": "sensitive-command", "description": "sensitive-payload"}
+                ],
+            },
+            {
+                "sessionUpdate": "config_option_update",
+                "configOptions": [
+                    {
+                        "id": "mode",
+                        "category": "mode",
+                        "currentValue": "sensitive-payload",
+                    }
+                ],
+            },
+            {
+                "sessionUpdate": "current_mode_update",
+                "currentModeId": "sensitive-payload",
+            },
+            {"sessionUpdate": "usage_update", "opaque": "sensitive-payload"},
+            {
+                "sessionUpdate": "session_info_update",
+                "opaque": "sensitive-payload",
+            },
+        ],
+    )
+    def test_direct_provisional_session_state_is_accepted_and_discarded(
+        self,
+        update: dict[str, Any],
+    ) -> None:
+        """Stable state may precede session/new without becoming client state."""
+
+        client = self._make_client()
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._transport = MagicMock()
+        client._transport.pending_request_count.return_value = 1
 
         client._handle_notification(
             {
                 "method": "session/update",
                 "params": {
                     "sessionId": "provisional-session",
-                    "update": {
-                        "sessionUpdate": "available_commands_update",
-                        "availableCommands": commands,
-                    },
+                    "update": update,
                 },
             }
         )
 
-        assert client._available_commands_by_session == {
-            "provisional-session": commands
-        }
+        assert client._provisional_session_ids == {"provisional-session"}
+        assert client._sessions == {}
+        assert client._update_queues == {}
+        assert "sensitive-payload" not in repr(
+            {
+                key: value
+                for key, value in client.__dict__.items()
+                if key != "_transport"
+            }
+        )
         client._transport.fail_closed.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "update",
+        [
+            {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "effect"},
+            },
+            {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": "effect"},
+            },
+            {
+                "sessionUpdate": "user_message_chunk",
+                "content": {"type": "text", "text": "effect"},
+            },
+            {"sessionUpdate": "tool_call", "toolCallId": "effect"},
+            {"sessionUpdate": "tool_call_update", "toolCallId": "effect"},
+            {"sessionUpdate": "plan", "entries": []},
+        ],
+    )
+    def test_direct_provisional_prompt_or_effect_update_fails_closed(
+        self,
+        update: dict[str, Any],
+    ) -> None:
+        """A pending create does not authorize prompt-scoped evidence."""
+
+        client = self._make_client()
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._transport = MagicMock()
+        client._transport.pending_request_count.return_value = 1
+
+        client._handle_notification(
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "provisional-session",
+                    "update": update,
+                },
+            }
+        )
+
+        assert client._provisional_session_ids == set()
+        client._transport.fail_closed.assert_called_once_with(
+            "direct ACP session update protocol failure"
+        )
+
+    @pytest.mark.parametrize(
+        ("update", "expected_error"),
+        [
+            (
+                {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [{"name": "valid"}, 42],
+                },
+                "direct ACP session update protocol failure",
+            ),
+            (
+                {
+                    "sessionUpdate": "config_option_update",
+                    "configOptions": [{"currentValue": "missing-id"}],
+                },
+                "direct ACP config update malformed",
+            ),
+            (
+                {"sessionUpdate": "current_mode_update", "currentModeId": ""},
+                "direct ACP session update protocol failure",
+            ),
+            (
+                {"sessionUpdate": "usage_update", "opaque": {"not-json"}},
+                "direct ACP session update protocol failure",
+            ),
+            (
+                {"sessionUpdate": "session_info_update", "opaque": object()},
+                "direct ACP session update protocol failure",
+            ),
+        ],
+    )
+    def test_direct_provisional_malformed_session_state_fails_closed(
+        self,
+        update: dict[str, Any],
+        expected_error: str,
+    ) -> None:
+        """Creation correlation never turns malformed state into tolerated noise."""
+
+        client = self._make_client()
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._transport = MagicMock()
+        client._transport.pending_request_count.return_value = 1
+
+        client._handle_notification(
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "provisional-session",
+                    "update": update,
+                },
+            }
+        )
+
+        client._transport.fail_closed.assert_called_once_with(expected_error)
+
+    @pytest.mark.parametrize(
+        "update",
+        [
+            {
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [
+                    {"name": "command", "description": "x" * 256_000}
+                ],
+            },
+            {
+                "sessionUpdate": "config_option_update",
+                "configOptions": [
+                    {
+                        "id": "mode",
+                        "currentValue": "mode",
+                        "description": "x" * 256_000,
+                    }
+                ],
+            },
+            {
+                "sessionUpdate": "current_mode_update",
+                "currentModeId": "mode",
+                "opaque": "x" * 256_000,
+            },
+            {
+                "sessionUpdate": "usage_update",
+                "opaque": "x" * 256_000,
+            },
+            {
+                "sessionUpdate": "session_info_update",
+                "opaque": "x" * 256_000,
+            },
+        ],
+    )
+    def test_direct_provisional_oversized_session_state_fails_closed(
+        self,
+        update: dict[str, Any],
+    ) -> None:
+        """Every accepted creation-state kind shares one per-update byte bound."""
+
+        client = self._make_client()
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._transport = MagicMock()
+        client._transport.pending_request_count.return_value = 1
+
+        client._handle_notification(
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "provisional-session",
+                    "update": update,
+                },
+            }
+        )
+
+        client._transport.fail_closed.assert_called_once_with(
+            "direct ACP session update protocol failure"
+        )
 
     def test_direct_provisional_session_ids_are_bounded_to_pending_creates(
         self,
@@ -778,7 +1241,6 @@ class TestHandleNotification:
             )
 
         assert client._provisional_session_ids == {"provisional-one"}
-        assert set(client._available_commands_by_session) == {"provisional-one"}
         client._transport.fail_closed.assert_called_once_with(
             "direct ACP session update protocol failure"
         )
@@ -791,7 +1253,6 @@ class TestHandleNotification:
         client = self._make_client()
         client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._provisional_session_ids = {"provisional"}
-        client._available_commands_by_session = {"provisional": []}
         client._transport = MagicMock()
         client._transport.pending_request_count.return_value = 0
 
@@ -799,8 +1260,124 @@ class TestHandleNotification:
             client._bind_provisional_session("different")
 
         assert client._provisional_session_ids == set()
-        assert client._available_commands_by_session == {}
         client._transport.fail_closed.assert_called_once()
+
+    @pytest.mark.parametrize("first_waiter_resumes", [False, True])
+    def test_direct_concurrent_session_new_responses_preserve_correlation(
+        self,
+        first_waiter_resumes: bool,
+    ) -> None:
+        """Response and waiter scheduling cannot orphan another valid create."""
+
+        client = self._make_client()
+        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client._provisional_session_ids = {"session-a"}
+        client._transport = MagicMock()
+
+        client._transport.pending_request_count.return_value = 2
+        client._observe_session_new_response(
+            {"jsonrpc": "2.0", "id": 1, "result": {"sessionId": "session-b"}}
+        )
+        assert client._provisional_session_ids == {"session-a"}
+        assert client._session_new_response_ids == {"session-b"}
+
+        if first_waiter_resumes:
+            client._transport.pending_request_count.return_value = 1
+            client._bind_provisional_session("session-b")
+            assert client._provisional_session_ids == {"session-a"}
+
+        client._transport.pending_request_count.return_value = 1
+        client._observe_session_new_response(
+            {"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "session-a"}}
+        )
+        client._transport.pending_request_count.return_value = 0
+        client._bind_provisional_session("session-a")
+        if not first_waiter_resumes:
+            client._bind_provisional_session("session-b")
+
+        assert client._provisional_session_ids == set()
+        assert client._session_new_response_ids == set()
+        client._transport.fail_closed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_direct_session_new_response_bridges_registration_gap(self) -> None:
+        """Buffered state after the response is correlated before task resumption."""
+
+        class StubStdin:
+            def __init__(self) -> None:
+                self.written: list[bytes] = []
+
+            def write(self, data: bytes) -> None:
+                self.written.append(data)
+
+            async def drain(self) -> None:
+                return None
+
+        class StubProcess:
+            def __init__(self) -> None:
+                self.stdin = StubStdin()
+
+        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        transport = AcpTransport()
+        process = StubProcess()
+        transport._process = process  # type: ignore[assignment]
+        transport.set_strict_response_correlation(True)
+        transport.on_notification(client._handle_notification)
+        transport.on_response_observed(client._observe_response)
+        client._transport = transport
+
+        task = asyncio.create_task(client.create_session("/workspace"))
+        await asyncio.sleep(0)
+        request = json.loads(process.stdin.written[0])
+        session_id = "response-session"
+
+        # Dispatch synchronously to keep the create coroutine suspended between
+        # transport response observation and SessionState registration.
+        transport._dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {
+                    "sessionId": session_id,
+                    "models": {
+                        "availableModels": [
+                            {"modelId": "auto", "name": "Auto"},
+                            {"modelId": "target", "name": "Target"},
+                        ],
+                        "currentModelId": "auto",
+                    },
+                },
+            }
+        )
+        assert session_id not in client._sessions
+        assert not task.done()
+
+        transport._dispatch(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": [
+                            {
+                                "id": "model",
+                                "category": "model",
+                                "currentValue": "notification-is-not-authoritative",
+                            }
+                        ],
+                    },
+                },
+            }
+        )
+        assert transport.is_open is True
+
+        assert await task == session_id
+        assert client._sessions[session_id].model_id == "auto"
+        assert client._provisional_session_ids == set()
+        assert client._session_new_response_ids == set()
+        transport._process = None
 
     @pytest.mark.parametrize(
         ("byte_limit", "count_limit", "updates"),
@@ -1949,8 +2526,8 @@ class TestDirectAcpContract:
         client._direct_prompt_phases = {"session": "active"}
         client._direct_update_budgets = {"session": {}}
         client._expected_model_updates = {}
-        client._available_commands_by_session = {}
-        client._provisional_session_ids = set()
+        client._provisional_session_ids = {"provisional-session"}
+        client._session_new_response_ids = {"response-session"}
         client._sessions = {"session": SessionState("session")}
         client._transport = AsyncMock()
 
@@ -1958,6 +2535,8 @@ class TestDirectAcpContract:
 
         getattr(client._transport, method).assert_awaited_once()
         assert queue.get_nowait() is None
+        assert client._provisional_session_ids == set()
+        assert client._session_new_response_ids == set()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("result", [{}, {"stopReason": ""}, {"stopReason": "novel"}])
