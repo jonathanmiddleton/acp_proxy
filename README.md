@@ -64,10 +64,11 @@ acp-proxy \
 ```
 
 Before direct HTTP readiness, the proxy uses one non-prompted catalog session
-to discover the available models and require an advertised, usable default.
-Each Meadow session then keeps that per-session default when it matches the
-requested model, or selects an advertised non-default through
-`session/set_model` before the session becomes ready. Direct readiness is
+to discover the available models, require an advertised usable default, and
+freeze one model-binding strategy for the child generation. The verified ACP
+`session/set_config_option` path is preferred; only method-not-found selects
+the Copilot `session/set_model` compatibility path. Every Meadow session then
+applies that frozen strategy before becoming ready. Direct readiness is
 negotiated at authenticated `GET /meadow/v1/capabilities`.
 The response identifies the protocol major, continuity generation, canonical
 workspace, exact model catalog, execution authority, resource limits, evidence
@@ -149,8 +150,9 @@ They **fail** (not skip) if the binary is not found — see
 python -m pytest tests/test_transport.py tests/test_client.py tests/test_server.py tests/test_direct_*.py tests/test_discovery.py tests/test_binary_admission.py tests/test_main.py -v
 ```
 The live direct integration probe requires the advertised
-`gpt-5.3-codex` model and exercises non-default session binding plus two turns
-on one continuity generation.
+`gpt-5.3-codex` model, proves that the target setter accepts an advertised ID
+and rejects an unadvertised control, and exercises two turns on one continuity
+generation.
 
 ## Configuration
 

@@ -14,7 +14,7 @@ from httpx import ASGITransport, AsyncClient
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from acp_proxy.client import CallbackPolicy, ModelInfo
+from acp_proxy.client import CallbackPolicy, ModelAcknowledgementError, ModelInfo
 from acp_proxy.direct_protocol import (
     CancelRequest,
     CreateSessionRequest,
@@ -24,7 +24,7 @@ from acp_proxy.direct_protocol import (
 )
 from acp_proxy.direct_server import RequestBodyLimitMiddleware, create_direct_app
 from acp_proxy.direct_service import DirectGenerationMismatch, DirectService
-from acp_proxy.direct_state import DirectLimitExceeded
+from acp_proxy.direct_state import DirectConflict, DirectLimitExceeded
 
 TOKEN = "t" * 48
 
@@ -1100,6 +1100,47 @@ async def test_create_deadline_and_upstream_errors_are_bounded_and_sanitized(
                 )
             )
         )
+
+
+@pytest.mark.asyncio
+async def test_known_model_binding_rejection_fails_without_quarantining_generation(
+    tmp_path: Path,
+) -> None:
+    """A settled selector rejection is failed, not uncertain or reusable."""
+
+    fake = FakeDirectAcpClient()
+    fake.create_error = ModelAcknowledgementError("private selector detail")
+    service = DirectService(
+        fake,
+        cwd=str(tmp_path),
+        launch_secret=TOKEN,
+        execution_authority="trusted-host",
+    )
+    request = CreateSessionRequest.model_validate(
+        _create_body(service, operation="rejected-create", session="rejected")
+    )
+
+    record, _ = await service.admit_create(request)
+    failed = await service.wait_for_operation(record)
+
+    assert failed.state == "failed"
+    assert failed.error == {
+        "code": "session_configuration_failed",
+        "message": "ACP did not settle the requested session configuration",
+    }
+    assert service._generation.sessions["rejected"].state == "non_reusable"
+    prompt = PromptRequest.model_validate(
+        _prompt_body(
+            service,
+            operation="rejected-prompt",
+            invocation="rejected-invocation",
+        )
+    )
+    with pytest.raises(DirectConflict, match="not reusable"):
+        await service.admit_prompt("rejected", prompt)
+    assert fake.abort_count == 0
+    assert fake.prompts == []
+    assert service.capabilities.continuity_generation_id == service.continuity_generation_id
 
 
 @pytest.mark.asyncio

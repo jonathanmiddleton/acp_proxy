@@ -17,7 +17,11 @@ import httpx
 import pytest
 
 from acp_proxy.__main__ import _direct_child_env
-from acp_proxy.client import AcpClient, CallbackPolicy
+from acp_proxy.client import (
+    AcpClient,
+    CallbackPolicy,
+    DirectModelBindingStrategy,
+)
 from acp_proxy.copilot_auth import inject_prior_copilot_oauth
 from acp_proxy.direct_protocol import CreateSessionRequest, PromptRequest
 from acp_proxy.direct_service import DirectService
@@ -25,6 +29,7 @@ from acp_proxy.discovery import BinaryCompatibilityError, find_binary
 from acp_proxy.transport import AcpError
 
 REQUIRED_LIVE_MODEL = "gpt-5.3-codex"
+UNADVERTISED_LIVE_MODEL = "acp-proxy-negative-control-model"
 
 
 def _live_child_env() -> dict[str, str]:
@@ -224,27 +229,33 @@ async def test_full_proxy_http_roundtrip(binary: str):
 @pytest.mark.asyncio
 async def test_required_model_prompt(binary: str):
     """Bind gpt-5.3-codex and complete one prompt on the real server."""
-    client = AcpClient(binary)
+    client = AcpClient(binary, callback_policy=CallbackPolicy.DIRECT_DENY)
     try:
         await client.start(env=_live_child_env())
-        await client.create_session(os.getcwd())
+        catalog_session_id = await client.create_session(os.getcwd())
         catalog_default = client.default_model
         assert isinstance(catalog_default, str) and catalog_default
         assert catalog_default != REQUIRED_LIVE_MODEL
         available = {model.model_id for model in client.models}
         assert REQUIRED_LIVE_MODEL in available
+        assert UNADVERTISED_LIVE_MODEL not in available
+        strategy = await client.negotiate_direct_model_binding(
+            catalog_session_id,
+            catalog_default,
+        )
+        assert strategy is DirectModelBindingStrategy.COPILOT_SET_MODEL
         descriptor = await client.create_session_exact(
             os.getcwd(), REQUIRED_LIVE_MODEL
         )
         assert descriptor.model_id == REQUIRED_LIVE_MODEL
 
         text = ""
-        async for update in client.prompt(
+        async for update in client.prompt_blocks(
             descriptor.session_id,
             [
                 {
-                    "role": "user",
-                    "content": "Reply with exactly: EXACT_MODEL_OK",
+                    "type": "text",
+                    "text": "Reply with exactly: EXACT_MODEL_OK",
                 }
             ],
         ):
@@ -254,6 +265,20 @@ async def test_required_model_prompt(binary: str):
                     text += content.get("text", "")
 
         assert "EXACT_MODEL_OK" in text
+
+        negative_session_id = await client.create_session(os.getcwd())
+        negative_catalog = client._sessions[negative_session_id].available_model_ids
+        assert negative_catalog is not None
+        assert UNADVERTISED_LIVE_MODEL not in negative_catalog
+        with pytest.raises(AcpError) as exc_info:
+            await client._transport.send_request(
+                "session/set_model",
+                {
+                    "sessionId": negative_session_id,
+                    "modelId": UNADVERTISED_LIVE_MODEL,
+                },
+            )
+        assert exc_info.value.error_obj.get("code") == -32602
     finally:
         await client.stop()
 
@@ -266,11 +291,16 @@ async def test_meadow_direct_model_binding_and_continuity_probe(binary: str) -> 
     client = AcpClient(binary, callback_policy=CallbackPolicy.DIRECT_DENY)
     try:
         await client.start(env=_live_child_env())
-        await client.create_session(os.getcwd())  # one non-prompted catalog probe
+        catalog_session_id = await client.create_session(os.getcwd())
         catalog_default = client.default_model
         assert isinstance(catalog_default, str) and catalog_default
         assert catalog_default != requested_model
         assert requested_model in {model.model_id for model in client.models}
+        strategy = await client.negotiate_direct_model_binding(
+            catalog_session_id,
+            catalog_default,
+        )
+        assert strategy is DirectModelBindingStrategy.COPILOT_SET_MODEL
         service = DirectService(
             client,
             cwd=os.getcwd(),

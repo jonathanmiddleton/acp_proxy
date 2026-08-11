@@ -17,8 +17,9 @@ import pytest
 from acp_proxy import __main__ as cli
 from acp_proxy import discovery
 from acp_proxy.application_policy import MIN_COPILOT_LANGUAGE_SERVER_VERSION
+from acp_proxy.client import ModelAcknowledgementError
 from acp_proxy.copilot_auth import CopilotOAuthCredentialError
-from acp_proxy.direct_protocol import CreateSessionRequest, PromptRequest
+from acp_proxy.direct_protocol import CreateSessionRequest, DirectLimits, PromptRequest
 from acp_proxy.discovery import BinaryAdmission, BinaryCompatibilityError
 
 
@@ -429,10 +430,10 @@ async def test_direct_readiness_requires_usable_catalog_default(
 
 
 @pytest.mark.asyncio
-async def test_direct_readiness_follows_catalog_without_model_setter(
+async def test_direct_readiness_follows_strategy_negotiation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The startup catalog is observed without mutating its default model."""
+    """The startup binding strategy settles before HTTP can become ready."""
 
     order: list[str] = []
     metadata = tmp_path / "ready.json"
@@ -455,6 +456,13 @@ async def test_direct_readiness_follows_catalog_without_model_setter(
         async def create_session(self, cwd: str) -> str:
             order.append("catalog-session")
             return "catalog-session"
+
+        async def negotiate_direct_model_binding(
+            self, session_id: str, model_id: str
+        ) -> None:
+            assert session_id == "catalog-session"
+            assert model_id == "catalog-model"
+            order.append("strategy-negotiated")
 
         async def stop(self) -> None:
             order.append("child-stop")
@@ -504,9 +512,126 @@ async def test_direct_readiness_follows_catalog_without_model_setter(
     )
 
     assert order.index("catalog-session") < order.index("http-constructed")
-    assert "exact-ack" not in order
+    assert order.index("catalog-session") < order.index("strategy-negotiated")
+    assert order.index("strategy-negotiated") < order.index("http-constructed")
     assert order.index("http-startup") < order.index("ready")
     assert "session/prompt" not in order
+
+
+@pytest.mark.asyncio
+async def test_direct_strategy_negotiation_failure_prevents_readiness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No usable binding strategy means no HTTP server or readiness metadata."""
+
+    observed: dict[str, Any] = {"server_constructed": False}
+
+    class FailingStrategyClient:
+        def __init__(self, _binary: str, **_kwargs: Any) -> None:
+            self.models = [SimpleNamespace(model_id="catalog-model")]
+            self.default_model = "catalog-model"
+            self.stopped = False
+            observed["client"] = self
+
+        def on_transport_closed(self, _handler: Any) -> None:
+            return None
+
+        async def start(self, env: dict[str, str] | None = None) -> None:
+            return None
+
+        async def create_session(self, cwd: str) -> str:
+            return "catalog-session"
+
+        async def negotiate_direct_model_binding(
+            self, session_id: str, model_id: str
+        ) -> None:
+            raise ModelAcknowledgementError("private child selector detail")
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+    class ForbiddenServer:
+        def __init__(self, _config: Any) -> None:
+            observed["server_constructed"] = True
+
+    metadata = tmp_path / "ready.json"
+    monkeypatch.setattr(cli, "AcpClient", FailingStrategyClient)
+    monkeypatch.setattr(cli.uvicorn, "Server", ForbiddenServer)
+
+    with pytest.raises(BinaryCompatibilityError) as exc_info:
+        await cli.run(
+            "/fake/copilot-language-server",
+            8765,
+            str(tmp_path),
+            consumer_mode="meadow-direct",
+            launch_secret="s" * 48,
+            execution_authority="trusted-host",
+            metadata_file=str(metadata),
+        )
+
+    message = str(exc_info.value)
+    assert "supported session model binding strategy" in message
+    assert "private child selector detail" not in message
+    assert observed["server_constructed"] is False
+    assert observed["client"].stopped is True
+    assert not metadata.exists()
+
+
+@pytest.mark.asyncio
+async def test_direct_strategy_negotiation_timeout_prevents_readiness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-responsive selector is bounded before HTTP readiness."""
+
+    observed: dict[str, Any] = {"server_constructed": False}
+
+    class HangingStrategyClient:
+        def __init__(self, _binary: str, **_kwargs: Any) -> None:
+            self.models = [SimpleNamespace(model_id="catalog-model")]
+            self.default_model = "catalog-model"
+            self.stopped = False
+            observed["client"] = self
+
+        def on_transport_closed(self, _handler: Any) -> None:
+            return None
+
+        async def start(self, env: dict[str, str] | None = None) -> None:
+            return None
+
+        async def create_session(self, cwd: str) -> str:
+            return "catalog-session"
+
+        async def negotiate_direct_model_binding(
+            self, session_id: str, model_id: str
+        ) -> None:
+            await asyncio.Event().wait()
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+    class ForbiddenServer:
+        def __init__(self, _config: Any) -> None:
+            observed["server_constructed"] = True
+
+    metadata = tmp_path / "ready.json"
+    monkeypatch.setattr(cli, "AcpClient", HangingStrategyClient)
+    monkeypatch.setattr(cli.uvicorn, "Server", ForbiddenServer)
+
+    with pytest.raises(BinaryCompatibilityError, match="bounded startup"):
+        await cli.run(
+            "/fake/copilot-language-server",
+            8765,
+            str(tmp_path),
+            consumer_mode="meadow-direct",
+            launch_secret="s" * 48,
+            execution_authority="trusted-host",
+            metadata_file=str(metadata),
+            direct_limits=DirectLimits(session_creation_timeout_s=0.01),
+        )
+
+    assert observed["server_constructed"] is False
+    assert observed["client"].stopped is True
+    assert not metadata.exists()
 
 
 def test_consumer_mode_is_mandatory() -> None:
@@ -713,6 +838,11 @@ async def test_child_loss_during_startup_invalidates_direct_service_and_cleans_u
         async def create_session(self, cwd: str) -> str:
             return "catalog-session"
 
+        async def negotiate_direct_model_binding(
+            self, session_id: str, model_id: str
+        ) -> None:
+            return None
+
         async def stop(self) -> None:
             self.stopped = True
 
@@ -796,6 +926,11 @@ async def test_graceful_owner_shutdown_quarantines_active_direct_work_first(
 
         async def create_session(self, cwd: str) -> str:
             return "catalog"
+
+        async def negotiate_direct_model_binding(
+            self, session_id: str, model_id: str
+        ) -> None:
+            return None
 
         async def create_session_exact(self, cwd: str, model_id: str) -> Any:
             return SimpleNamespace(session_id="backend", model_id=model_id)

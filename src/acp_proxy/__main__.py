@@ -36,7 +36,7 @@ import tempfile
 import uvicorn
 
 from .application_policy import MIN_COPILOT_LANGUAGE_SERVER_VERSION
-from .client import AcpClient, CallbackPolicy
+from .client import AcpClient, CallbackPolicy, ModelAcknowledgementError
 from .config import (
     build_subprocess_env,
     compose_system_prompt,
@@ -292,6 +292,11 @@ async def run(
         system_prompt=system_prompt,
         direct_limits=direct_limits,
     )
+    effective_direct_limits = (
+        direct_limits or DirectLimits()
+        if consumer_mode == "meadow-direct"
+        else None
+    )
     admission = await asyncio.to_thread(admit_compatible_binary, binary)
     binary = admission.path
     if consumer_mode == "opencode-legacy":
@@ -330,25 +335,44 @@ async def run(
         # ACP initialize has no model catalog. Create exactly one non-prompted,
         # non-Meadow catalog-probe session at startup. HTTP capability requests
         # are read-only and never create additional ACP sessions.
-        catalog_session_id = await client.create_session(cwd)
         if consumer_mode == "meadow-direct":
-            default_model = client.default_model
-            advertised_models = {model.model_id for model in client.models}
-            if (
-                not isinstance(default_model, str)
-                or not default_model
-                or default_model not in advertised_models
-            ):
+            assert effective_direct_limits is not None
+            try:
+                async with asyncio.timeout(
+                    effective_direct_limits.session_creation_timeout_s
+                ):
+                    catalog_session_id = await client.create_session(cwd)
+                    default_model = client.default_model
+                    advertised_models = {model.model_id for model in client.models}
+                    if (
+                        not isinstance(default_model, str)
+                        or not default_model
+                        or default_model not in advertised_models
+                    ):
+                        raise _direct_binary_capability_error(
+                            admission,
+                            "startup model catalog with an advertised usable default model",
+                        )
+                    await client.negotiate_direct_model_binding(
+                        catalog_session_id,
+                        default_model,
+                    )
+            except TimeoutError:
                 raise _direct_binary_capability_error(
                     admission,
-                    "startup model catalog with an advertised usable default model",
-                )
+                    "bounded startup model catalog and binding negotiation",
+                ) from None
+            except ModelAcknowledgementError:
+                raise _direct_binary_capability_error(
+                    admission,
+                    "a supported session model binding strategy",
+                ) from None
             logger.info(
-                "Created non-prompted catalog-probe ACP session with a usable "
-                "default model; "
+                "Created and model-bound non-prompted catalog-probe ACP session; "
                 "backend close is unsupported"
             )
         else:
+            catalog_session_id = await client.create_session(cwd)
             logger.info(
                 "Created non-prompted catalog-probe ACP session %s; "
                 "backend close is %s",
@@ -367,7 +391,7 @@ async def run(
                 cwd=cwd,
                 launch_secret=launch_secret or "",
                 execution_authority=execution_authority or "",
-                limits=direct_limits,
+                limits=effective_direct_limits,
             )
             app = create_direct_app(direct_service)
         else:

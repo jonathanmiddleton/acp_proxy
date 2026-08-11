@@ -114,6 +114,13 @@ class CallbackPolicy(StrEnum):
     DIRECT_DENY = "direct-deny"
 
 
+class DirectModelBindingStrategy(StrEnum):
+    """Model-binding method negotiated once for a direct child generation."""
+
+    STANDARD_CONFIG = "standard-config"
+    COPILOT_SET_MODEL = "copilot-set-model"
+
+
 @dataclass
 class SessionState:
     """Tracks the state of an ACP session."""
@@ -145,6 +152,11 @@ class AcpClient:
         self._transport = AcpTransport()
         self._models: list[ModelInfo] = []
         self._default_model: str | None = None
+        self._direct_model_binding_strategy: (
+            DirectModelBindingStrategy | None
+        ) = None
+        self._direct_model_binding_negotiation: object | None = None
+        self._direct_model_binding_generation = 0
         self._sessions: dict[str, SessionState] = {}
         self._update_queues: dict[str, asyncio.Queue[dict[str, Any] | None]] = {}
         self._direct_prompt_phases: dict[str, str] = {}
@@ -164,6 +176,12 @@ class AcpClient:
     @property
     def default_model(self) -> str | None:
         return self._default_model
+
+    @property
+    def direct_model_binding_strategy(self) -> DirectModelBindingStrategy | None:
+        """Return the strategy frozen for the current direct child generation."""
+
+        return self._direct_model_binding_strategy
 
     @property
     def agent_info(self) -> dict[str, str | None]:
@@ -249,6 +267,11 @@ class AcpClient:
         self._available_commands_by_session.clear()
         self._provisional_session_ids.clear()
         self._sessions.clear()
+        self._direct_model_binding_strategy = None
+        self._direct_model_binding_negotiation = None
+        self._direct_model_binding_generation = (
+            getattr(self, "_direct_model_binding_generation", 0) + 1
+        )
 
     async def create_session(self, cwd: str, model_id: str | None = None) -> str:
         """Create a new ACP session.
@@ -328,11 +351,12 @@ class AcpClient:
         )
         self._sessions[session_id] = session
 
-        # ``session/new`` reports the model already active on this session.
-        # Only non-default requests require a separate selection operation.
-        if model_id and model_id != session.model_id:
+        # Direct callers bind through the strategy negotiated before HTTP
+        # readiness. Legacy callers retain their historical best-effort path.
+        if model_id and (direct_mode or model_id != session.model_id):
             if direct_mode:
-                await self._settle_direct_model(session_id, model_id)
+                self._require_direct_session_catalog(session_id, model_id)
+                await self._bind_direct_model(session_id, model_id)
             else:
                 await self._try_set_model(session_id, model_id)
 
@@ -352,23 +376,146 @@ class AcpClient:
     ) -> AcpSessionDescriptor:
         """Create a session and settle its requested model binding.
 
-        ``session/new`` is authoritative when its per-session current model is
-        already the requested model. Otherwise the Copilot-specific
-        ``session/set_model`` operation must settle successfully before the
-        session is returned. The supported language server does not expose a
-        separate post-selection value, so non-default binding evidence is the
-        successful settlement of that exact request.
+        Direct mode applies the startup-negotiated strategy to every logical
+        session before it is returned. Standard configuration requires an
+        explicitly reported matching current value. The Copilot-specific
+        strategy requires successful settlement of the exact
+        ``session/set_model`` request. Non-direct callers retain the former
+        per-session compatibility selection behavior.
         """
 
+        direct_mode = self._callback_policy is CallbackPolicy.DIRECT_DENY
+        if direct_mode and self._direct_model_binding_strategy is None:
+            raise ModelAcknowledgementError(
+                "direct model binding strategy was not negotiated before session creation"
+            )
         available = {model.model_id for model in self._models}
         if model_id not in available:
             raise ValueError(
                 f"Model {model_id!r} is not advertised. Available: {sorted(available)}"
             )
         session_id = await self.create_session(cwd)
-        session = self._sessions[session_id]
+        session = self._require_direct_session_catalog(session_id, model_id)
+        if direct_mode:
+            await self._bind_direct_model(session_id, model_id)
+        elif session.model_id != model_id:
+            await self._settle_compatibility_model(session_id, model_id)
+        bound_model = session.model_id
+        if bound_model != model_id:
+            raise ModelAcknowledgementError(
+                "copilot-language-server did not settle the requested session model"
+            )
+        return AcpSessionDescriptor(session_id=session_id, model_id=bound_model)
+
+    async def negotiate_direct_model_binding(
+        self, session_id: str, model_id: str
+    ) -> DirectModelBindingStrategy:
+        """Select and freeze one direct model-binding strategy before readiness."""
+
+        if self._callback_policy is not CallbackPolicy.DIRECT_DENY:
+            raise RuntimeError("direct model binding requires direct callback policy")
+        if self._direct_model_binding_strategy is not None:
+            raise RuntimeError("direct model binding strategy is already negotiated")
+        if self._direct_model_binding_negotiation is not None:
+            raise RuntimeError("direct model binding strategy negotiation is in progress")
+        self._require_direct_session_catalog(session_id, model_id)
+
+        generation = self._direct_model_binding_generation
+        negotiation = object()
+        self._direct_model_binding_negotiation = negotiation
+
+        try:
+            strategy: DirectModelBindingStrategy | None = None
+            try:
+                await self._set_config_option_exact(session_id, model_id)
+            except AcpError as exc:
+                error_code = exc.error_obj.get("code")
+                if type(error_code) is not int or error_code != -32601:
+                    logger.error(
+                        "Standard direct model binding negotiation was rejected"
+                    )
+                    raise ModelAcknowledgementError(
+                        "copilot-language-server rejected standard model binding negotiation"
+                    ) from None
+            else:
+                strategy = DirectModelBindingStrategy.STANDARD_CONFIG
+
+            if strategy is None:
+                try:
+                    await self._set_copilot_model_settled(session_id, model_id)
+                except AcpError:
+                    logger.error("Copilot direct model binding negotiation was rejected")
+                    raise ModelAcknowledgementError(
+                        "copilot-language-server exposes no usable session model selector"
+                    ) from None
+                strategy = DirectModelBindingStrategy.COPILOT_SET_MODEL
+
+            if (
+                self._direct_model_binding_generation != generation
+                or self._direct_model_binding_negotiation is not negotiation
+            ):
+                raise ModelAcknowledgementError(
+                    "direct model binding negotiation was interrupted by child teardown"
+                ) from None
+            self._direct_model_binding_strategy = strategy
+            logger.info("Negotiated direct model binding strategy: %s", strategy)
+            return strategy
+        finally:
+            if self._direct_model_binding_negotiation is negotiation:
+                self._direct_model_binding_negotiation = None
+
+    async def acknowledge_session_model(
+        self, session_id: str, model_id: str
+    ) -> str:
+        """Require the standard method to report the requested model as current.
+
+        This compatibility API intentionally retains its former exact
+        ``session/set_config_option`` semantics. Direct strategy negotiation is
+        a separate operation because ``session/set_model`` does not report an
+        independently observed post-state.
+        """
+
+        if session_id not in self._sessions:
+            raise ModelAcknowledgementError(
+                "cannot prove model configuration for an unknown ACP session"
+            )
+        try:
+            observed = await self._set_config_option_exact(session_id, model_id)
+        except AcpError as exc:
+            if exc.error_obj.get("code") == -32601:
+                logger.error(
+                    "ACP agent does not expose the required exact model "
+                    "configuration method"
+                )
+                message = (
+                    "copilot-language-server does not expose required exact "
+                    "model configuration"
+                )
+            else:
+                logger.error(
+                    "Could not prove the required exact model configuration capability"
+                )
+                message = (
+                    "could not prove copilot-language-server required exact "
+                    "model configuration"
+                )
+            raise ModelAcknowledgementError(message) from None
+
+        if self._callback_policy is CallbackPolicy.DIRECT_DENY:
+            logger.info("ACP acknowledged the requested direct model")
+        else:
+            logger.info(
+                "ACP acknowledged model %s for session %s", observed, session_id
+            )
+        return observed
+
+    def _require_direct_session_catalog(
+        self, session_id: str, model_id: str
+    ) -> SessionState:
+        session = self._sessions.get(session_id)
         if (
-            not isinstance(session.model_id, str)
+            session is None
+            or not isinstance(session.model_id, str)
             or not session.model_id
             or session.available_model_ids is None
             or session.model_id not in session.available_model_ids
@@ -380,14 +527,7 @@ class AcpClient:
             raise ModelAcknowledgementError(
                 "session/new did not advertise the requested session model"
             )
-        if session.model_id != model_id:
-            await self._settle_direct_model(session_id, model_id)
-        bound_model = session.model_id
-        if bound_model != model_id:
-            raise ModelAcknowledgementError(
-                "copilot-language-server did not settle the requested session model"
-            )
-        return AcpSessionDescriptor(session_id=session_id, model_id=bound_model)
+        return session
 
     @staticmethod
     def _model_from_config_options(result: dict[str, Any]) -> str:
@@ -627,7 +767,12 @@ class AcpClient:
 
     async def set_model(self, session_id: str, model_id: str) -> None:
         """Change the model for an existing session."""
-        await self._try_set_model(session_id, model_id)
+
+        if self._callback_policy is CallbackPolicy.DIRECT_DENY:
+            self._require_direct_session_catalog(session_id, model_id)
+            await self._bind_direct_model(session_id, model_id)
+        else:
+            await self._try_set_model(session_id, model_id)
 
     async def _initialize(self) -> None:
         """Complete the ACP initialization handshake."""
@@ -747,76 +892,116 @@ class AcpClient:
             f"Tried: {[method for method, _ in methods]}. Requested model: {model_id}"
         )
 
-    async def _settle_direct_model(self, session_id: str, model_id: str) -> None:
-        """Set a non-default session model and require request settlement.
+    async def _bind_direct_model(self, session_id: str, model_id: str) -> None:
+        """Bind one direct session with the frozen generation strategy."""
 
-        Tries session/set_model (Copilot-specific) first, then falls back
-        to session/set_config_option (ACP spec standard). The standard response
-        is verified when used; the Copilot-specific method returns no selected
-        model value, so its successful JSON-RPC settlement is the available
-        evidence. Silent degradation to the default model is never allowed.
-        """
-        methods: list[tuple[str, dict[str, Any], bool]] = [
-            (
-                "session/set_model",
-                {"sessionId": session_id, "modelId": model_id},
-                False,
-            ),
-            (
-                "session/set_config_option",
-                {"sessionId": session_id, "configId": "model", "value": model_id},
-                True,
-            ),
-        ]
+        strategy = self._direct_model_binding_strategy
+        if strategy is None:
+            raise ModelAcknowledgementError(
+                "direct model binding strategy was not negotiated before session creation"
+            )
+        try:
+            if strategy is DirectModelBindingStrategy.STANDARD_CONFIG:
+                await self._set_config_option_exact(session_id, model_id)
+            elif strategy is DirectModelBindingStrategy.COPILOT_SET_MODEL:
+                await self._set_copilot_model_settled(session_id, model_id)
+            else:  # pragma: no cover - enum state is closed by construction
+                raise AssertionError("unknown direct model binding strategy")
+        except AcpError:
+            logger.error("Frozen direct model binding strategy was rejected")
+            raise ModelAcknowledgementError(
+                "copilot-language-server rejected the requested session model"
+            ) from None
+
+        logger.info("Bound requested direct model via %s", strategy)
+
+    async def _settle_compatibility_model(
+        self, session_id: str, model_id: str
+    ) -> None:
+        """Preserve the pre-negotiation exact-session API outside direct mode."""
+
+        try:
+            await self._set_copilot_model_settled(session_id, model_id)
+        except AcpError as exc:
+            if exc.error_obj.get("code") != -32601:
+                raise ModelAcknowledgementError(
+                    "copilot-language-server rejected the requested session model"
+                ) from None
+        else:
+            return
+
+        prior_model = (
+            self._sessions[session_id].model_id
+            if session_id in self._sessions
+            else None
+        )
+        try:
+            await self._set_config_option_exact(session_id, model_id)
+        except ModelAcknowledgementError:
+            if session_id in self._sessions:
+                self._sessions[session_id].model_id = prior_model
+            raise
+        except AcpError as exc:
+            if exc.error_obj.get("code") == -32601:
+                raise ModelAcknowledgementError(
+                    "copilot-language-server exposes no supported session model selector"
+                ) from None
+            raise ModelAcknowledgementError(
+                "copilot-language-server rejected the requested session model"
+            ) from None
+
+    async def _set_config_option_exact(
+        self, session_id: str, model_id: str
+    ) -> str:
+        """Apply standard model configuration and verify its reported post-state."""
+
         expected_model_updates = getattr(self, "_expected_model_updates", None)
         if expected_model_updates is None:
             expected_model_updates = {}
             self._expected_model_updates = expected_model_updates
         expected_model_updates[session_id] = model_id
         try:
-            for method, params, verifies_current_value in methods:
-                try:
-                    result = await self._transport.send_request(method, params)
-                except AcpError as exc:
-                    if exc.error_obj.get("code") == -32601:
-                        logger.debug("%s not supported, trying next method", method)
-                        continue
-                    logger.error("ACP model selection request was rejected")
-                    raise ModelAcknowledgementError(
-                        "copilot-language-server rejected the requested session model"
-                    ) from None
-
-                if verifies_current_value:
-                    observed = self._model_from_config_options(result)
-                    if observed != model_id:
-                        raise ModelAcknowledgementError(
-                            "copilot-language-server returned a different session model"
-                        )
-                if session_id in self._sessions:
-                    self._sessions[session_id].model_id = model_id
-                if (
-                    getattr(
-                        self,
-                        "_callback_policy",
-                        CallbackPolicy.LEGACY_PERMISSIVE,
-                    )
-                    is CallbackPolicy.DIRECT_DENY
-                ):
-                    logger.info("Set requested direct model via %s", method)
-                else:
-                    logger.info(
-                        "Set model for session %s to %s (via %s)",
-                        session_id,
-                        model_id,
-                        method,
-                    )
-                return
+            result = await self._transport.send_request(
+                "session/set_config_option",
+                {
+                    "sessionId": session_id,
+                    "configId": "model",
+                    "value": model_id,
+                },
+            )
         finally:
             expected_model_updates.pop(session_id, None)
 
-        raise ModelAcknowledgementError(
-            "copilot-language-server exposes no supported session model selector"
-        )
+        observed = self._model_from_config_options(result)
+        if observed != model_id:
+            if session_id in self._sessions:
+                self._sessions[session_id].model_id = None
+            raise ModelAcknowledgementError(
+                "copilot-language-server did not acknowledge the requested exact model"
+            )
+        if session_id in self._sessions:
+            self._sessions[session_id].model_id = observed
+        return observed
+
+    async def _set_copilot_model_settled(
+        self, session_id: str, model_id: str
+    ) -> None:
+        """Apply Copilot model selection and require successful RPC settlement."""
+
+        expected_model_updates = getattr(self, "_expected_model_updates", None)
+        if expected_model_updates is None:
+            expected_model_updates = {}
+            self._expected_model_updates = expected_model_updates
+        expected_model_updates[session_id] = model_id
+        try:
+            await self._transport.send_request(
+                "session/set_model",
+                {"sessionId": session_id, "modelId": model_id},
+            )
+        finally:
+            expected_model_updates.pop(session_id, None)
+        if session_id in self._sessions:
+            self._sessions[session_id].model_id = model_id
 
     @staticmethod
     def _extract_text(content: str | list[dict[str, Any]] | None) -> str:

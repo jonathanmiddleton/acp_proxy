@@ -15,7 +15,9 @@ import pytest
 
 from acp_proxy.client import (
     AcpClient,
+    AcpSessionDescriptor,
     CallbackPolicy,
+    DirectModelBindingStrategy,
     ModelAcknowledgementError,
     ModelInfo,
     SessionState,
@@ -1123,6 +1125,371 @@ class TestTrySetModel:
         assert client._expected_model_updates == {}
 
 
+class TestDirectModelBindingNegotiation:
+    """Direct startup selects one model-binding strategy for the generation."""
+
+    @staticmethod
+    def _client() -> AcpClient:
+        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        client._sessions = {
+            "catalog": SessionState(
+                "catalog",
+                model_id="auto",
+                available_model_ids=frozenset({"auto", "target"}),
+            )
+        }
+        client._transport = AsyncMock()
+        return client
+
+    @staticmethod
+    def _non_direct_client(*selection_results: object) -> AcpClient:
+        client = AcpClient("unused")
+        client._models = [ModelInfo("target", "Target")]
+        client._transport = AsyncMock()
+        client._transport.send_request.side_effect = [
+            {
+                "sessionId": "session",
+                "models": {
+                    "availableModels": [
+                        {"modelId": "auto", "name": "Auto"},
+                        {"modelId": "target", "name": "Target"},
+                    ],
+                    "currentModelId": "auto",
+                },
+            },
+            *selection_results,
+        ]
+        return client
+
+    @pytest.mark.asyncio
+    async def test_standard_strategy_wins_without_probing_copilot(self) -> None:
+        client = self._client()
+        client._transport.send_request.return_value = {
+            "configOptions": [{"id": "model", "currentValue": "auto"}]
+        }
+
+        strategy = await client.negotiate_direct_model_binding("catalog", "auto")
+
+        assert strategy is DirectModelBindingStrategy.STANDARD_CONFIG
+        assert client.direct_model_binding_strategy is strategy
+        client._transport.send_request.assert_awaited_once_with(
+            "session/set_config_option",
+            {"sessionId": "catalog", "configId": "model", "value": "auto"},
+        )
+        assert client._expected_model_updates == {}
+
+    @pytest.mark.asyncio
+    async def test_method_not_found_selects_copilot_strategy(self) -> None:
+        from acp_proxy.transport import AcpError
+
+        client = self._client()
+        client._transport.send_request.side_effect = [
+            AcpError("standard unavailable", {"code": -32601}),
+            {},
+        ]
+
+        strategy = await client.negotiate_direct_model_binding("catalog", "auto")
+
+        assert strategy is DirectModelBindingStrategy.COPILOT_SET_MODEL
+        assert client._transport.send_request.await_args_list == [
+            call(
+                "session/set_config_option",
+                {"sessionId": "catalog", "configId": "model", "value": "auto"},
+            ),
+            call(
+                "session/set_model",
+                {"sessionId": "catalog", "modelId": "auto"},
+            ),
+        ]
+        assert client._expected_model_updates == {}
+
+    @pytest.mark.asyncio
+    async def test_neither_strategy_fails_without_freezing_state(self) -> None:
+        from acp_proxy.transport import AcpError
+
+        client = self._client()
+        child_canary = "CHILD-ERROR-MUST-NOT-CROSS"
+        client._transport.send_request.side_effect = [
+            AcpError(child_canary, {"code": -32601}),
+            AcpError(child_canary, {"code": -32601}),
+        ]
+
+        with pytest.raises(ModelAcknowledgementError) as exc_info:
+            await client.negotiate_direct_model_binding("catalog", "auto")
+
+        assert child_canary not in str(exc_info.value)
+        assert client.direct_model_binding_strategy is None
+        assert client._sessions["catalog"].model_id == "auto"
+        assert client._expected_model_updates == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error_code", [-32000, -32601.0, "-32601", True])
+    async def test_non_method_error_never_downgrades_to_copilot(
+        self, error_code: object
+    ) -> None:
+        from acp_proxy.transport import AcpError
+
+        client = self._client()
+        client._transport.send_request.side_effect = AcpError(
+            "rejected with child detail",
+            {"code": error_code},
+        )
+
+        with pytest.raises(ModelAcknowledgementError, match="rejected standard"):
+            await client.negotiate_direct_model_binding("catalog", "auto")
+
+        client._transport.send_request.assert_awaited_once()
+        assert client.direct_model_binding_strategy is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "result",
+        [
+            {},
+            {"configOptions": []},
+            {"configOptions": [{"id": "model", "currentValue": "target"}]},
+        ],
+    )
+    async def test_broken_standard_success_never_downgrades(
+        self, result: dict[str, Any]
+    ) -> None:
+        client = self._client()
+        client._transport.send_request.return_value = result
+
+        with pytest.raises(ModelAcknowledgementError):
+            await client.negotiate_direct_model_binding("catalog", "auto")
+
+        client._transport.send_request.assert_awaited_once()
+        assert client.direct_model_binding_strategy is None
+        assert client._expected_model_updates == {}
+
+    @pytest.mark.asyncio
+    async def test_strategy_is_immutable_until_client_state_is_cleared(self) -> None:
+        client = self._client()
+        client._transport.send_request.return_value = {
+            "configOptions": [{"id": "model", "currentValue": "auto"}]
+        }
+        await client.negotiate_direct_model_binding("catalog", "auto")
+
+        with pytest.raises(RuntimeError, match="already negotiated"):
+            await client.negotiate_direct_model_binding("catalog", "auto")
+        assert client._transport.send_request.await_count == 1
+
+        client._clear_client_state()
+        assert client.direct_model_binding_strategy is None
+
+    @pytest.mark.asyncio
+    async def test_teardown_cannot_restore_an_inflight_strategy(self) -> None:
+        client = self._client()
+        setter_started = asyncio.Event()
+        release_setter = asyncio.Event()
+
+        async def send_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+            setter_started.set()
+            await release_setter.wait()
+            return {"configOptions": [{"id": "model", "currentValue": "auto"}]}
+
+        client._transport.send_request.side_effect = send_request
+        negotiation = asyncio.create_task(
+            client.negotiate_direct_model_binding("catalog", "auto")
+        )
+        await setter_started.wait()
+
+        with pytest.raises(RuntimeError, match="in progress"):
+            await client.negotiate_direct_model_binding("catalog", "auto")
+
+        await client.stop()
+        release_setter.set()
+        with pytest.raises(ModelAcknowledgementError, match="interrupted"):
+            await negotiation
+
+        assert client.direct_model_binding_strategy is None
+        assert client._direct_model_binding_negotiation is None
+
+    @pytest.mark.asyncio
+    async def test_exact_compatibility_api_remains_standard_only(self) -> None:
+        client = self._client()
+        client._direct_model_binding_strategy = (
+            DirectModelBindingStrategy.COPILOT_SET_MODEL
+        )
+        client._transport.send_request.return_value = {
+            "configOptions": [{"id": "model", "currentValue": "target"}]
+        }
+
+        observed = await client.acknowledge_session_model("catalog", "target")
+
+        assert observed == "target"
+        client._transport.send_request.assert_awaited_once_with(
+            "session/set_config_option",
+            {"sessionId": "catalog", "configId": "model", "value": "target"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_exact_compatibility_api_rejects_unknown_session(self) -> None:
+        client = self._client()
+
+        with pytest.raises(ModelAcknowledgementError, match="unknown ACP session"):
+            await client.acknowledge_session_model("missing", "target")
+
+        client._transport.send_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("code", [-32601, -32000])
+    async def test_exact_compatibility_api_sanitizes_method_errors(
+        self, code: int
+    ) -> None:
+        from acp_proxy.transport import AcpError
+
+        client = self._client()
+        child_canary = "EXACT-API-CHILD-DETAIL"
+        client._transport.send_request.side_effect = AcpError(
+            child_canary,
+            {"code": code, "data": child_canary},
+        )
+
+        with pytest.raises(ModelAcknowledgementError) as exc_info:
+            await client.acknowledge_session_model("catalog", "target")
+
+        assert child_canary not in str(exc_info.value)
+        assert client._sessions["catalog"].model_id == "auto"
+        assert client._expected_model_updates == {}
+
+    @pytest.mark.asyncio
+    async def test_exact_compatibility_api_rejects_wrong_reported_model(self) -> None:
+        client = self._client()
+        requested = "MODEL-TEXT-CANARY-REQUESTED"
+        observed = "MODEL-TEXT-CANARY-OBSERVED"
+        client._sessions["catalog"].available_model_ids = frozenset(
+            {"auto", requested, observed}
+        )
+        client._transport.send_request.return_value = {
+            "configOptions": [{"id": "model", "currentValue": observed}]
+        }
+
+        with pytest.raises(ModelAcknowledgementError) as exc_info:
+            await client.acknowledge_session_model("catalog", requested)
+
+        assert requested not in str(exc_info.value)
+        assert observed not in str(exc_info.value)
+        assert client._sessions["catalog"].model_id is None
+        assert client._expected_model_updates == {}
+
+    @pytest.mark.asyncio
+    async def test_public_direct_set_model_uses_frozen_strategy(self) -> None:
+        client = self._client()
+        client._direct_model_binding_strategy = (
+            DirectModelBindingStrategy.COPILOT_SET_MODEL
+        )
+        client._transport.send_request.return_value = {}
+
+        await client.set_model("catalog", "target")
+
+        client._transport.send_request.assert_awaited_once_with(
+            "session/set_model",
+            {"sessionId": "catalog", "modelId": "target"},
+        )
+        assert client._sessions["catalog"].model_id == "target"
+
+    @pytest.mark.asyncio
+    async def test_non_direct_exact_session_preserves_dynamic_selection(self) -> None:
+        """Programmatic non-direct callers do not require startup negotiation."""
+
+        client = self._non_direct_client({})
+
+        descriptor = await client.create_session_exact("/workspace", "target")
+
+        assert descriptor == AcpSessionDescriptor("session", "target")
+        assert client._transport.send_request.await_args_list == [
+            call("session/new", {"cwd": "/workspace", "mcpServers": []}),
+            call(
+                "session/set_model",
+                {"sessionId": "session", "modelId": "target"},
+            ),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_non_direct_exact_session_falls_back_to_verified_config(
+        self,
+    ) -> None:
+        from acp_proxy.transport import AcpError
+
+        client = self._non_direct_client(
+            AcpError("method missing", {"code": -32601}),
+            {"configOptions": [{"id": "model", "currentValue": "target"}]},
+        )
+
+        descriptor = await client.create_session_exact("/workspace", "target")
+
+        assert descriptor == AcpSessionDescriptor("session", "target")
+        assert client._transport.send_request.await_args_list == [
+            call("session/new", {"cwd": "/workspace", "mcpServers": []}),
+            call(
+                "session/set_model",
+                {"sessionId": "session", "modelId": "target"},
+            ),
+            call(
+                "session/set_config_option",
+                {"sessionId": "session", "configId": "model", "value": "target"},
+            ),
+        ]
+        assert client._expected_model_updates == {}
+
+    @pytest.mark.asyncio
+    async def test_non_direct_exact_session_rejection_does_not_fallback(
+        self,
+    ) -> None:
+        from acp_proxy.transport import AcpError
+
+        client = self._non_direct_client(
+            AcpError("selection rejected", {"code": -32000})
+        )
+
+        with pytest.raises(ModelAcknowledgementError, match="rejected"):
+            await client.create_session_exact("/workspace", "target")
+
+        assert len(client._transport.send_request.await_args_list) == 2
+        assert client._sessions["session"].model_id == "auto"
+        assert client._expected_model_updates == {}
+
+    @pytest.mark.asyncio
+    async def test_non_direct_exact_session_fails_when_both_methods_are_missing(
+        self,
+    ) -> None:
+        from acp_proxy.transport import AcpError
+
+        client = self._non_direct_client(
+            AcpError("target method missing", {"code": -32601}),
+            AcpError("standard method missing", {"code": -32601}),
+        )
+
+        with pytest.raises(ModelAcknowledgementError, match="no supported"):
+            await client.create_session_exact("/workspace", "target")
+
+        assert [
+            observed.args[0]
+            for observed in client._transport.send_request.await_args_list
+        ] == ["session/new", "session/set_model", "session/set_config_option"]
+        assert client._sessions["session"].model_id == "auto"
+        assert client._expected_model_updates == {}
+
+    @pytest.mark.asyncio
+    async def test_non_direct_exact_session_retains_current_on_wrong_config_value(
+        self,
+    ) -> None:
+        from acp_proxy.transport import AcpError
+
+        client = self._non_direct_client(
+            AcpError("target method missing", {"code": -32601}),
+            {"configOptions": [{"id": "model", "currentValue": "auto"}]},
+        )
+
+        with pytest.raises(ModelAcknowledgementError, match="exact model"):
+            await client.create_session_exact("/workspace", "target")
+
+        assert client._sessions["session"].model_id == "auto"
+        assert client._expected_model_updates == {}
+
+
 class TestDirectAcpContract:
     """Strict ACP primitives used only by Meadow direct mode."""
 
@@ -1240,57 +1607,84 @@ class TestDirectAcpContract:
         assert client.agent_capabilities["loadSession"] is True
 
     @pytest.mark.asyncio
-    async def test_nondefault_model_uses_copilot_setter_before_return(self) -> None:
-        """A non-default direct model is bound by settled session/set_model."""
-        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
-        client._models = [ModelInfo("gpt-5.3-codex", "GPT-5.3 Codex")]
-        client._transport = AsyncMock()
-        client._transport.send_request.side_effect = [
-            {
-                "sessionId": "session",
-                "models": {
-                    "availableModels": [
-                        {"modelId": "auto", "name": "Auto"},
-                        {"modelId": "gpt-5.3-codex", "name": "GPT-5.3 Codex"},
-                    ],
-                    "currentModelId": "auto",
-                },
-            },
-            {},
-        ]
+    @pytest.mark.parametrize(
+        ("strategy", "current_model", "setter_method"),
+        [
+            (DirectModelBindingStrategy.STANDARD_CONFIG, "auto", "session/set_config_option"),
+            (DirectModelBindingStrategy.STANDARD_CONFIG, "target", "session/set_config_option"),
+            (DirectModelBindingStrategy.COPILOT_SET_MODEL, "auto", "session/set_model"),
+            (DirectModelBindingStrategy.COPILOT_SET_MODEL, "target", "session/set_model"),
+        ],
+    )
+    async def test_frozen_strategy_binds_before_descriptor_returns(
+        self,
+        strategy: DirectModelBindingStrategy,
+        current_model: str,
+        setter_method: str,
+    ) -> None:
+        """Every logical session awaits its frozen setter, including the default."""
 
-        descriptor = await client.create_session_exact("/workspace", "gpt-5.3-codex")
+        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        client._models = [ModelInfo("target", "Target")]
+        client._direct_model_binding_strategy = strategy
+        setter_started = asyncio.Event()
+        release_setter = asyncio.Event()
+
+        async def send_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "session/new":
+                return {
+                    "sessionId": "session",
+                    "models": {
+                        "availableModels": [
+                            {"modelId": "auto", "name": "Auto"},
+                            {"modelId": "target", "name": "Target"},
+                        ],
+                        "currentModelId": current_model,
+                    },
+                }
+            setter_started.set()
+            await release_setter.wait()
+            if method == "session/set_config_option":
+                return {
+                    "configOptions": [{"id": "model", "currentValue": "target"}]
+                }
+            return {}
+
+        client._transport = AsyncMock()
+        client._transport.send_request = AsyncMock(side_effect=send_request)
+
+        task = asyncio.create_task(client.create_session_exact("/workspace", "target"))
+        await setter_started.wait()
+        assert not task.done()
+        assert client._sessions["session"].model_id == current_model
+
+        release_setter.set()
+        descriptor = await task
 
         assert descriptor.session_id == "session"
-        assert descriptor.model_id == "gpt-5.3-codex"
-        assert client._sessions["session"].model_id == "gpt-5.3-codex"
-        assert client._transport.send_request.await_args_list[1].args == (
-            "session/set_model",
-            {"sessionId": "session", "modelId": "gpt-5.3-codex"},
+        assert descriptor.model_id == "target"
+        assert client._sessions["session"].model_id == "target"
+        setter_params = (
+            {"sessionId": "session", "configId": "model", "value": "target"}
+            if strategy is DirectModelBindingStrategy.STANDARD_CONFIG
+            else {"sessionId": "session", "modelId": "target"}
         )
+        assert client._transport.send_request.await_args_list == [
+            call("session/new", {"cwd": "/workspace", "mcpServers": []}),
+            call(setter_method, setter_params),
+        ]
+        assert client._expected_model_updates == {}
 
     @pytest.mark.asyncio
-    async def test_requested_current_model_needs_no_setter(self) -> None:
-        """The current model reported for a new session is already bound."""
+    async def test_exact_session_requires_negotiated_strategy_before_new(self) -> None:
         client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
-        client._models = [ModelInfo("auto", "Auto")]
+        client._models = [ModelInfo("target", "Target")]
         client._transport = AsyncMock()
-        client._transport.send_request.return_value = {
-            "sessionId": "session",
-            "models": {
-                "availableModels": [{"modelId": "auto", "name": "Auto"}],
-                "currentModelId": "auto",
-            },
-        }
 
-        descriptor = await client.create_session_exact("/workspace", "auto")
+        with pytest.raises(ModelAcknowledgementError, match="not negotiated"):
+            await client.create_session_exact("/workspace", "target")
 
-        assert descriptor.session_id == "session"
-        assert descriptor.model_id == "auto"
-        client._transport.send_request.assert_awaited_once_with(
-            "session/new",
-            {"cwd": "/workspace", "mcpServers": []},
-        )
+        client._transport.send_request.assert_not_awaited()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1315,6 +1709,9 @@ class TestDirectAcpContract:
         client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
         client._models = [ModelInfo("auto", "Auto")]
         client._default_model = "auto"
+        client._direct_model_binding_strategy = (
+            DirectModelBindingStrategy.COPILOT_SET_MODEL
+        )
         client._transport = AsyncMock()
         response: dict[str, Any] = {"sessionId": "session"}
         if session_models is not None:
@@ -1335,6 +1732,9 @@ class TestDirectAcpContract:
         """A model removed from the new session's catalog is not selected."""
         client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
         client._models = [ModelInfo("target", "Target")]
+        client._direct_model_binding_strategy = (
+            DirectModelBindingStrategy.COPILOT_SET_MODEL
+        )
         client._transport = AsyncMock()
         client._transport.send_request.return_value = {
             "sessionId": "session",
@@ -1377,6 +1777,9 @@ class TestDirectAcpContract:
         await client.create_session("/workspace")
         startup_models = [model.model_id for model in client.models]
         startup_default = client.default_model
+        client._direct_model_binding_strategy = (
+            DirectModelBindingStrategy.COPILOT_SET_MODEL
+        )
 
         with pytest.raises(ModelAcknowledgementError, match="did not advertise"):
             await client.create_session_exact("/workspace", "target")
@@ -1385,12 +1788,30 @@ class TestDirectAcpContract:
         assert client.default_model == startup_default
 
     @pytest.mark.asyncio
-    async def test_missing_model_selectors_fail_session_safely(self) -> None:
-        """A non-default session is not returned when no selector exists."""
+    @pytest.mark.parametrize(
+        ("strategy", "setter_method"),
+        [
+            (
+                DirectModelBindingStrategy.STANDARD_CONFIG,
+                "session/set_config_option",
+            ),
+            (
+                DirectModelBindingStrategy.COPILOT_SET_MODEL,
+                "session/set_model",
+            ),
+        ],
+    )
+    async def test_frozen_strategy_never_renegotiates_on_method_not_found(
+        self,
+        strategy: DirectModelBindingStrategy,
+        setter_method: str,
+    ) -> None:
+        """A post-readiness method loss fails instead of switching strategies."""
         from acp_proxy.transport import AcpError
 
         client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
         client._models = [ModelInfo("gpt-5.3-codex", "GPT-5.3 Codex")]
+        client._direct_model_binding_strategy = strategy
         client._transport = AsyncMock()
         client._transport.send_request.side_effect = [
             {
@@ -1404,11 +1825,7 @@ class TestDirectAcpContract:
                 },
             },
             AcpError(
-                '"Method not found": session/set_model',
-                {"code": -32601, "data": "sensitive child output"},
-            ),
-            AcpError(
-                '"Method not found": session/set_config_option',
+                f'"Method not found": {setter_method}',
                 {"code": -32601, "data": "sensitive child output"},
             ),
         ]
@@ -1417,10 +1834,24 @@ class TestDirectAcpContract:
             await client.create_session_exact("/workspace", "gpt-5.3-codex")
 
         message = str(exc_info.value)
-        assert "no supported session model selector" in message
+        assert "rejected the requested session model" in message
         assert "Method not found" not in message
         assert "sensitive child output" not in message
         assert client._sessions["session"].model_id == "auto"
+        expected_params = (
+            {
+                "sessionId": "session",
+                "configId": "model",
+                "value": "gpt-5.3-codex",
+            }
+            if strategy is DirectModelBindingStrategy.STANDARD_CONFIG
+            else {"sessionId": "session", "modelId": "gpt-5.3-codex"}
+        )
+        assert client._transport.send_request.await_args_list == [
+            call("session/new", {"cwd": "/workspace", "mcpServers": []}),
+            call(setter_method, expected_params),
+        ]
+        assert client.direct_model_binding_strategy is strategy
 
     @pytest.mark.parametrize(
         "result",
@@ -1437,25 +1868,29 @@ class TestDirectAcpContract:
             AcpClient._model_from_config_options(result)
 
     @pytest.mark.asyncio
-    async def test_config_fallback_rejects_wrong_current_model(self) -> None:
-        from acp_proxy.transport import AcpError
-
+    async def test_standard_strategy_rejects_wrong_current_model(self) -> None:
         client = AcpClient.__new__(AcpClient)
         requested = "MODEL_TEXT_CANARY_REQUESTED"
         observed = "MODEL_TEXT_CANARY_OBSERVED"
         client._sessions = {"session": SessionState("session", model_id="auto")}
         client._expected_model_updates = {}
+        client._direct_model_binding_strategy = (
+            DirectModelBindingStrategy.STANDARD_CONFIG
+        )
         client._transport = AsyncMock()
-        client._transport.send_request.side_effect = [
-            AcpError("Method not found", {"code": -32601}),
-            {"configOptions": [{"id": "model", "currentValue": observed}]},
-        ]
+        client._transport.send_request.return_value = {
+            "configOptions": [{"id": "model", "currentValue": observed}]
+        }
 
         with pytest.raises(ModelAcknowledgementError) as exc_info:
-            await client._settle_direct_model("session", requested)
+            await client._bind_direct_model("session", requested)
         assert requested not in str(exc_info.value)
         assert observed not in str(exc_info.value)
-        assert client._sessions["session"].model_id == "auto"
+        assert client._sessions["session"].model_id is None
+        client._transport.send_request.assert_awaited_once_with(
+            "session/set_config_option",
+            {"sessionId": "session", "configId": "model", "value": requested},
+        )
 
     @pytest.mark.asyncio
     async def test_rejected_nondefault_binding_retains_observed_current_model(self) -> None:
@@ -1464,6 +1899,9 @@ class TestDirectAcpContract:
 
         client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
         client._models = [ModelInfo("gpt-5.3-codex", "GPT-5.3 Codex")]
+        client._direct_model_binding_strategy = (
+            DirectModelBindingStrategy.COPILOT_SET_MODEL
+        )
         client._transport = AsyncMock()
         client._transport.send_request.side_effect = [
             {
