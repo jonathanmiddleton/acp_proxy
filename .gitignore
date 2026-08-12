@@ -10,3 +10,4 @@ experiments/*/logs/
 logs/
 .meadow/
 tmp/
+.hypothesis/
