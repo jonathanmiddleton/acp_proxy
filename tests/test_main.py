@@ -851,10 +851,11 @@ async def test_post_start_catalog_failure_still_stops_owned_child(
 
 @pytest.mark.asyncio
 async def test_child_loss_during_startup_invalidates_direct_service_and_cleans_up(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """ADI-10/13: a dead ACP child cannot leave direct readiness or an orphan."""
     observed: dict[str, Any] = {}
+    caplog.set_level("INFO", logger="acp_proxy.direct_service")
 
     class ChildLossClient:
         def __init__(self, _binary: str, **kwargs: Any) -> None:
@@ -936,14 +937,22 @@ async def test_child_loss_during_startup_invalidates_direct_service_and_cleans_u
         _ = observed["service"].capabilities
     assert observed["client"].stopped is True
     assert observed["server"].shutdown_called is True
+    assert [
+        (record.levelname, record.getMessage())
+        for record in caplog.records
+        if record.name == "acp_proxy.direct_service"
+    ] == [
+        ("ERROR", "Quarantined ACP continuity generation: owned ACP child transport closed")
+    ]
 
 
 @pytest.mark.asyncio
 async def test_graceful_owner_shutdown_quarantines_active_direct_work_first(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """ADI-10/13: normal shutdown marks active work in_doubt before child stop."""
     observed: dict[str, Any] = {}
+    caplog.set_level("INFO", logger="acp_proxy.direct_service")
 
     class ActiveClient:
         def __init__(self, _binary: str, **kwargs: Any) -> None:
@@ -1084,6 +1093,13 @@ async def test_graceful_owner_shutdown_quarantines_active_direct_work_first(
     assert observed["old_session"].state.value == "lost"
     assert observed["client"].stopped is True
     assert observed["shutdown"] is True
+    assert [
+        (record.levelname, record.getMessage())
+        for record in caplog.records
+        if record.name == "acp_proxy.direct_service"
+    ] == [
+        ("INFO", "Closed ACP continuity generation for shutdown: owned proxy is shutting down")
+    ]
 
 
 def test_trusted_host_direct_rejects_non_loopback(

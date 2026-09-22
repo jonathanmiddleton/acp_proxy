@@ -1099,9 +1099,10 @@ class DirectService:
         self,
         reason: str,
         *,
+        expected_shutdown: bool = False,
         defer_operation_ids: frozenset[str] = frozenset(),
     ) -> None:
-        """Quarantine this generation after ACP child or proof-ledger loss."""
+        """Invalidate continuity; log only proxy-authored, public-safe reasons."""
 
         tasks_to_cancel: tuple[asyncio.Task[Any], ...]
         async with self._state_lock:
@@ -1141,7 +1142,10 @@ class DirectService:
 
         if tasks_to_cancel:
             await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
-        logger.error("Quarantined ACP continuity generation")
+        if expected_shutdown:
+            logger.info("Closed ACP continuity generation for shutdown: %s", reason)
+        else:
+            logger.error("Quarantined ACP continuity generation: %s", reason)
 
     async def _quarantine_uncertain(
         self,

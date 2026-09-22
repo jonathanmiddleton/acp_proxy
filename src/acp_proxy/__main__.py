@@ -527,7 +527,9 @@ async def run(
         if generation_loss_task is not None and not generation_loss_task.done():
             await generation_loss_task
         if direct_service is not None:
-            await direct_service.mark_generation_lost("owned proxy is shutting down")
+            await direct_service.mark_generation_lost(
+                "owned proxy is shutting down", expected_shutdown=True
+            )
         if server is not None and server_start_attempted:
             try:
                 await server.shutdown()
