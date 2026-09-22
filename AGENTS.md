@@ -131,7 +131,6 @@ code:
 
 - Commit messages describe the "why" not the "what".
 - No user IDs or environment-specific paths in committed code.
-- `docs/journal.md` is gitignored — unfiltered local working record.
 
 ## Target Environment Constraints
 
