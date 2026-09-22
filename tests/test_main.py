@@ -98,6 +98,14 @@ def test_metadata_records_requested_bind_host(tmp_path: Path) -> None:
     assert metadata["host"] == "0.0.0.0"
 
 
+def test_raw_capture_cli_is_explicit(tmp_path: Path) -> None:
+    parser = cli._build_parser()
+    base = ["--consumer-mode", "meadow-direct"]
+    assert parser.parse_args(base).raw_event_file is None
+    path = str(tmp_path / "events.jsonl")
+    assert parser.parse_args([*base, "--raw-event-file", path]).raw_event_file == path
+
+
 def test_windows_shutdown_handles_ctrl_break(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

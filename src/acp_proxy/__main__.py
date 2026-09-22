@@ -57,6 +57,7 @@ from .discovery import (
     admit_compatible_binary,
     find_binary,
 )
+from .raw_events import RawEventCaptureError
 from .server import create_app
 
 logger = logging.getLogger(__name__)
@@ -308,6 +309,7 @@ async def run(
     launch_secret: str | None = None,
     execution_authority: str | None = None,
     direct_limits: DirectLimits | None = None,
+    raw_event_file: str | None = None,
 ) -> None:
     """Start the ACP client and HTTP server."""
     callback_policy = _validate_run_mode(
@@ -330,7 +332,9 @@ async def run(
             "opencode-legacy mode is deprecated and will be removed in acp-proxy 0.3.0"
         )
 
-    client = AcpClient(binary, callback_policy=callback_policy)
+    client = AcpClient(
+        binary, callback_policy=callback_policy, raw_event_file=raw_event_file
+    )
     child_lost_event = asyncio.Event()
     server: uvicorn.Server | None = None
     server_start_attempted = False
@@ -533,6 +537,9 @@ async def run(
             _remove_metadata_file(metadata_file)
         try:
             await client.stop()
+        except RawEventCaptureError:
+            # Opted-in capture is part of this run's diagnostic contract.
+            raise
         except Exception:
             logger.exception("ACP child cleanup failed")
         logger.info("Proxy stopped.")
@@ -582,6 +589,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--log-file",
         default="logs/proxy.log",
         help="Log file path (default: logs/proxy.log). DEBUG level always.",
+    )
+    parser.add_argument(
+        "--raw-event-file",
+        help="Opt-in NDJSON capture of full ACP updates and prompt boundaries.",
     )
     parser.add_argument(
         "--system-prompt",
@@ -717,10 +728,14 @@ def main() -> None:
                 consumer_mode=args.consumer_mode,
                 launch_secret=launch_secret,
                 execution_authority=args.execution_authority,
+                raw_event_file=args.raw_event_file,
             )
         )
     except BinaryCompatibilityError as exc:
         logger.error("Incompatible copilot-language-server: %s", exc)
+        sys.exit(1)
+    except RawEventCaptureError as exc:
+        logger.error("%s", exc)
         sys.exit(1)
 
 

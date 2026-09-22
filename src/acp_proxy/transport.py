@@ -14,6 +14,8 @@ import re
 from collections.abc import Callable
 from typing import Any
 
+from .raw_events import RawEventCapture, RawEventCaptureError
+
 logger = logging.getLogger(__name__)
 MAX_INCOMING_REQUEST_TASKS = 64
 MAX_ACP_STDOUT_LINE_BYTES = 5_000_000
@@ -50,7 +52,7 @@ class AcpTransport:
     - Request/response correlation via pending futures
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, raw_event_file: str | None = None) -> None:
         self._process: asyncio.subprocess.Process | None = None
         self._next_id: int = 1
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
@@ -75,6 +77,15 @@ class AcpTransport:
         self._failed = False
         self._strict_response_correlation = False
         self._close_handler: Callable[[], None] | None = None
+        self._raw_capture = (
+            RawEventCapture(raw_event_file, self._capture_failed)
+            if raw_event_file is not None
+            else None
+        )
+
+    def _capture_failed(self) -> None:
+        logger.error("Raw ACP event capture failed; evidence is incomplete")
+        self.fail_closed("Raw ACP event capture failed")
 
     @property
     def is_open(self) -> bool:
@@ -99,6 +110,8 @@ class AcpTransport:
         logger.info("Starting copilot-language-server: %s", binary_path)
         self._closed = False
         self._failed = False
+        if self._raw_capture is not None:
+            await self._raw_capture.start()
         self._process = await asyncio.create_subprocess_exec(
             binary_path,
             "--acp",
@@ -138,6 +151,8 @@ class AcpTransport:
                 await self._process.wait()
         await self._settle_stderr_task()
         self._fail_pending(ConnectionError("Transport closed"))
+        if self._raw_capture is not None:
+            await self._raw_capture.close()
 
     async def abort(self) -> None:
         """Fail ownership immediately, notify the owner, then kill the child."""
@@ -263,6 +278,15 @@ class AcpTransport:
         if params is not None:
             msg["params"] = params
 
+        if self._raw_capture is not None and method == "session/prompt":
+            # Intent precedes the write; a missing terminal record means the
+            # capture does not establish settlement of this request.
+            self._raw_capture.record(
+                "prompt_request",
+                request_id=req_id,
+                session_id=params.get("sessionId") if params else None,
+            )
+
         future: asyncio.Future[dict[str, Any]] = (
             asyncio.get_event_loop().create_future()
         )
@@ -345,9 +369,26 @@ class AcpTransport:
                     _safe_method_name(msg),
                     len(line_bytes),
                 )
+                if self._raw_capture is not None:
+                    if msg.get("method") == "session/update":
+                        self._raw_capture.record("session_update", message=msg)
+                    elif type(msg.get("id")) is int and "method" not in msg:
+                        request = self._pending_requests.get(msg["id"])
+                        if request is not None and request[0] == "session/prompt":
+                            params = request[1]
+                            self._raw_capture.record(
+                                "prompt_response",
+                                request_id=msg["id"],
+                                session_id=params.get("sessionId") if params else None,
+                                message=msg,
+                            )
+                # No await between wire observation and protocol observers:
+                # callback settlement and prompt phases depend on this order.
                 self._dispatch(msg)
         except asyncio.CancelledError:
             raise
+        except RawEventCaptureError:
+            self._capture_failed()
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
             logger.warning("Malformed ACP stdout; revoking child continuity")
             self.fail_closed("ACP protocol failure")

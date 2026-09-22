@@ -254,6 +254,7 @@ Key references: [session setup](https://agentclientprotocol.com/protocol/session
 | `--cwd`           | current directory | Working directory for ACP sessions (default: `cwd` where acp_proxy is executed |
 | `--log-level`     | DEBUG             | DEBUG, INFO, WARNING, ERROR (DEBUG default during development phase)            |
 | `--log-file`      | logs/proxy.log    | Log file path (always DEBUG level)                                             |
+| `--raw-event-file` | disabled        | Separate opt-in NDJSON capture of full ACP updates and prompt boundaries       |
 | `--execution-authority` | none        | Required direct profile: `trusted-host` or `confined-container`                |
 | `--system-prompt` | none              | Legacy-only prompt file; rejected in direct mode                               |
 | `--context-files` | configured list   | Legacy-only workspace context override; rejected in direct mode                |
@@ -262,3 +263,30 @@ The default bind is loopback. Trusted-host direct mode rejects non-loopback
 binds. Legacy mode remains unauthenticated and must not be exposed to an
 untrusted network. Confined direct mode requires both managed attestation and
 an observable runtime container boundary.
+
+## Raw event diagnostics
+
+Pass `--raw-event-file /absolute/path/events.jsonl` to retain complete decoded
+`session/update` envelopes before client validation or projection, including
+outer and nested `_meta`, message IDs, content, and unknown fields. The parent
+directory must exist. Ordinary logs continue to contain protocol metadata.
+
+Each NDJSON record has `version`, `capture_id`, `sequence`, `timestamp`, and
+`kind`. `session_update` and `prompt_response` records carry the full JSON-RPC
+`message`. `prompt_request` records capture dispatch intent with `request_id`
+and `session_id`; `prompt_response` records carry the same identifiers and the
+terminal result or error. Prompt bodies, HTTP credentials, and child stderr
+are outside this capture. Agent output may itself contain sensitive content.
+
+Capture is disabled by default. Existing complete files are appended with a
+new `capture_id` and sequence starting at zero, preserving resumed-run evidence.
+`capture_start` and `capture_end` delimit each clean writer lifetime. A missing
+prompt response means settlement was not observed; a missing `capture_end`
+means the capture is incomplete. An unterminated existing record fails startup.
+Records are flushed without truncation or rotation. A bounded writer queue
+keeps filesystem I/O off the event loop; overflow or I/O failure reports an
+error, revokes transport continuity, and makes proxy shutdown fail.
+
+Meadow's `acp_proxy.capture_raw_events: true` setting passes a run-owned file at
+`<run-log-directory>/acp-events-<run_id>.jsonl`. Both the host proxy installation
+and any selected container image must include this option.

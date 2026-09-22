@@ -164,10 +164,11 @@ class AcpClient:
         binary_path: str,
         *,
         callback_policy: CallbackPolicy = CallbackPolicy.LEGACY_PERMISSIVE,
+        raw_event_file: str | None = None,
     ) -> None:
         self._binary_path = binary_path
         self._callback_policy = callback_policy
-        self._transport = AcpTransport()
+        self._transport = AcpTransport(raw_event_file=raw_event_file)
         self._models: list[ModelInfo] = []
         self._default_model: str | None = None
         self._direct_model_binding_strategy: (

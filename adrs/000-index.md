@@ -13,6 +13,7 @@ See [GUIDE.md](GUIDE.md) for how and when to write ADRs.
 - [ADR-012: Authenticated Meadow-Direct Consumer Protocol](012-meadow-direct-consumer-protocol.md) — exact catalog-session acknowledgement before readiness
 - [ADR-014: Correlate Direct Session State Without Retaining Unsupported State](014-correlate-direct-session-state.md) — bounded state-update correlation without unused retained state
 - [ADR-015: Order Direct Model Binding at RPC Settlement](015-order-direct-model-binding-transitions.md) — admit exact prior/target state during unresolved selection; enforce target at the ordered response boundary
+- [ADR-016: Opt-In Raw ACP Event Capture](016-opt-in-raw-acp-event-capture.md) — separate ordered diagnostic artifacts with explicit lifetime and failure reporting
 
 ## Session and conversation management
 
