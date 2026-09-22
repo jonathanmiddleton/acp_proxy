@@ -294,7 +294,7 @@ def _select_best_binary(
         try:
             canonical_paths.add(os.path.realpath(os.path.abspath(path)))
         except (TypeError, ValueError):
-            logger.warning("Rejected a language-server candidate with an invalid path")
+            logger.info("Rejected a language-server candidate with an invalid path")
 
     admitted: list[BinaryAdmission] = []
     rejected = 0
@@ -305,7 +305,7 @@ def _select_best_binary(
         except BinaryCompatibilityError as exc:
             rejected += 1
             rejection_reasons.add(str(exc))
-            logger.warning("Rejected language-server candidate: %s", exc)
+            logger.info("Rejected language-server candidate: %s", exc)
 
     if rejected:
         logger.info("Rejected %d incompatible language-server candidate(s)", rejected)
