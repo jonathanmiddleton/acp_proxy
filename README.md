@@ -149,7 +149,7 @@ They **fail** (not skip) if the binary is not found — see
 [ADR-005](adrs/005-fail-loud-testing.md). Run unit tests only with:
 
 ```bash
-python -m pytest tests/test_transport.py tests/test_client.py tests/test_server.py tests/test_direct_*.py tests/test_discovery.py tests/test_binary_admission.py tests/test_main.py -v
+python -m pytest tests/test_transport.py tests/test_client.py tests/test_model_binding_order.py tests/test_server.py tests/test_direct_*.py tests/test_discovery.py tests/test_binary_admission.py tests/test_main.py -v
 ```
 The live direct integration probe requires the advertised
 `gpt-5.3-codex` model, proves exact advertised-model binding through the public

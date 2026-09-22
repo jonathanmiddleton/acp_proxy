@@ -1,7 +1,9 @@
 # ADR-012: Authenticated Meadow-Direct Consumer Protocol
 
 **Status:** Accepted; out-of-prompt session-state retention partially
-superseded by [ADR-014](014-correlate-direct-session-state.md)
+superseded by [ADR-014](014-correlate-direct-session-state.md); pending-model
+integrity partially superseded by
+[ADR-015](015-order-direct-model-binding-transitions.md)
 **Date:** 2026-08-09
 
 > **Partial supersession note (2026-08-11):** ADR-014 replaces the requirement
@@ -10,6 +12,13 @@ superseded by [ADR-014](014-correlate-direct-session-state.md)
 > logged, then discarded unless they enforce an explicit Meadow contract.
 > Exact selected-model integrity and prompt-scoped ordered event evidence
 > remain binding.
+
+> **Partial supersession note (2026-09-22):** ADR-015 replaces the requirement
+> that every configuration notification match the requested target while model
+> binding remains unresolved. A correlated transition admits the exact prior
+> model or target until successful RPC settlement is observed in read order;
+> after that boundary, only the target remains valid. The required binding
+> acknowledgement and post-binding model integrity remain binding.
 
 ## Context
 

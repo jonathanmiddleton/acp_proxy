@@ -138,6 +138,17 @@ class SessionState:
     created_at: float = field(default_factory=time.time)
 
 
+@dataclass
+class _ModelBinding:
+    """One selection RPC, including its transition before response dispatch."""
+
+    prior_model: str | None
+    target_model: str
+    method: str
+    params: dict[str, Any]
+    response_received: bool = False
+
+
 class AcpClient:
     """High-level ACP client wrapping transport + session management.
 
@@ -168,7 +179,7 @@ class AcpClient:
         self._update_queues: dict[str, asyncio.Queue[dict[str, Any] | None]] = {}
         self._direct_prompt_phases: dict[str, str] = {}
         self._direct_update_budgets: dict[str, dict[str, int]] = {}
-        self._expected_model_updates: dict[str, str] = {}
+        self._model_bindings: dict[str, _ModelBinding] = {}
         self._provisional_session_ids: set[str] = set()
         self._session_new_response_ids: set[str] = set()
         self._agent_name: str | None = None
@@ -270,7 +281,7 @@ class AcpClient:
         self._update_queues.clear()
         self._direct_prompt_phases.clear()
         self._direct_update_budgets.clear()
-        self._expected_model_updates.clear()
+        self._model_bindings.clear()
         self._provisional_session_ids.clear()
         self._session_new_response_ids.clear()
         self._sessions.clear()
@@ -962,22 +973,16 @@ class AcpClient:
     ) -> str:
         """Apply standard model configuration and verify its reported post-state."""
 
-        expected_model_updates = getattr(self, "_expected_model_updates", None)
-        if expected_model_updates is None:
-            expected_model_updates = {}
-            self._expected_model_updates = expected_model_updates
-        expected_model_updates[session_id] = model_id
+        binding = self._begin_model_binding(
+            session_id, model_id, "session/set_config_option"
+        )
         try:
             result = await self._transport.send_request(
-                "session/set_config_option",
-                {
-                    "sessionId": session_id,
-                    "configId": "model",
-                    "value": model_id,
-                },
+                binding.method, binding.params
             )
         finally:
-            expected_model_updates.pop(session_id, None)
+            if self._model_bindings.get(session_id) is binding:
+                self._model_bindings.pop(session_id)
 
         observed = self._model_from_config_options(result)
         if observed != model_id:
@@ -995,20 +1000,67 @@ class AcpClient:
     ) -> None:
         """Apply Copilot model selection and require successful RPC settlement."""
 
-        expected_model_updates = getattr(self, "_expected_model_updates", None)
-        if expected_model_updates is None:
-            expected_model_updates = {}
-            self._expected_model_updates = expected_model_updates
-        expected_model_updates[session_id] = model_id
+        binding = self._begin_model_binding(session_id, model_id, "session/set_model")
         try:
             await self._transport.send_request(
-                "session/set_model",
-                {"sessionId": session_id, "modelId": model_id},
+                binding.method, binding.params
             )
         finally:
-            expected_model_updates.pop(session_id, None)
+            if self._model_bindings.get(session_id) is binding:
+                self._model_bindings.pop(session_id)
         if session_id in self._sessions:
             self._sessions[session_id].model_id = model_id
+
+    def _begin_model_binding(
+        self, session_id: str, model_id: str, method: str
+    ) -> _ModelBinding:
+        """Capture this session's prior state before dispatching its selector."""
+
+        if session_id in self._model_bindings:
+            raise RuntimeError("model binding is already in progress for this session")
+        session = self._sessions.get(session_id)
+        params: dict[str, Any] = {"sessionId": session_id}
+        if method == "session/set_config_option":
+            params.update(configId="model", value=model_id)
+        else:
+            params["modelId"] = model_id
+        binding = _ModelBinding(
+            prior_model=session.model_id if session is not None else None,
+            target_model=model_id,
+            method=method,
+            params=params,
+        )
+        self._model_bindings[session_id] = binding
+        return binding
+
+    def _observe_model_binding_response(
+        self, message: dict[str, Any], method: str, params: dict[str, Any] | None
+    ) -> None:
+        """End the old-model allowance before any following wire notification."""
+
+        if not isinstance(params, dict):
+            return
+        session_id = params.get("sessionId")
+        binding = self._model_bindings.get(session_id)
+        if binding is None:
+            return
+        # The transport retains the original params with the JSON-RPC request
+        # ID. Identity also distinguishes an earlier cancelled request with the
+        # same session, method, and target from the current binding attempt.
+        if binding.method != method or binding.params is not params:
+            self._transport.fail_closed(
+                "direct ACP model binding response correlation failure"
+            )
+            return
+        if "error" in message:
+            # Rejection does not establish the target. Restore the prior-model
+            # invariant now, including before a method-not-found fallback runs.
+            self._model_bindings.pop(session_id)
+        else:
+            # The coroutine still validates the exact acknowledgement. Meanwhile
+            # only the target may appear after this response, even when several
+            # messages are buffered and the coroutine has not resumed yet.
+            binding.response_received = True
 
     @staticmethod
     def _extract_text(content: str | list[dict[str, Any]] | None) -> str:
@@ -1199,7 +1251,7 @@ class AcpClient:
         )
 
     def _direct_model_integrity_holds(self, params: Any) -> bool:
-        """Fail continuity when any config update changes the selected model."""
+        """Validate selected-model state against the ordered binding transition."""
 
         if not isinstance(params, dict):
             return True
@@ -1215,11 +1267,13 @@ class AcpClient:
         if not isinstance(options, list):
             return True
         session = self._sessions.get(session_id)
-        selected_model = getattr(self, "_expected_model_updates", {}).get(
-            session_id,
-            session.model_id if session is not None else None,
+        binding = getattr(self, "_model_bindings", {}).get(session_id)
+        selected_model = (
+            binding.target_model
+            if binding is not None
+            else session.model_id if session is not None else None
         )
-        model_option_seen = False
+        observed_model: str | None = None
         for option in options:
             if (
                 not isinstance(option, dict)
@@ -1231,19 +1285,37 @@ class AcpClient:
                 )
                 return False
             if option.get("id") == "model" or option.get("category") == "model":
-                model_option_seen = True
                 current = option.get("currentValue")
-                if not isinstance(current, str) or not current:
+                if (
+                    not isinstance(current, str)
+                    or not current
+                    or (observed_model is not None and current != observed_model)
+                ):
                     self._transport.fail_closed(
                         "direct ACP config update malformed"
                     )
                     return False
-                if isinstance(selected_model, str) and current != selected_model:
+                observed_model = current
+                prior_model_pending = (
+                    binding is not None
+                    and not binding.response_received
+                    and current == binding.prior_model
+                )
+                if prior_model_pending and current != selected_model:
+                    logger.debug(
+                        "Direct ACP model binding accepted prior-model snapshot "
+                        "before response"
+                    )
+                if (
+                    isinstance(selected_model, str)
+                    and current != selected_model
+                    and not prior_model_pending
+                ):
                     self._transport.fail_closed(
                         "direct ACP selected model drifted"
                     )
                     return False
-        if isinstance(selected_model, str) and selected_model and not model_option_seen:
+        if isinstance(selected_model, str) and selected_model and observed_model is None:
             self._transport.fail_closed(
                 "direct ACP selected model state missing"
             )
@@ -1521,7 +1593,7 @@ class AcpClient:
         method: str,
         params: dict[str, Any] | None,
     ) -> None:
-        """Correlate session creation or order a prompt's terminal marker."""
+        """Order session creation, model binding, and prompt settlement."""
 
         if (
             getattr(self, "_callback_policy", CallbackPolicy.LEGACY_PERMISSIVE)
@@ -1530,6 +1602,9 @@ class AcpClient:
             return
         if method == "session/new":
             self._observe_session_new_response(_message)
+            return
+        if method in {"session/set_config_option", "session/set_model"}:
+            self._observe_model_binding_response(_message, method, params)
             return
         if method != "session/prompt":
             return

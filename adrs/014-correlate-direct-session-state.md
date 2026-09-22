@@ -1,10 +1,18 @@
 # ADR-014: Correlate Direct Session State Without Retaining Unsupported State
 
-**Status:** Accepted
+**Status:** Accepted; pending-model integrity partially superseded by
+[ADR-015](015-order-direct-model-binding-transitions.md)
 **Date:** 2026-08-11
 **Supersedes:** ADR-012's out-of-prompt command and configuration retention
 policy
 **Related ADRs:** [ADR-012](012-meadow-direct-consumer-protocol.md)
+
+> **Partial supersession note (2026-09-22):** ADR-015 admits the exact prior
+> model or requested target while a correlated binding RPC remains unresolved.
+> Successful settlement closes that transition at the ordered response
+> observer, before coroutine resumption. Required acknowledgement and
+> post-binding drift detection remain unchanged; the pending-target-only
+> requirement below is retained as the historical decision.
 
 ## Context
 

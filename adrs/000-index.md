@@ -12,6 +12,7 @@ See [GUIDE.md](GUIDE.md) for how and when to write ADRs.
 - [ADR-011: Context Injection — Proxy Responsibilities and Consumer Boundary](011-context-injection-boundary.md) — legacy mode only
 - [ADR-012: Authenticated Meadow-Direct Consumer Protocol](012-meadow-direct-consumer-protocol.md) — exact catalog-session acknowledgement before readiness
 - [ADR-014: Correlate Direct Session State Without Retaining Unsupported State](014-correlate-direct-session-state.md) — bounded state-update correlation without unused retained state
+- [ADR-015: Order Direct Model Binding at RPC Settlement](015-order-direct-model-binding-transitions.md) — admit exact prior/target state during unresolved selection; enforce target at the ordered response boundary
 
 ## Session and conversation management
 

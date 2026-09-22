@@ -157,6 +157,7 @@ class AcpTransport:
         if self._closed or self._failed:
             return
         self._failed = True
+        logger.debug("ACP transport continuity revoked: %s", public_message)
         self._fail_pending(ConnectionError(public_message))
         if self._close_handler is not None:
             try:

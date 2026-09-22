@@ -61,6 +61,8 @@ from .server import create_app
 
 logger = logging.getLogger(__name__)
 
+LOG_LEVEL_ENV = "ACP_PROXY_LOG_LEVEL"
+LOG_LEVEL_CHOICES = ("DEBUG", "INFO", "WARNING", "ERROR")
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB per file
 LOG_BACKUP_COUNT = 3
@@ -106,6 +108,8 @@ DIRECT_CHILD_ENV_KEYS = frozenset(
 )
 DIRECT_CHILD_ENV_PREFIXES = ("LC_", "GH", "GITHUB")
 
+def _default_log_level() -> str:
+    return os.environ.get(LOG_LEVEL_ENV, "WARNING").strip().upper() or "WARNING"
 
 def _install_shutdown_signal_handlers(
     loop: asyncio.AbstractEventLoop,
@@ -160,14 +164,15 @@ def _direct_binary_capability_error(
     )
 
 
-def _configure_logging(console_level: str, log_file: str) -> None:
+def _configure_logging(console_level: str | None, log_file: str) -> None:
     """Set up dual logging: DEBUG to file (always), configurable to console."""
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
 
+    log_level = console_level or _default_log_level()
     # Console handler — respects --log-level
     console = logging.StreamHandler(sys.stderr)
-    console.setLevel(getattr(logging, console_level))
+    console.setLevel(getattr(logging, log_level))
     console.setFormatter(logging.Formatter(LOG_FORMAT))
     root.addHandler(console)
 
@@ -569,7 +574,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--log-level",
-        default="DEBUG",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Console logging level (default: DEBUG during development). "
         "File always logs DEBUG.",

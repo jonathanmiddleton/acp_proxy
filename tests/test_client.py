@@ -255,7 +255,7 @@ class TestHandlePermissionRequest:
         client._update_queues = {}
         client._direct_prompt_phases = {}
         client._direct_update_budgets = {}
-        client._expected_model_updates = {}
+        client._model_bindings = {}
         client._provisional_session_ids = set()
         client._session_new_response_ids = set()
         return client
@@ -386,7 +386,7 @@ class TestHandleAgentRequest:
         client._update_queues = {}
         client._direct_prompt_phases = {}
         client._direct_update_budgets = {}
-        client._expected_model_updates = {}
+        client._model_bindings = {}
         return client
 
     def test_unknown_method_returns_none(self):
@@ -435,7 +435,7 @@ class TestHandleNotification:
         client._update_queues = {}
         client._direct_prompt_phases = {}
         client._direct_update_budgets = {}
-        client._expected_model_updates = {}
+        client._model_bindings = {}
         client._provisional_session_ids = set()
         client._session_new_response_ids = set()
         return client
@@ -671,7 +671,7 @@ class TestHandleNotification:
         client._sessions = {
             "session": SessionState(session_id="session", model_id="auto")
         }
-        client._expected_model_updates = {"session": "target"}
+        client._begin_model_binding("session", "target", "session/set_config_option")
         client._transport = MagicMock()
 
         client._handle_notification(
@@ -701,15 +701,15 @@ class TestHandleNotification:
         assert client._sessions["session"].model_id == "auto"
         client._transport.fail_closed.assert_not_called()
 
-    def test_direct_binding_model_update_mismatch_fails_continuity(self) -> None:
-        """The target being bound, rather than the old catalog value, is invariant."""
+    def test_direct_binding_third_model_update_fails_continuity(self) -> None:
+        """A pending binding permits only its prior model and requested target."""
 
         client = self._make_client()
         client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._sessions = {
             "session": SessionState(session_id="session", model_id="auto")
         }
-        client._expected_model_updates = {"session": "target"}
+        client._begin_model_binding("session", "target", "session/set_config_option")
         client._transport = MagicMock()
 
         client._handle_notification(
@@ -723,7 +723,7 @@ class TestHandleNotification:
                             {
                                 "id": "model",
                                 "category": "model",
-                                "currentValue": "auto",
+                                "currentValue": "unrequested-model",
                             }
                         ],
                     },
@@ -736,12 +736,12 @@ class TestHandleNotification:
         )
 
     @pytest.mark.parametrize(
-        "expected_model_updates",
-        [{}, {"session": "target"}],
+        "binding_pending",
+        [False, True],
     )
     def test_direct_config_snapshot_cannot_omit_selected_model(
         self,
-        expected_model_updates: dict[str, str],
+        binding_pending: bool,
     ) -> None:
         """A complete config snapshot must preserve ready and binding models."""
 
@@ -750,7 +750,10 @@ class TestHandleNotification:
         client._sessions = {
             "session": SessionState(session_id="session", model_id="ready-model")
         }
-        client._expected_model_updates = expected_model_updates
+        if binding_pending:
+            client._begin_model_binding(
+                "session", "target", "session/set_config_option"
+            )
         client._transport = MagicMock()
 
         client._handle_notification(
@@ -1616,7 +1619,7 @@ class TestTrySetModel:
         """session/set_model works — no fallback needed."""
         client = AcpClient.__new__(AcpClient)
         client._sessions = {"s1": SessionState(session_id="s1", model_id="auto")}
-        client._expected_model_updates = {}
+        client._model_bindings = {}
 
         transport = AsyncMock()
         transport.send_request = AsyncMock(return_value={})
@@ -1627,7 +1630,7 @@ class TestTrySetModel:
             "session/set_model", {"sessionId": "s1", "modelId": "gpt-4o"}
         )
         assert client._sessions["s1"].model_id == "gpt-4o"
-        assert client._expected_model_updates == {}
+        assert client._model_bindings == {}
 
     @pytest.mark.asyncio
     async def test_fallback_to_set_config_option(self):
@@ -1636,7 +1639,7 @@ class TestTrySetModel:
 
         client = AcpClient.__new__(AcpClient)
         client._sessions = {"s1": SessionState(session_id="s1", model_id="auto")}
-        client._expected_model_updates = {}
+        client._model_bindings = {}
 
         call_count = 0
 
@@ -1658,7 +1661,7 @@ class TestTrySetModel:
         await client._try_set_model("s1", "gpt-4o")
         assert call_count == 2
         assert client._sessions["s1"].model_id == "gpt-4o"
-        assert client._expected_model_updates == {}
+        assert client._model_bindings == {}
 
     @pytest.mark.asyncio
     async def test_both_methods_fail_raises(self):
@@ -1667,7 +1670,7 @@ class TestTrySetModel:
 
         client = AcpClient.__new__(AcpClient)
         client._sessions = {"s1": SessionState(session_id="s1", model_id="auto")}
-        client._expected_model_updates = {}
+        client._model_bindings = {}
 
         async def mock_send(method, params):
             raise AcpError("Method not found", {"code": -32601})
@@ -1679,7 +1682,7 @@ class TestTrySetModel:
         with pytest.raises(RuntimeError, match="Model selection not supported"):
             await client._try_set_model("s1", "gpt-4o")
         assert client._sessions["s1"].model_id == "auto"
-        assert client._expected_model_updates == {}
+        assert client._model_bindings == {}
 
     @pytest.mark.asyncio
     async def test_legacy_rejected_setter_propagates(self) -> None:
@@ -1688,7 +1691,7 @@ class TestTrySetModel:
 
         client = AcpClient.__new__(AcpClient)
         client._sessions = {"s1": SessionState(session_id="s1", model_id="auto")}
-        client._expected_model_updates = {}
+        client._model_bindings = {}
         client._transport = AsyncMock()
         client._transport.send_request.side_effect = AcpError(
             "rejected with sensitive detail",
@@ -1699,7 +1702,7 @@ class TestTrySetModel:
             await client._try_set_model("s1", "gpt-4o")
 
         assert client._sessions["s1"].model_id == "auto"
-        assert client._expected_model_updates == {}
+        assert client._model_bindings == {}
 
 
 class TestDirectModelBindingNegotiation:
@@ -1753,7 +1756,7 @@ class TestDirectModelBindingNegotiation:
             "session/set_config_option",
             {"sessionId": "catalog", "configId": "model", "value": "auto"},
         )
-        assert client._expected_model_updates == {}
+        assert client._model_bindings == {}
 
     @pytest.mark.asyncio
     async def test_method_not_found_selects_copilot_strategy(self) -> None:
@@ -1778,7 +1781,7 @@ class TestDirectModelBindingNegotiation:
                 {"sessionId": "catalog", "modelId": "auto"},
             ),
         ]
-        assert client._expected_model_updates == {}
+        assert client._model_bindings == {}
 
     @pytest.mark.asyncio
     async def test_neither_strategy_fails_without_freezing_state(self) -> None:
@@ -1797,7 +1800,7 @@ class TestDirectModelBindingNegotiation:
         assert child_canary not in str(exc_info.value)
         assert client.direct_model_binding_strategy is None
         assert client._sessions["catalog"].model_id == "auto"
-        assert client._expected_model_updates == {}
+        assert client._model_bindings == {}
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("error_code", [-32000, -32601.0, "-32601", True])
@@ -1838,7 +1841,7 @@ class TestDirectModelBindingNegotiation:
 
         client._transport.send_request.assert_awaited_once()
         assert client.direct_model_binding_strategy is None
-        assert client._expected_model_updates == {}
+        assert client._model_bindings == {}
 
     @pytest.mark.asyncio
     async def test_strategy_is_immutable_until_client_state_is_cleared(self) -> None:
@@ -1929,7 +1932,7 @@ class TestDirectModelBindingNegotiation:
 
         assert child_canary not in str(exc_info.value)
         assert client._sessions["catalog"].model_id == "auto"
-        assert client._expected_model_updates == {}
+        assert client._model_bindings == {}
 
     @pytest.mark.asyncio
     async def test_exact_compatibility_api_rejects_wrong_reported_model(self) -> None:
@@ -1949,7 +1952,7 @@ class TestDirectModelBindingNegotiation:
         assert requested not in str(exc_info.value)
         assert observed not in str(exc_info.value)
         assert client._sessions["catalog"].model_id is None
-        assert client._expected_model_updates == {}
+        assert client._model_bindings == {}
 
     @pytest.mark.asyncio
     async def test_public_direct_set_model_uses_frozen_strategy(self) -> None:
@@ -2009,7 +2012,7 @@ class TestDirectModelBindingNegotiation:
                 {"sessionId": "session", "configId": "model", "value": "target"},
             ),
         ]
-        assert client._expected_model_updates == {}
+        assert client._model_bindings == {}
 
     @pytest.mark.asyncio
     async def test_non_direct_exact_session_rejection_does_not_fallback(
@@ -2026,7 +2029,7 @@ class TestDirectModelBindingNegotiation:
 
         assert len(client._transport.send_request.await_args_list) == 2
         assert client._sessions["session"].model_id == "auto"
-        assert client._expected_model_updates == {}
+        assert client._model_bindings == {}
 
     @pytest.mark.asyncio
     async def test_non_direct_exact_session_fails_when_both_methods_are_missing(
@@ -2047,7 +2050,7 @@ class TestDirectModelBindingNegotiation:
             for observed in client._transport.send_request.await_args_list
         ] == ["session/new", "session/set_model", "session/set_config_option"]
         assert client._sessions["session"].model_id == "auto"
-        assert client._expected_model_updates == {}
+        assert client._model_bindings == {}
 
     @pytest.mark.asyncio
     async def test_non_direct_exact_session_retains_current_on_wrong_config_value(
@@ -2064,7 +2067,7 @@ class TestDirectModelBindingNegotiation:
             await client.create_session_exact("/workspace", "target")
 
         assert client._sessions["session"].model_id == "auto"
-        assert client._expected_model_updates == {}
+        assert client._model_bindings == {}
 
 
 class TestDirectAcpContract:
@@ -2250,7 +2253,7 @@ class TestDirectAcpContract:
             call("session/new", {"cwd": "/workspace", "mcpServers": []}),
             call(setter_method, setter_params),
         ]
-        assert client._expected_model_updates == {}
+        assert client._model_bindings == {}
 
     @pytest.mark.asyncio
     async def test_exact_session_requires_negotiated_strategy_before_new(self) -> None:
@@ -2450,7 +2453,7 @@ class TestDirectAcpContract:
         requested = "MODEL_TEXT_CANARY_REQUESTED"
         observed = "MODEL_TEXT_CANARY_OBSERVED"
         client._sessions = {"session": SessionState("session", model_id="auto")}
-        client._expected_model_updates = {}
+        client._model_bindings = {}
         client._direct_model_binding_strategy = (
             DirectModelBindingStrategy.STANDARD_CONFIG
         )
@@ -2525,7 +2528,7 @@ class TestDirectAcpContract:
         client._update_queues = {"session": queue}
         client._direct_prompt_phases = {"session": "active"}
         client._direct_update_budgets = {"session": {}}
-        client._expected_model_updates = {}
+        client._model_bindings = {}
         client._provisional_session_ids = {"provisional-session"}
         client._session_new_response_ids = {"response-session"}
         client._sessions = {"session": SessionState("session")}

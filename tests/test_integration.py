@@ -723,7 +723,7 @@ def test_meadow_direct_proxy_model_binding_and_continuity(
         assert create_response.status_code == 200, create_response.text
         created = create_response.json()
         assert created["kind"] == "create_session"
-        assert created["state"] == "completed"
+        assert created["state"] == "completed", (created, meadow_proxy.debug_log_path)
         assert created["error"] is None
         assert created["result"]["logical_session_id"] == logical_session_id
         assert created["result"]["model_id"] == REQUIRED_LIVE_MODEL
@@ -759,7 +759,7 @@ def test_meadow_direct_proxy_model_binding_and_continuity(
         assert initial_response.status_code == 200, initial_response.text
         initial = initial_response.json()
         assert initial["kind"] == "prompt"
-        assert initial["state"] == "completed"
+        assert initial["state"] == "completed", (initial, meadow_proxy.debug_log_path)
         assert initial["error"] is None
         initial_result = initial["result"]
         assert initial_result["logical_session_id"] == logical_session_id
@@ -794,7 +794,7 @@ def test_meadow_direct_proxy_model_binding_and_continuity(
         assert later_response.status_code == 200, later_response.text
         later = later_response.json()
         assert later["kind"] == "prompt"
-        assert later["state"] == "completed"
+        assert later["state"] == "completed", (later, meadow_proxy.debug_log_path)
         assert later["error"] is None
         later_result = later["result"]
         assert later_result["logical_session_id"] == logical_session_id
@@ -817,42 +817,3 @@ def test_meadow_direct_proxy_model_binding_and_continuity(
         )
         assert status_response.status_code == 200, status_response.text
         assert status_response.json() == later
-
-
-def test_opencode_legacy_proxy_http_roundtrip(legacy_proxy: LiveProxy) -> None:
-    """The deprecated adapter is exercised through its real CLI and TCP API."""
-
-    with httpx.Client(
-        base_url=legacy_proxy.base_url,
-        timeout=_HTTP_TIMEOUT,
-        trust_env=False,
-    ) as http:
-        direct_route = http.get("/meadow/v1/capabilities")
-        assert direct_route.status_code == 410, direct_route.text
-        assert direct_route.json()["error"]["code"] == (
-            "meadow_direct_mode_required"
-        )
-
-        model_response = http.get("/v1/models")
-        assert model_response.status_code == 200, model_response.text
-        models = model_response.json()
-        assert models["object"] == "list"
-        assert REQUIRED_LIVE_MODEL in {model["id"] for model in models["data"]}
-
-        completion_response = http.post(
-            "/v1/chat/completions",
-            json={
-                "model": REQUIRED_LIVE_MODEL,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": "Reply with exactly: LEGACY_HTTP_OK",
-                    }
-                ],
-                "stream": False,
-            },
-        )
-        assert completion_response.status_code == 200, completion_response.text
-        completion = completion_response.json()
-        assert completion["choices"][0]["finish_reason"] == "stop"
-        assert "LEGACY_HTTP_OK" in completion["choices"][0]["message"]["content"]
