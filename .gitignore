@@ -11,3 +11,6 @@ logs/
 .meadow/
 tmp/
 .hypothesis/
+.uv-cache/
+.mypy_cache/
+.ruff_cache/

@@ -264,7 +264,11 @@ def main() -> None:
 
     all_variants = build_variants()
     if args.variants:
-        all_variants = [(l, m) for l, m in all_variants if l in args.variants]
+        all_variants = [
+            (label, messages)
+            for label, messages in all_variants
+            if label in args.variants
+        ]
 
     for label, messages in all_variants:
         results.append(run_variant(http, model, base_url, label, messages))

@@ -16,14 +16,22 @@ import json
 import os
 import re
 import sys
-import textwrap
 import time
-import traceback
 from datetime import datetime
+from typing import TypedDict
 
 import httpx
 
 PROXY_BASE = "http://127.0.0.1:{port}/v1"
+
+
+class IterationResult(TypedDict):
+    iteration: int
+    variant: str
+    r1_passed: int
+    r2_passed: int | None
+    total: int
+    delta: int | None
 
 # --- Test suites keyed by config filename stem ---
 
@@ -320,17 +328,17 @@ def run_tests(code: str, fn_name: str, test_cases: list[tuple]) -> list[dict]:
 class TestLogger:
     """Logs every interaction verbatim to a timestamped file."""
 
-    def __init__(self, log_dir: str, tag: str):
+    def __init__(self, log_dir: str, tag: str) -> None:
         os.makedirs(log_dir, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.path = os.path.join(log_dir, f"code_{ts}_{tag}.log")
         self._f = open(self.path, "w")
 
-    def write(self, text: str):
+    def write(self, text: str) -> None:
         self._f.write(text + "\n")
         self._f.flush()
 
-    def close(self):
+    def close(self) -> None:
         self._f.close()
 
 
@@ -373,17 +381,17 @@ def run_single_iteration(
     base_url: str,
     question: str,
     fn_name: str,
-    test_cases: list,
-    injections: list[dict],
+    test_cases: list[tuple[str, object, object]],
+    injections: list[dict[str, str]],
     iteration: int,
     logger: TestLogger,
-) -> list[dict]:
+) -> list[IterationResult]:
     """Run one full iteration: baseline + all injection variants.
 
     Each iteration prefixes the question with a unique tag to force a fresh
     ACP session (different first-user-message hash per iteration).
     """
-    results = []
+    results: list[IterationResult] = []
 
     # --- Baseline (R1 only, no injection) ---
     # Each variant gets a unique prefix to force a distinct ACP session
@@ -464,7 +472,7 @@ def run_single_iteration(
             {"role": "user", "content": packed},
         ]
 
-        logger.write(f"Packed injection:")
+        logger.write("Packed injection:")
         logger.write(">>>")
         logger.write(packed)
         logger.write("<<<")
@@ -531,7 +539,7 @@ def main() -> None:
 
     model = args.model
     n = args.n
-    logger.write(f"=== Code Correctness Probe ===")
+    logger.write("=== Code Correctness Probe ===")
     logger.write(f"Timestamp: {datetime.now().isoformat()}")
     logger.write(f"Config: {args.config}")
     logger.write(f"Model: {model}")
@@ -574,6 +582,7 @@ def main() -> None:
                 print(f"  {v:30s}  R1={r['r1_passed']}/{r['total']}")
             else:
                 d = r["delta"]
+                assert d is not None
                 tag_str = "IMPROVED" if d > 0 else ("SAME" if d == 0 else "REGRESSED")
                 print(
                     f"  {v:30s}  R1={r['r1_passed']}/{r['total']}  R2={r['r2_passed']}/{r['total']}  delta={d:+d} {tag_str}"
@@ -587,7 +596,7 @@ def main() -> None:
     # Compute per-variant statistics
     from collections import defaultdict
 
-    stats: dict[str, dict] = defaultdict(
+    stats: dict[str, dict[str, list[int]]] = defaultdict(
         lambda: {
             "r1_scores": [],
             "r2_scores": [],
@@ -599,6 +608,7 @@ def main() -> None:
         stats[v]["r1_scores"].append(r["r1_passed"])
         if r["r2_passed"] is not None:
             stats[v]["r2_scores"].append(r["r2_passed"])
+            assert r["delta"] is not None
             stats[v]["deltas"].append(r["delta"])
 
     total = len(test_cases)

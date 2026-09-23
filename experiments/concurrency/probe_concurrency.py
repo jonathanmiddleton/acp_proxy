@@ -554,7 +554,7 @@ async def run_test(
     result["_total_prompts"] = test_cfg.get("total_prompts", 1)
     result["_is_sequential"] = is_sequential
 
-    test_logger.write(f"\n  Summary:")
+    test_logger.write("\n  Summary:")
     test_logger.write(f"    Successes: {result['successes']}/{result['count']}")
     test_logger.write(f"    Failures:  {result['failures']}/{result['count']}")
     if result.get("latency_mean_s") is not None:
@@ -573,7 +573,7 @@ async def run_test(
         test_logger.write(f"    Errors: {result['failure_errors']}")
     test_logger.write(f"    Stop reasons: {result['stop_reasons']}")
     if "by_model" in result:
-        test_logger.write(f"    Per-model breakdown:")
+        test_logger.write("    Per-model breakdown:")
         for m, stats in result["by_model"].items():
             test_logger.write(
                 f"      {m}: n={stats['count']}, "

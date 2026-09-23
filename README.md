@@ -137,11 +137,42 @@ application minimum.
 
 `python -m acp_proxy` supports the same mandatory options.
 
-## Tests
+## Development and validation
+
+Read [CODING_STANDARDS.md](CODING_STANDARDS.md) before editing. The required
+completion command, ported from Meadow, is:
 
 ```bash
-pip install -e ".[dev]"
-python -m pytest tests/ -v
+python3 scripts/checkout_gate.py
+```
+
+Install `uv` first. The gate synchronizes the locked development dependencies,
+runs strict Mypy and Pyrefly change-relative validation, the complete test suite,
+and Ruff, then verifies that validation left the checkout unchanged. It retains
+full command logs and reports every failed check. `--list` shows its inventory.
+
+Typing compares the working tree (including staged, unstaged, and untracked
+work) with the merge base of `HEAD` and the local `refs/heads/main`. Keep that
+canonical ref available in your clone. New diagnostics and existing diagnostics
+inside changed declarations fail; unchanged diagnostics elsewhere are not a
+checked-in baseline or a claim of repository-wide strict cleanliness.
+
+For focused development after environment setup:
+
+```bash
+uv sync --locked --extra dev
+python3 scripts/typecheck_change.py
+uv run --no-sync --no-env-file ruff check .
+```
+
+An explicit `typecheck_change.py --base <revision>` inspects another comparison
+boundary; it does not replace the full gate. When changing dependencies, update
+`uv.lock` with `uv lock` before running the gate.
+
+### Tests
+
+```bash
+uv run --no-sync --no-env-file pytest tests/ -v
 ```
 
 Integration tests require the `copilot-language-server` binary to be available.
@@ -149,12 +180,15 @@ They **fail** (not skip) if the binary is not found — see
 [ADR-005](adrs/005-fail-loud-testing.md). Run unit tests only with:
 
 ```bash
-python -m pytest tests/test_transport.py tests/test_client.py tests/test_model_binding_order.py tests/test_server.py tests/test_direct_*.py tests/test_discovery.py tests/test_binary_admission.py tests/test_main.py -v
+uv run --no-sync --no-env-file pytest tests/ --ignore=tests/test_integration.py -v
 ```
 The live direct integration probe requires the advertised
 `gpt-5.3-codex` model, proves exact advertised-model binding through the public
 Meadow contract, verifies that its catalog gate rejects an unadvertised
 control, and exercises two turns on one continuity generation.
+It also needs usable cached Copilot authentication. Missing prerequisites fail
+the complete gate; a unit-only run is useful development feedback, not checkout
+completion.
 
 ## Configuration
 

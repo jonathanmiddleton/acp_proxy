@@ -8,6 +8,15 @@ The user's name is Jonathan.
 contains the project's binding standards covering failure handling, error
 surfacing, resilience policy, and testing philosophy.
 
+It also owns the Meadow-derived strong typing, semantic design, and
+test-retention rules. Required completion validation is
+`python3 scripts/checkout_gate.py`; `--list` prints its inventory. The gate
+synchronizes the locked development environment, runs Mypy/Pyrefly
+change-relative validation against `refs/heads/main`, all tests, and Ruff, and
+requires the checkout to remain unchanged. Focused checks do not replace it.
+During development, run `python3 scripts/typecheck_change.py` after bounded
+Python edits. Do not add diagnostic baselines or weaken checks to obtain a pass.
+
 ## Project Overview
 
 This repo owns two explicit inbound contracts over GitHub Copilot's
@@ -75,7 +84,10 @@ The OpenAPI schema is at https://agentclientprotocol.com/api-reference/openapi.j
 - **Integration tests** (`test_integration.py`): Real copilot-language-server. **Fails** (not skips) if binary not found — a missing binary means the environment is misconfigured.
 - **No skips.** Tests must never use `skipif` or `pytest.skip()`. See CODING_STANDARDS.md.
 - Run all: `python -m pytest tests/ -v`
-- Run unit only: `python -m pytest tests/test_transport.py tests/test_raw_events.py tests/test_client.py tests/test_model_binding_order.py tests/test_server.py tests/test_direct_*.py tests/test_discovery.py -v`
+- Run without live Copilot integration: `python -m pytest tests/ --ignore=tests/test_integration.py -v`
+- Validation-driver tests exercise real temporary Git repositories and tool
+  subprocess boundaries; they do not launch Copilot. The complete gate includes
+  them and the live integration suite.
 
 ## Architectural Decisions
 
@@ -99,6 +111,7 @@ particularly the failure modes that motivated each decision.
 | [ADR-014](adrs/014-correlate-direct-session-state.md) | Correlate and validate direct session state without retaining unsupported payloads                         |
 | [ADR-015](adrs/015-order-direct-model-binding-transitions.md) | Bound prior/target model transitions until ordered RPC settlement; preserve exact acknowledgement and post-binding integrity |
 | [ADR-016](adrs/016-opt-in-raw-acp-event-capture.md) | Explicit raw event diagnostics with ordered capture, bounded queues, and visible failures |
+| [ADR-017](adrs/017-change-relative-typing-and-checkout-gate.md) | Meadow-derived typing, complete checkout validation, snapshot isolation, and no-skips enforcement |
 
 The ADRs explain the *why* behind the module ownership rules in the table
 above. A change that contradicts an accepted ADR requires a new ADR

@@ -87,7 +87,6 @@ class AcpProcess:
 
     async def start(self, cwd: str | None = None) -> None:
         """Launch the language server and complete ACP init handshake."""
-        effective_cwd = cwd or os.getcwd()
         logger.info("[%s] Starting: %s", self.label, self._binary_path)
         self._process = await asyncio.create_subprocess_exec(
             self._binary_path,
@@ -142,6 +141,9 @@ class AcpProcess:
         """Create a new ACP session. Returns the session ID."""
         result = await self._send_request("session/new", {"cwd": cwd, "mcpServers": []})
         session_id = result["sessionId"]
+        if not isinstance(session_id, str):
+            logger.debug("[%s] Unexpected session/new result: %r", self.label, result)
+            raise ValueError("Expected session/new to return a string sessionId")
 
         if "models" in result:
             models_data = result["models"]

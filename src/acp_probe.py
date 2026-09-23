@@ -15,12 +15,15 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterable, Mapping
+
+from pydantic import JsonValue
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 from acp_proxy.discovery import find_binary
 
 
-def read_ndjson(stream, label="stdout"):
+def read_ndjson(stream: Iterable[str], label: str = "stdout") -> None:
     """Read NDJSON lines from a stream and print them."""
     for line in stream:
         line = line.strip()
@@ -33,22 +36,23 @@ def read_ndjson(stream, label="stdout"):
             print(f"\n<<< [{label}] (raw) {line}")
 
 
-def send(proc, msg):
+def send(proc: subprocess.Popen[str], msg: Mapping[str, JsonValue]) -> None:
     """Send a JSON-RPC message to the process stdin."""
     payload = json.dumps(msg)
     print(f"\n>>> {json.dumps(msg, indent=2)}")
+    assert proc.stdin is not None
     proc.stdin.write(payload + "\n")
     proc.stdin.flush()
 
 
-def main():
+def main() -> None:
     cls_path = find_binary()
     if not cls_path:
         print("ERROR: No compatible copilot-language-server binary found.")
         print("No named candidate reported the minimum language-server version.")
         sys.exit(1)
 
-    print(f"Starting copilot-language-server in ACP mode...")
+    print("Starting copilot-language-server in ACP mode...")
     print(f"Binary: {cls_path}")
     print()
 

@@ -242,7 +242,7 @@ def main() -> None:
     # Variants
     variants = REFLECTION_VARIANTS
     if args.variants:
-        variants = [(l, t) for l, t in variants if l in args.variants]
+        variants = [(label, text) for label, text in variants if label in args.variants]
 
     for label, injection in variants:
         result = run_variant(http, model, base_url, label, injection)

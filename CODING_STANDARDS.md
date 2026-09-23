@@ -4,6 +4,138 @@ Read this document before making any changes to the codebase. These standards
 are binding and reflect the realities of building on partially documented,
 externally controlled interfaces.
 
+The typing, checkout validation, semantic design, and test-retention rules are
+adapted from the sibling Meadow repository. ACP Proxy's own ADRs remain
+authoritative for its protocols, resource ownership, and failure policy.
+See [ADR-017](adrs/017-change-relative-typing-and-checkout-gate.md) for the
+adoption decision and migration boundary.
+
+## Python and Static Types
+
+- **Python 3.11+** is required. Keep syntax and APIs compatible with that floor.
+- **Type hints everywhere.** Annotate function signatures, return types, and
+  non-trivial local values. Public methods and classes need docstrings.
+- **Pydantic** owns HTTP request/response validation. Internal semantic values
+  use immutable dataclasses or other invariant-owning types.
+- **Validate with Ruff** before committing. `ruff check .` must pass; the
+  repository pins its rule selection in `pyproject.toml`.
+
+### Change-relative static type validation
+
+Every maintained Python change is validated by Mypy in strict mode and Pyrefly.
+The required completion command is:
+
+```bash
+python3 scripts/checkout_gate.py
+```
+
+The gate synchronizes the locked development environment before invoking
+`scripts/typecheck_change.py`. The validator resolves the merge base of `HEAD`
+and the canonical local ref `refs/heads/main`, independent of the current
+branch's upstream. It includes committed branch changes, staged and unstaged
+edits, and untracked Python files. Both checkers compare structured diagnostics
+in cohesive affected scopes at the base and in the working tree, requiring:
+
+- no new checker diagnostics; and
+- no retained diagnostic inside a declaration changed by the work.
+
+Unchanged diagnostics outside changed declarations do not enlarge the task.
+This is a migration rule, not a claim that the entire existing repository is
+already strict-type clean. Comparison is transient: do not add diagnostic
+baselines, per-file allowlists, debt counts, or suppression budgets. Do not
+obtain a pass with `Any`, ignores, unchecked casts, or weaker checker settings.
+Validate and narrow dynamic external values at admission before they enter
+semantic code.
+
+The maintained scope includes `src/`, `tests/`, `scripts/`, and experiment
+Python. Source changes also validate maintained consumers. For focused work,
+run `python3 scripts/typecheck_change.py` after each bounded edit. Its
+`--base <revision>` option deliberately inspects a different boundary; it does
+not replace the complete checkout gate, which always uses `refs/heads/main`.
+
+### Checkout completion
+
+`python3 scripts/checkout_gate.py --list` lists the commands without executing
+them. The complete gate owns locked dependency synchronization, change-relative
+typing, all tests including live integration, repository-wide Ruff, and a final
+content-sensitive checkout-preservation check. Tests run serially so the gate
+does not multiply live Copilot sessions by the machine's CPU count.
+
+Each command retains a full log and reports failure independently. A missing
+tool, binary, credential, or failed check is a failure; a focused or partial
+run is not completion. The gate must not rewrite tracked or untracked work,
+change HEAD, or switch branches. Its disposable logs and ignored caches are
+outside that source-state contract. Update `uv.lock` intentionally when
+changing dependencies; validation uses `uv sync --locked --extra dev`.
+
+## Type-Directed Semantic Design
+
+For changes involving identity, state, ordering, causality, concurrency, or
+durable facts, name the invariants and non-invariants first. Invalid states and
+unauthorized decisions must be inexpressible through the supported public API.
+
+1. **Encode states and authority.** Represent facts, decisions, projections,
+   effects, failures, and material phases as distinct immutable nominal values.
+   Model alternatives as closed unions of variant-specific types and handle
+   them exhaustively with `assert_never`. The owner controls construction;
+   adapters admit external facts and materialize returned effects.
+2. **Make transitions structural.** Express governed behavior as a total or
+   explicitly failing transition over typed inputs. Validation, preparation,
+   execution, and settlement consume only their permitted predecessor states.
+   Live and recovery adapters call the same owning transition; projections,
+   diagnostics, and effect receipts cannot become alternate semantic inputs.
+3. **Keep identity and retained state irreducible.** Prefer an existing domain
+   identity. New identities expose checked construction, equality, hashing,
+   and required boundary serialization, without unrelated primitive behavior.
+   Before adding a durable field, cursor, mirror, or cached relation, show two
+   legal histories that existing facts cannot distinguish but that require
+   different behavior. Otherwise derive it once from the owner.
+4. **Prove residual behavior.** Types do not prove purity, actual I/O, resource
+   settlement, or behavioral equivalence. Use property and integration evidence
+   for those obligations. Remove replaced constructors and alternate decision
+   paths in the same cutover, within the authorized contract.
+
+Keep a functional semantic core and thin imperative shells for I/O and resource
+ownership. Mutable process handles, queues, task registries, and lifecycle
+resources belong to their explicit owners; they are not mutable semantic
+payloads shared across modules. The deprecated OpenCode adapter remains an
+explicit supported contract until an ADR authorizes its removal.
+
+## Module and Code Organisation
+
+- Gather code that changes for the same reasons behind one owning contract.
+  Functions have one responsibility; collaborating modules form cohesive
+  packages with a deliberate public surface.
+- Production package code lives in `src/acp_proxy/`; maintained tests live in
+  `tests/`, validation tools in `scripts/`, and experiments in `experiments/`.
+  The standalone `src/acp_probe.py` and `src/acp_validate.py` diagnostics are
+  not production imports.
+- Follow the module ownership table in `AGENTS.md`. Consumers call the owner's
+  supported API rather than reconstructing its decisions or reading internals.
+- Read relevant ADRs before design changes. A contradictory decision requires
+  a new superseding ADR; passing tests do not authorize a silent deviation.
+
+### Inadmissible design practices
+
+- **Validation outside construction.** Value invariants belong to checked
+  constructors, `__post_init__`, or Pydantic validators, not caller discipline.
+- **Bare mappings across semantic boundaries.** Raw JSON mappings may exist
+  in wire decoders/encoders; normalize them into typed values before crossing
+  into semantic code. A dataclass that only renames an open bag of fields does
+  not establish a domain model.
+- **Redundant semantic state.** Do not retain both a fact and a second writable
+  representation of a value derivable from it, or add agreement checks in
+  place of a single owner and derivation.
+- **Composite construction outside its owner.** Consumers use the owner's
+  checked factories rather than assembling its authoritative raw fields.
+- **Sum types squeezed into records.** Give disjoint states distinct immutable
+  variants carrying exactly their applicable payload. Absence, rejection, and
+  corruption are different states; flags plus optional fields must not permit
+  incoherent combinations.
+- **Ad hoc I/O outside the owning seam.** Transport, authentication, discovery,
+  and HTTP policy stay with their declared owners. Orchestration consumes typed
+  results instead of duplicating their parsing, storage, or resource policy.
+
 ## Failure Philosophy: Surface Problems, Don't Absorb Them
 
 This project operates at boundaries between documented protocols and actual
@@ -110,14 +242,52 @@ expensive.
 
 ## Testing
 
-- Non-trivial changes must be backed by tests.
+- Non-trivial changes require appropriate verification. Identify construction
+  guarantees, existing behavioral coverage, and residual uncertainty before
+  adding permanent tests. Ordinary documentation changes do not need tests.
+- Defect fixes require a reproducer that fails before the fix and passes after.
+  An existing test or temporary probe can supply that development evidence.
 - Integration tests should cover real protocol interactions where feasible.
 - Tests verify behavior, not implementation details.
 - No hardcoded paths, user IDs, or environment-specific values in tests.
+- Prefer property-based tests for meaningful laws and boundaries.
+- Minimize mocks; use them only at genuine I/O boundaries. Exercise actual
+  implementations and assert outcomes rather than internal call sequences.
+- Do not mask infrastructure or upstream failures with test retries, weaker
+  assertions, or repair heuristics. Fix or surface the actual cause.
+
+### Test retention
+
+Correctness begins with owner algorithms, explicit immutable inputs, strong
+types, and construction-enforced invariants. Tests address residual behavioral
+uncertainty. Name the actual type or algorithm and invariant when relying on a
+construction guarantee; an unsupported claim of correctness is not evidence.
+
+- Retain tests with distinct, materially plausible defect-detection value beyond
+  construction, types, and stronger existing coverage. Independent laws, real
+  admission boundaries, and still-possible regressions justify retention.
+- Review tests added or affected by a change and remove low-value scaffolding
+  before completion. Do not retain constructor-argument echoes, incidental
+  field rosters, constant mirrors, or duplicated implementation logic merely
+  because they were written during development.
+- Put temporary reproducers under ignored `tmp/test-probes/<task>/`, outside
+  normal collection, and run them explicitly. Promote them only after a
+  deliberate retention decision; do not move maintained tests to scratch to
+  bypass review.
+- Use actual typed construction in tests. Inspect constructors, protocols, and
+  consumers before edits; supply complete valid resources from the outset.
+  Run the change-relative validator after bounded maintained-test edits.
+- Retirement must preserve required behavior and meaningful observations.
+  Coverage overlap alone does not prove redundancy; do not weaken assertions,
+  hide failures, or narrow the checkout gate to obtain a pass.
+- Explain retention or consolidation by behavioral family in the change
+  description. No separate per-test ledger is required.
 
 ### No Skips
 
-Tests must not use `skipif` or `pytest.skip()`. A test that cannot run is
+Tests must not use `skip`, `skipif`, `importorskip`, or `pytest.skip()` to bypass
+an obligation. `tests/conftest.py` makes collection-time and runtime skips fail
+an otherwise successful pytest run, including focused runs. A test that cannot run is
 asserting that the environment is misconfigured — that assertion should
 surface as a failure, not be silently suppressed.
 
@@ -131,10 +301,11 @@ When a test depends on an external resource (binary, service, credential):
 - Use a fixture that asserts the resource exists and returns it.
 - Do not provide a "success path" that avoids the dependency.
 
-## Python Conventions
+## Concurrency and Resources
 
-- Python 3.11+ required.
-- Type hints on all function signatures and return types.
-- Pydantic for request/response models at HTTP boundaries.
-- Dataclasses for internal data structures.
-- `async/await` throughout — no blocking I/O in the event loop.
+- Use `async/await` for runtime orchestration; no blocking I/O in the event loop.
+- Keep child processes, tasks, queues, callbacks, and shutdown settlement with
+  their declared owners. Async code can interleave at every `await`; do not
+  assume a single event loop makes a multi-step transition atomic.
+- Preserve bounded resource lifetimes, ordered terminal signaling, and explicit
+  failure reporting required by the relevant ACP Proxy ADRs.

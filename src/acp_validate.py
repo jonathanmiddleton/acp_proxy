@@ -12,17 +12,25 @@ If no path is given, attempts to find the binary via 'ps'.
 """
 
 import json
+import logging
 import subprocess
 import sys
 import threading
 import time
 import os
+from collections.abc import Iterable, Mapping
+
+from pydantic import JsonValue
+
+
+MessageLog = list[tuple[str, object]]
+logger = logging.getLogger(__name__)
 
 # Collect all streamed updates here
-UPDATES = []
+UPDATES: MessageLog = []
 
 
-def find_binary():
+def find_binary() -> str | None:
     """Try to locate a running copilot-language-server process."""
     try:
         out = subprocess.check_output(
@@ -38,26 +46,29 @@ def find_binary():
     return None
 
 
-def read_ndjson(stream, collected, label="out"):
+def read_ndjson(
+    stream: Iterable[str], collected: MessageLog, label: str = "out"
+) -> None:
     """Read NDJSON lines from a stream into collected list."""
     for line in stream:
         line = line.strip()
         if not line:
             continue
         try:
-            msg = json.loads(line)
-            collected.append((label, msg))
+            decoded: object = json.loads(line)
+            collected.append((label, decoded))
         except json.JSONDecodeError:
             collected.append((label, {"_raw": line}))
 
 
-def send(proc, msg):
+def send(proc: subprocess.Popen[str], msg: Mapping[str, JsonValue]) -> None:
     """Send a JSON-RPC message."""
+    assert proc.stdin is not None
     proc.stdin.write(json.dumps(msg) + "\n")
     proc.stdin.flush()
 
 
-def drain(collected, timeout=3.0):
+def drain(collected: MessageLog, timeout: float = 3.0) -> MessageLog:
     """Wait for messages to arrive, return them, and clear the buffer."""
     time.sleep(timeout)
     result = list(collected)
@@ -65,25 +76,57 @@ def drain(collected, timeout=3.0):
     return result
 
 
-def find_response(messages, req_id):
+def find_response(messages: MessageLog, req_id: int) -> dict[str, object] | None:
     """Find the JSON-RPC response matching a request id."""
     for _, msg in messages:
-        if isinstance(msg, dict) and msg.get("id") == req_id:
-            return msg
+        if isinstance(msg, dict):
+            response = _as_object(msg)
+            if response.get("id") == req_id:
+                return response
     return None
 
 
-def find_notifications(messages, method=None):
+def find_notifications(
+    messages: MessageLog, method: str | None = None
+) -> list[dict[str, object]]:
     """Find all JSON-RPC notifications (no 'id' field)."""
-    results = []
+    results: list[dict[str, object]] = []
     for _, msg in messages:
         if isinstance(msg, dict) and "id" not in msg:
-            if method is None or msg.get("method") == method:
-                results.append(msg)
+            notification = _as_object(msg)
+            if method is None or notification.get("method") == method:
+                results.append(notification)
     return results
 
 
-def main():
+def _as_object(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        logger.debug("Expected a JSON object, received %r", value)
+        raise ValueError(f"Expected a JSON object, received {type(value).__name__}")
+    result: dict[str, object] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            logger.debug("Expected a JSON object with string keys, received %r", value)
+            raise ValueError("Expected a JSON object with string keys")
+        result[key] = item
+    return result
+
+
+def _as_list(value: object) -> list[object]:
+    if not isinstance(value, list):
+        logger.debug("Expected a JSON array, received %r", value)
+        raise ValueError(f"Expected a JSON array, received {type(value).__name__}")
+    return value
+
+
+def _as_string(value: object) -> str:
+    if not isinstance(value, str):
+        logger.debug("Expected a JSON string, received %r", value)
+        raise ValueError(f"Expected a JSON string, received {type(value).__name__}")
+    return value
+
+
+def main() -> None:
     binary = sys.argv[1] if len(sys.argv) > 1 else find_binary()
     if not binary:
         print("ERROR: Could not find copilot-language-server.")
@@ -94,7 +137,7 @@ def main():
     print(f"CWD:    {os.getcwd()}")
     print()
 
-    collected = []
+    collected: MessageLog = []
 
     proc = subprocess.Popen(
         [binary, "--acp", "--stdio"],
@@ -138,18 +181,19 @@ def main():
     msgs = drain(collected, 2)
     resp = find_response(msgs, 1)
     if resp and "result" in resp:
-        r = resp["result"]
-        info = r.get("agentInfo", {})
-        caps = r.get("agentCapabilities", {})
-        methods = r.get("authMethods", [])
+        r = _as_object(resp["result"])
+        info = _as_object(r.get("agentInfo", {}))
+        caps = _as_object(r.get("agentCapabilities", {}))
+        prompt_caps = _as_object(caps.get("promptCapabilities", {}))
+        methods = _as_list(r.get("authMethods", []))
         print(f"  Agent:       {info.get('name')} v{info.get('version')}")
         print(f"  Protocol:    {r.get('protocolVersion')}")
         print(
             f"  Capabilities: loadSession={caps.get('loadSession')}, "
-            f"image={caps.get('promptCapabilities', {}).get('image')}, "
-            f"embeddedContext={caps.get('promptCapabilities', {}).get('embeddedContext')}"
+            f"image={prompt_caps.get('image')}, "
+            f"embeddedContext={prompt_caps.get('embeddedContext')}"
         )
-        print(f"  Signin methods: {[m.get('id') for m in methods]}")
+        print(f"  Signin methods: {[_as_object(m).get('id') for m in methods]}")
         results["init"] = "OK"
     elif resp and "error" in resp:
         print(f"  ERROR: {resp['error']}")
@@ -181,17 +225,18 @@ def main():
     resp = find_response(msgs, 2)
     session_id = None
     if resp and "result" in resp:
-        r = resp["result"]
+        r = _as_object(resp["result"])
         session_id = r.get("sessionId")
-        models = r.get("models", {}).get("availableModels", [])
-        current = r.get("models", {}).get("currentModelId")
-        modes = r.get("modes", {}).get("availableModes", [])
+        model_state = _as_object(r.get("models", {}))
+        models = _as_list(model_state.get("availableModels", []))
+        current = model_state.get("currentModelId")
+        modes = _as_list(_as_object(r.get("modes", {})).get("availableModes", []))
         print(f"  Session ID:  {session_id}")
         print(
-            f"  Models ({len(models)}): {[m['modelId'] for m in models[:5]]}{'...' if len(models) > 5 else ''}"
+            f"  Models ({len(models)}): {[_as_object(m)['modelId'] for m in models[:5]]}{'...' if len(models) > 5 else ''}"
         )
         print(f"  Default model: {current}")
-        print(f"  Modes:       {[m['id'].split('#')[-1] for m in modes]}")
+        print(f"  Modes:       {[_as_string(_as_object(m)['id']).split('#')[-1] for m in modes]}")
         results["session"] = "OK"
     elif resp and "error" in resp:
         print(f"  ERROR: {resp['error']}")
@@ -205,6 +250,7 @@ def main():
         print("No session. Exiting.")
         proc.terminate()
         sys.exit(1)
+    session_id = _as_string(session_id)
 
     # --- Step 3: session/prompt ---
     print("=" * 50)
@@ -233,17 +279,17 @@ def main():
     thought_text = ""
     update_types = set()
     for n in notifs:
-        u = n.get("params", {}).get("update", {})
-        kind = u.get("sessionUpdate", "")
+        u = _as_object(_as_object(n.get("params", {})).get("update", {}))
+        kind = _as_string(u.get("sessionUpdate", ""))
         update_types.add(kind)
         if kind == "agent_message_chunk":
-            content = u.get("content", {})
+            content = _as_object(u.get("content", {}))
             if content.get("type") == "text":
-                agent_text += content.get("text", "")
+                agent_text += _as_string(content.get("text", ""))
         elif kind == "agent_thought_chunk":
-            content = u.get("content", {})
+            content = _as_object(u.get("content", {}))
             if content.get("type") == "text":
-                thought_text += content.get("text", "")
+                thought_text += _as_string(content.get("text", ""))
 
     print(f"  Updates received: {len(notifs)}")
     print(f"  Update types:     {sorted(update_types)}")
@@ -254,13 +300,13 @@ def main():
         )
     print(f"  Agent response:   {agent_text[:500]}")
     if resp and "result" in resp:
-        print(f"  Stop reason:      {resp['result'].get('stopReason')}")
+        print(f"  Stop reason:      {_as_object(resp['result']).get('stopReason')}")
         results["prompt"] = "OK"
     elif resp and "error" in resp:
         print(f"  ERROR: {resp['error']}")
         results["prompt"] = "FAIL"
     else:
-        print(f"  No final response yet (may need more time)")
+        print("  No final response yet (may need more time)")
         results["prompt"] = "PARTIAL"
     print()
 

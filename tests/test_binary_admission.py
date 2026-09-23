@@ -309,10 +309,8 @@ def test_version_probe_rejects_output_flood_without_retaining_it(
         ),
     )
 
-    started = time.monotonic()
     with pytest.raises(BinaryCompatibilityError) as exc_info:
         _probe_binary_version(binary)
-    elapsed = time.monotonic() - started
     assert "safety limit" in str(exc_info.value)
     assert "x" * 20 not in str(exc_info.value)
 
@@ -360,10 +358,8 @@ def test_version_probe_timeout_is_sanitized_and_kills_posix_descendants(
         ),
     )
 
-    started = time.monotonic()
     with pytest.raises(BinaryCompatibilityError) as exc_info:
         _read_bounded_version_output(binary, timeout_s=0.05)
-    elapsed = time.monotonic() - started
 
     assert "timed out" in str(exc_info.value)
     assert canary not in str(exc_info.value)

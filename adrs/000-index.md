@@ -29,3 +29,4 @@ See [GUIDE.md](GUIDE.md) for how and when to write ADRs.
 ## Testing and quality
 
 - [ADR-005: Fail-Loud Testing — No Skips](005-fail-loud-testing.md)
+- [ADR-017: Change-Relative Typing and a Complete Checkout Gate](017-change-relative-typing-and-checkout-gate.md)
