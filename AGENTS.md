@@ -88,29 +88,27 @@ The OpenAPI schema is at https://agentclientprotocol.com/api-reference/openapi.j
 ## Architectural Decisions
 
 **Read the relevant ADRs before making any architectural or design change.**
-They document the binding decisions and the empirical evidence behind them —
-particularly the failure modes that motivated each decision.
+They document current binding decisions and their empirical basis. Historical
+rows retain evidence only; the listed superseding ADR governs current behavior.
 
 | ADR                                                 | Decision                                                                                                      |
 |-----------------------------------------------------|---------------------------------------------------------------------------------------------------------------|
 | [ADR-001](adrs/001-acp-proxy-architecture.md)       | Historical adapter architecture; removed by ADR-018                                   |
-| [ADR-002](adrs/002-session-per-conversation.md)     | Session-per-conversation via first-message hash (why sessions are keyed this way)                             |
-| [ADR-003](adrs/003-system-prompt-injection.md)      | System prompt injection as primary control surface (why and how it works)                                     |
-| [ADR-004](adrs/004-last-user-message-extraction.md) | Extract only the last user message (why full history replay causes duplication)                               |
+| [ADR-002](adrs/002-session-per-conversation.md)     | Historical first-message-hash session identity; removed by ADR-018                             |
+| [ADR-003](adrs/003-system-prompt-injection.md)      | Historical proxy-authored system prompt injection; removed by ADR-018                                     |
+| [ADR-004](adrs/004-last-user-message-extraction.md) | Historical last-user-message extraction; removed by ADR-018                               |
 | [ADR-005](adrs/005-fail-loud-testing.md)            | Fail-loud testing — no skips (why skips are banned, what they masked)                                         |
 | [ADR-006](adrs/006-binary-discovery.md)             | Version-bounded JetBrains binary discovery and wrong-binary failure evidence                     |
-| [ADR-007](adrs/007-tool-ownership.md)               | The ACP server owns tools — do not inject or override (protocol constraint, empirical evidence)               |
-| [ADR-008](adrs/008-proxy-as-substrate.md)           | Proxy as substrate — installable command, cwd as workspace                                                    |
+| [ADR-007](adrs/007-tool-ownership.md)               | ACP agent tool ownership retained; ADR-018 removes permissive callbacks and retains direct denial               |
+| [ADR-008](adrs/008-proxy-as-substrate.md)           | Installable command and cwd workspace retained; ADR-018 removes OpenCode startup, ADR-019 owns Meadow Bridge identity                                                    |
 | [ADR-009](adrs/009-intra-process-session-scaling.md)| Retained scaling evidence; direct pool/affinity clauses superseded                                            |
 | [ADR-011](adrs/011-context-injection-boundary.md)   | Historical context-injection boundary; removed by ADR-018                                                                 |
-| [ADR-012](adrs/012-meadow-direct-consumer-protocol.md) | Authenticated direct protocol, migration, lifecycle, evidence, and authority policy                       |
+| [ADR-012](adrs/012-meadow-direct-consumer-protocol.md) | Authenticated direct lifecycle, evidence and authority; ADR-018 removes dual-mode provisions                       |
 | [ADR-014](adrs/014-correlate-direct-session-state.md) | Correlate and validate direct session state without retaining unsupported payloads                         |
 | [ADR-015](adrs/015-order-direct-model-binding-transitions.md) | Bound prior/target model transitions until ordered RPC settlement; preserve exact acknowledgement and post-binding integrity |
 | [ADR-016](adrs/016-opt-in-raw-acp-event-capture.md) | Explicit raw event diagnostics with ordered capture, bounded queues, and visible failures |
 | [ADR-017](adrs/017-change-relative-typing-and-checkout-gate.md) | Meadow-derived typing, complete checkout validation, snapshot isolation, and no-skips enforcement |
-
 | [ADR-018](adrs/018-remove-openai-compatible-adapter.md) | Remove the deprecated adapter and consumer-mode selector; retain direct ACP semantics |
-
 | [ADR-019](adrs/019-meadow-bridge-product-identity.md) | Meadow Bridge identity; direct ACP wire contract retained |
 
 The ADRs explain the *why* behind the module ownership rules in the table
