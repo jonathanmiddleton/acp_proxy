@@ -29,6 +29,7 @@ URL_USERINFO = re.compile(r"(https?://)[^/\s@]+@", re.I)
 SECRET_NAME = re.compile(r"TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTHORIZATION|API_KEY", re.I)
 TOKEN_PATTERN = re.compile(r"(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|Bearer\s+[^\s\"']+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)", re.I)
 SETTINGS = {"telemetry": {"telemetryLevel": "off"}, "github": {"copilot": {
+    "mcp": "{}",
     "enableBuiltInGitHubMcpServer": False,
 }}}
 
@@ -225,6 +226,7 @@ class NativeClient:
         self.fatal: ProtocolError | None = None
         self.exiting = False
         self.mcp_catalog_seen = False
+        self.mcp_catalog_snapshots: dict[str, Any] = {}
         self.lock = asyncio.Lock()
         self.reader = asyncio.create_task(self.read_loop())
         self.stderr = asyncio.create_task(self.drain_stderr())
@@ -266,6 +268,13 @@ class NativeClient:
 
     async def notify(self, method: str, params: Any = None) -> None:
         await self.send({"jsonrpc": "2.0", "method": method, **({"params": params} if params is not None else {})})
+
+    async def check_mcp_catalog(self, stage: str) -> None:
+        # A disabled manager may never emit its change notification. This
+        # read-only request snapshots the same catalog without starting servers.
+        catalog = await self.request("mcp/getTools", {})
+        self.mcp_catalog_snapshots[stage] = catalog
+        require(isinstance(catalog, list) and not catalog, "Nonempty/unrecognized MCP server catalog")
 
     def begin_turn(self, token: str) -> None:
         require(self.active_token is None and token not in self.turns, "Concurrent/repeated turn token")
@@ -541,6 +550,8 @@ async def run(args: argparse.Namespace, output: Path, result: dict[str, Any]) ->
                     "editorInfo": {"name": "Native IDE smoke diagnostic", "version": "1.0"}, "editorPluginInfo": {"name": "acp-proxy diagnostic", "version": "1.0"}}})
             await client.notify("initialized", {})
             await client.notify("workspace/didChangeConfiguration", {"settings": SETTINGS})
+            result["phase"] = "mcp_catalog_before"
+            await client.check_mcp_catalog("before")
             result["phase"] = "model_catalog"
             catalog = await client.request("copilot/models", {})
             require(isinstance(catalog, list) and all(isinstance(model, dict) and isinstance(model.get("id"), str) for model in catalog), "Unrecognized advertised model catalog")
@@ -598,6 +609,8 @@ async def run(args: argparse.Namespace, output: Path, result: dict[str, Any]) ->
                                       "execution_receipt": effects.receipt, "continuity_marker_recalled": True}
                 result["phase"] = "destroy"
                 require(await client.request("conversation/destroy", {"conversationId": first["conversationId"]}, timeout=15) == "OK", "Conversation destroy did not return OK")
+            result["phase"] = "mcp_catalog_after"
+            await client.check_mcp_catalog("after")
             result["phase"] = "shutdown"
             await client.settle_callbacks()
             await client.request("shutdown", timeout=15)
@@ -607,10 +620,9 @@ async def run(args: argparse.Namespace, output: Path, result: dict[str, Any]) ->
             require(process.returncode == 0, "Language-server did not exit cleanly")
             await asyncio.wait_for(asyncio.gather(client.reader, client.stderr), 5)
             require(client.fatal is None and not client.pending and not client.callbacks, "Transport/callbacks did not settle cleanly")
+            result["phase"] = "verify_controls"
             guard_log = output / "cli-guard.log"
             require(not guard_log.exists() or not guard_log.read_bytes(), "A prohibited CLI PATH guard was invoked")
-            result["controls"]["empty_mcp_catalog_observed"] = client.mcp_catalog_seen
-            require(args.list_models or client.mcp_catalog_seen, "No empty MCP server catalog was observed")
             result["status"] = "catalog_only" if args.list_models else "PASS"
             result["phase"] = "complete"
         except BaseException as exc:
@@ -643,7 +655,11 @@ async def run(args: argparse.Namespace, output: Path, result: dict[str, Any]) ->
                 result["effect_phase"] = effects.phase
                 result["observed_callbacks"] = effects.calls
             if client is not None:
-                result["controls"]["empty_mcp_catalog_observed"] = client.mcp_catalog_seen
+                result["controls"].update({
+                    "empty_mcp_catalog_observed": client.mcp_catalog_seen or any(value == [] for value in client.mcp_catalog_snapshots.values()),
+                    "empty_mcp_catalog_notification_observed": client.mcp_catalog_seen,
+                    "mcp_catalog_snapshots": client.mcp_catalog_snapshots,
+                })
             result["cli_guard_invoked"] = (output / "cli-guard.log").exists()
             result.update(redact(result, secrets))
     result["cleanup"]["temporary_credentials_removed"] = not Path(temporary).exists()

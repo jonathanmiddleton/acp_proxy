@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import os
 import shlex
+import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 from hypothesis import HealthCheck, given, settings
@@ -23,6 +25,105 @@ from acp_proxy.discovery import (
     parse_copilot_language_server_version,
     require_compatible_binary,
 )
+
+
+class _WindowsProbeProcess:
+    """External process boundary with observable termination and reaping."""
+
+    pid = 123
+
+    def __init__(self, returncode: int | None = None) -> None:
+        self.returncode = returncode
+        self.killed = False
+        self.reaped = False
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -1
+
+    def wait(self, timeout: float | None = None) -> int:
+        assert self.returncode is not None, "A live probe must be stopped before reaping"
+        self.reaped = True
+        return self.returncode
+
+
+@pytest.fixture
+def windows_probe_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Replace this module's OS boundary, not the process-global os.name.
+    monkeypatch.setattr(
+        discovery,
+        "os",
+        SimpleNamespace(
+            name="nt",
+            environ={"PATH": "probe-path", "ACP_PROXY_MEADOW_SECRET": "credential-canary"},
+        ),
+    )
+
+
+@pytest.mark.parametrize("duration_s", [2.0, 9.5])
+def test_windows_probe_tree_cleanup_allows_slow_bounded_taskkill(
+    duration_s: float,
+    windows_probe_cleanup: None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    process = _WindowsProbeProcess()
+
+    def run_taskkill(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        assert command == ["taskkill", "/PID", str(process.pid), "/T", "/F"]
+        assert kwargs["env"] == {"PATH": "probe-path"}
+        timeout = kwargs["timeout"]
+        assert 0 < timeout <= 10.0
+        if duration_s > timeout:
+            raise subprocess.TimeoutExpired(command, timeout)
+        process.returncode = 0
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(discovery.subprocess, "run", run_taskkill)
+
+    discovery._terminate_probe_process_group(cast(subprocess.Popen[bytes], process))
+
+    assert process.reaped
+    assert not process.killed
+    assert not caplog.records
+
+
+@pytest.mark.parametrize("already_exited", [False, True])
+@pytest.mark.parametrize("failure", ["timeout", "launch"])
+def test_windows_probe_tree_cleanup_failure_is_sanitized_and_reaps_leader(
+    failure: str,
+    already_exited: bool,
+    windows_probe_cleanup: None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    process = _WindowsProbeProcess(returncode=0 if already_exited else None)
+    canary = "PRIVATE_PROCESS_DETAILS_MUST_NOT_SURFACE"
+
+    def run_taskkill(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(canary, kwargs["timeout"], output=canary)
+        raise OSError(canary)
+
+    monkeypatch.setattr(discovery.subprocess, "run", run_taskkill)
+
+    discovery._terminate_probe_process_group(cast(subprocess.Popen[bytes], process))
+
+    assert process.reaped
+    assert process.killed is not already_exited
+    assert canary not in caplog.text
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    if failure == "timeout":
+        assert "timed out" in message
+        assert "10" in message
+        assert "could not start" not in message
+    else:
+        assert "could not start" in message
+        assert "timed out" not in message
 
 
 def _executable(path: Path) -> str:

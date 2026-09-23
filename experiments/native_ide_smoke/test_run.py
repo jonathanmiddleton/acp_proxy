@@ -212,6 +212,73 @@ send({"jsonrpc": "2.0", "id": request["id"], "result": dict(base, modelName="tes
 """
 
 
+_MCP_PEER = r"""
+import json, sys
+def send(value):
+    body = json.dumps(value).encode()
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+    sys.stdout.buffer.flush()
+while True:
+    header = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            sys.exit(0)
+        if line == b"\r\n":
+            break
+        key, value = line.decode().split(":", 1)
+        header[key.lower()] = value.strip()
+    request = json.loads(sys.stdin.buffer.read(int(header["content-length"])))
+    assert request["method"] == "mcp/getTools" and request["params"] == {}
+    if sys.argv[1] == "notification":
+        send({"jsonrpc": "2.0", "method": "copilot/mcpTools", "params": {"servers": [{"name": "unexpected"}]}})
+    response = {"jsonrpc": "2.0", "id": request["id"]}
+    response.update(json.loads(sys.argv[2]))
+    send(response)
+"""
+
+
+class McpCatalogTests(unittest.IsolatedAsyncioTestCase):
+    async def exercise_catalog(self, response: dict, *, notification: bool = False, accepted: bool = False) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            effects = probe.Effects(Path(tmp), dict(os.environ), "offline")
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, "-u", "-c", _MCP_PEER,
+                "notification" if notification else "silent", json.dumps(response),
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            client = probe.NativeClient(process, lambda *_: None, effects)
+            try:
+                if accepted:
+                    await asyncio.wait_for(client.check_mcp_catalog("before"), timeout=3)
+                    await asyncio.wait_for(client.check_mcp_catalog("after"), timeout=3)
+                    self.assertEqual(client.mcp_catalog_snapshots, {"before": [], "after": []})
+                    self.assertFalse(client.mcp_catalog_seen)
+                else:
+                    with self.assertRaises(probe.ProtocolError):
+                        await asyncio.wait_for(client.check_mcp_catalog("before"), timeout=3)
+            finally:
+                await client.close()
+                if process.returncode is None:
+                    process.kill()
+                await process.wait()
+
+    async def test_explicit_empty_snapshots_need_no_change_notification(self) -> None:
+        await self.exercise_catalog({"result": []}, accepted=True)
+
+    async def test_nonempty_or_malformed_snapshot_is_rejected(self) -> None:
+        for catalog in ([{"name": "unexpected", "status": "stopped"}], {"servers": []}, None):
+            with self.subTest(catalog=catalog):
+                await self.exercise_catalog({"result": catalog})
+
+    async def test_unavailable_catalog_method_is_not_assumed_empty(self) -> None:
+        await self.exercise_catalog({"error": {"code": -32601, "message": "Method not found"}})
+
+    async def test_empty_snapshot_cannot_hide_nonempty_notification(self) -> None:
+        await self.exercise_catalog({"result": []}, notification=True)
+
+
 class TransportFailureTests(unittest.IsolatedAsyncioTestCase):
     async def exercise_peer(self, mode: str) -> None:
         with tempfile.TemporaryDirectory() as tmp:

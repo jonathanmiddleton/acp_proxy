@@ -31,6 +31,7 @@ _VERSION_PATTERN = re.compile(
     r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
 )
 _VERSION_PROBE_TIMEOUT_S = 10
+_WINDOWS_PROBE_TERMINATION_TIMEOUT_S = 10.0
 _VERSION_OUTPUT_LIMIT_BYTES = 256
 _VERSION_PROBE_ENV_KEYS = frozenset(
     {
@@ -113,10 +114,15 @@ def _terminate_probe_process_group(process: subprocess.Popen[bytes]) -> None:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 env=_version_probe_env(dict(os.environ)),
-                timeout=1.0,
+                timeout=_WINDOWS_PROBE_TERMINATION_TIMEOUT_S,
             )
-        except (OSError, subprocess.TimeoutExpired):
-            logger.warning("Windows probe process-tree termination was unavailable")
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "Windows probe process-tree termination timed out after %.1f seconds",
+                _WINDOWS_PROBE_TERMINATION_TIMEOUT_S,
+            )
+        except OSError:
+            logger.warning("Windows probe process-tree termination could not start")
         if process.poll() is None:
             process.kill()
     else:
