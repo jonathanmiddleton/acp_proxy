@@ -11,6 +11,9 @@ Meadow ───────────────→ ACP Proxy `/meadow/v1` �
 OpenCode (deprecated) → ACP Proxy `/v1` ─────────→ copilot-language-server
 ```
 
+Current architecture decisions, candidate designs and diagnostic evidence are
+linked from the [documentation index](docs/INDEX.md).
+
 ## Dependencies
 
 ### Runtime dependencies (Python)
