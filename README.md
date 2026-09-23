@@ -1,15 +1,15 @@
 # ACP Proxy
 
-Exposes GitHub Copilot's `copilot-language-server` ACP interface through two
-explicitly selected HTTP contracts:
-
-- an authenticated, stateful `/meadow/v1` protocol for direct Meadow use;
-- a deprecated OpenAI-compatible `/v1` adapter for stock OpenCode.
+Connects Meadow to the installed GitHub Copilot `copilot-language-server`
+through its ACP interface and the authenticated `/meadow/v1` HTTP contract.
 
 ```
-Meadow ───────────────→ ACP Proxy `/meadow/v1` ─→ copilot-language-server
-OpenCode (deprecated) → ACP Proxy `/v1` ─────────→ copilot-language-server
+Meadow → ACP Proxy `/meadow/v1` → copilot-language-server (ACP)
 ```
+
+Copilot owns model access, authentication refresh, and agent-internal tools.
+The service owns its child process, explicit sessions and operations, bounded
+admission, and settlement evidence. It does not implement the native IDE backend.
 
 ## Dependencies
 
@@ -17,7 +17,7 @@ OpenCode (deprecated) → ACP Proxy `/v1` ─────────→ copilot
 
 Installed automatically via `pip install`:
 
-- **FastAPI** — HTTP server exposing OpenAI-compatible endpoints
+- **FastAPI** — HTTP server exposing the authenticated direct protocol
 - **Uvicorn** — ASGI server
 - **Pydantic** — Request/response validation
 
@@ -28,14 +28,8 @@ These must be present in the environment before using the proxy.
 | Dependency                                                | Suggested install                                                     | Purpose                                                                         |
 |-----------------------------------------------------------|-----------------------------------------------------------------------|---------------------------------------------------------------------------------|
 | **Python 3.11+**                                          | System package manager                                                | Runtime for the proxy itself                                                    |
-| **Node.js / npm**                                         | System package manager                                                | Required only for deprecated OpenCode compatibility                             |
-| **[OpenCode](https://opencode.ai)**                       | `npm i -g opencode-ai@latest`                                         | Optional legacy consumer                                                        |
 | **JetBrains IDE with GitHub Copilot plugin** (`copilot-language-server` meeting the configured minimum) | JetBrains Toolbox or standalone installer; plugin via IDE marketplace | Provides the version-admitted ACP binary and cached Copilot authentication |
 | **GitHub Copilot subscription**                           | Signed in via the JetBrains plugin                                    | The proxy uses the cached OAuth token at `~/.config/github-copilot/`            |
-
-Alternative installation paths exist for OpenCode (building from source, other
-package managers) and for the Copilot plugin (VS Code, Neovim). The versions
-above are tested and known to work together.
 
 ## Install
 
@@ -49,7 +43,7 @@ pip install -e ".[dev]"
 
 ## Run
 
-### Meadow direct mode
+### Authenticated direct service
 
 The managed Meadow launcher generates the launch secret and passes it to both
 processes without logging it. For an external trusted-host deployment, provide
@@ -59,7 +53,6 @@ an equivalent pre-shared value through a secret manager, then bind loopback:
 cd ~/projects/my-app
 export ACP_PROXY_MEADOW_SECRET='<at-least-32-secret-bytes>'
 acp-proxy \
-  --consumer-mode meadow-direct \
   --execution-authority trusted-host
 ```
 
@@ -74,9 +67,8 @@ The response identifies the protocol major, continuity generation, canonical
 workspace, exact model catalog, execution authority, resource limits, evidence
 support, and underlying ACP capabilities. Every mutation pins that generation
 and uses explicit logical-session, invocation, and operation IDs.
-Only `/meadow/v1/*` performs direct work. `/v1/*` exists in this mode solely as
-an unauthenticated `410 legacy_mode_required` migration response for a
-misconfigured stock OpenCode process; it cannot reach ACP.
+Only `/meadow/v1/*` performs consumer work. The OpenAI-compatible adapter and
+its `/v1/*` routes have been removed.
 
 `confined-container` may bind `0.0.0.0` only inside an actual container runtime
 with both the runtime marker and the managed launch attestation
@@ -102,20 +94,6 @@ as normalized token counters. Recognized state updates outside a prompt are
 boundedly correlated, structurally validated and logged, then discarded unless
 they enforce the acknowledged model.
 
-### Deprecated OpenCode compatibility
-
-Stock OpenCode remains available only through an explicit legacy mode during
-the 0.2.x release line:
-
-```bash
-cd ~/projects/my-app
-acp-proxy --consumer-mode opencode-legacy
-```
-
-Configure OpenCode with the provided `opencode.json`, then start `opencode`.
-Legacy mode is removed in 0.3.0. Direct and legacy endpoints reject each
-other's traffic rather than guessing caller semantics.
-
 The current working directory (or `--cwd`) becomes the ACP workspace.
 
 The proxy combines named candidates from running processes with a recursive
@@ -124,11 +102,10 @@ server versions below `MIN_COPILOT_LANGUAGE_SERVER_VERSION` in
 `application_policy.py`, and deterministically selects the highest admitted
 version (using canonical path as the stable tie-break). IDE product,
 release, plugin layout, and bundled architecture are not compatibility
-evidence. This minimum is global: deprecated legacy mode does not admit an
-older binary. To specify the path explicitly:
+evidence. To specify the path explicitly:
 
 ```bash
-acp-proxy --consumer-mode opencode-legacy --binary /path/to/copilot-language-server
+acp-proxy --execution-authority trusted-host --binary /path/to/copilot-language-server
 ```
 
 `--binary` bypasses candidate discovery only. The selected executable must
@@ -199,16 +176,15 @@ On first run, the proxy creates a default config at `~/.acp_proxy/config.json`:
   "_doc": "ACP Proxy configuration. See README.md for details.",
   "https_proxy": "",
   "http_proxy": "",
-  "no_proxy": "localhost,127.0.0.1",
-  "context_files": ["AGENTS.md", "CLAUDE.md", "COPILOT-INSTRUCTIONS.md"]
+  "no_proxy": "localhost,127.0.0.1"
 }
 ```
 
 ### Proxy settings
 
-In corporate environments, the `copilot-language-server` needs proxy
-settings to reach `api.github.com`. Edit `https_proxy` and `http_proxy`
-with your corporate proxy URL (e.g., `"http://proxy-host:port"`).
+When the language server needs an HTTP network proxy, configure
+`https_proxy` and `http_proxy` with its URL (for example,
+`"http://proxy-host:port"`).
 
 The proxy injects these into the language server subprocess environment
 only — the global environment is not modified. Shell environment variables
@@ -223,7 +199,7 @@ The proxy forwards every environment variable whose name begins with `GH` or
 forwarded. Names are matched case-insensitively for stable Windows behavior,
 and no aliases are synthesized.
 
-For `meadow-direct` CLI startup, an explicit non-empty `GH_COPILOT_TOKEN` or
+For CLI startup, an explicit non-empty `GH_COPILOT_TOKEN` or
 `GITHUB_COPILOT_TOKEN` remains authoritative. If neither is set, the proxy
 loads the single prior OAuth `accessToken` from the GitHub Copilot
 `oauth.json` file and supplies it to the child as `GITHUB_COPILOT_TOKEN`.
@@ -234,37 +210,12 @@ Windows uses `%LOCALAPPDATA%\github-copilot\oauth.json` (with the conventional
 to these verified Windows and macOS layouts; other platforms must use one of
 the explicit token variables. The file must contain exactly one OAuth account
 so the proxy never guesses between identities. Authority and endpoint routing
-remain owned by the surrounding `GH*`/`GITHUB*` environment and the company's
-proxy setup; those values are forwarded unchanged. Missing, malformed, empty,
+remain owned by the surrounding `GH*`/`GITHUB*` environment and network
+proxy settings; those values are forwarded unchanged. Missing, malformed, empty,
 or ambiguous credentials stop startup before the language server is launched.
 Credential values are never logged, and the language server remains
 responsible for exchanging the durable OAuth credential for and refreshing its
 short-lived Copilot service token.
-
-### Legacy context injection
-
-Only `opencode-legacy` mode injects workspace markdown files into the system
-prompt for each ACP session. The `context_files` list controls which files
-are scanned in the workspace (`--cwd`). Files that don't exist are silently
-skipped — a generous default list works across different repos.
-
-To customize, edit `context_files` in the config:
-
-```json
-{
-  "context_files": ["AGENTS.md", "CODING_STANDARDS.md", "docs/ARCHITECTURE.md"]
-}
-```
-
-To disable auto-injection entirely: `"context_files": []`
-
-If `--system-prompt` is also provided, the explicit prompt comes first
-(positional priority) and context files are appended after a separator.
-
-The proxy logs estimated token counts for the composed prompt at startup
-and per request. These are estimates (~4 chars/token) — actual usage is
-higher because Copilot's backend injects its own system prompt, safety
-policies, and tool definitions that we cannot observe.
 
 ## ACP Specification
 
@@ -281,21 +232,17 @@ Key references: [session setup](https://agentclientprotocol.com/protocol/session
 
 | Flag              | Default           | Description                                                                    |
 |-------------------|-------------------|--------------------------------------------------------------------------------|
-| `--consumer-mode` | required          | `meadow-direct` or deprecated `opencode-legacy`; never inferred                |
 | `--binary`        | auto-discovered   | Path to `copilot-language-server`                                              |
 | `--host`          | 127.0.0.1         | Address on which the HTTP server listens                                       |
 | `--port`          | 8765              | Port for the HTTP server                                                       |
 | `--cwd`           | current directory | Working directory for ACP sessions (default: `cwd` where acp_proxy is executed |
-| `--log-level`     | DEBUG             | DEBUG, INFO, WARNING, ERROR (DEBUG default during development phase)            |
+| `--log-level`     | WARNING           | DEBUG, INFO, WARNING, ERROR; environment override supported            |
 | `--log-file`      | logs/proxy.log    | Log file path (always DEBUG level)                                             |
 | `--raw-event-file` | disabled        | Separate opt-in NDJSON capture of full ACP updates and prompt boundaries       |
 | `--execution-authority` | none        | Required direct profile: `trusted-host` or `confined-container`                |
-| `--system-prompt` | none              | Legacy-only prompt file; rejected in direct mode                               |
-| `--context-files` | configured list   | Legacy-only workspace context override; rejected in direct mode                |
 
 The default bind is loopback. Trusted-host direct mode rejects non-loopback
-binds. Legacy mode remains unauthenticated and must not be exposed to an
-untrusted network. Confined direct mode requires both managed attestation and
+binds. Confined direct mode requires both managed attestation and
 an observable runtime container boundary.
 
 ## Raw event diagnostics

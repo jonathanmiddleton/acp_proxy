@@ -9,9 +9,9 @@ import os
 import uuid
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
-from .client import DIRECT_STOP_REASONS, CallbackPolicy, ModelAcknowledgementError
+from .client import DIRECT_STOP_REASONS, ModelAcknowledgementError
 from .direct_protocol import (
     DIRECT_PROTOCOL_MAJOR,
     PROXY_VERSION,
@@ -127,16 +127,14 @@ class DirectService:
             raise ValueError("direct launch secret must contain at least 32 bytes")
         if execution_authority not in {"trusted-host", "confined-container"}:
             raise ValueError(f"unsupported execution authority: {execution_authority}")
-        if getattr(acp_client, "callback_policy", None) is not CallbackPolicy.DIRECT_DENY:
-            raise ValueError(
-                "Meadow direct mode requires an ACP client attested to "
-                "the direct-deny callback policy"
-            )
         self.acp_client = acp_client
         self.canonical_workspace = os.path.realpath(cwd)
         self.launch_secret = launch_secret
         self.limits = limits or DirectLimits()
-        self.execution_authority_name = execution_authority
+        if execution_authority == "trusted-host":
+            self.execution_authority_name: Literal["trusted-host", "confined-container"] = "trusted-host"
+        else:
+            self.execution_authority_name = "confined-container"
         self._state_lock = asyncio.Lock()
         self._generation = self._new_generation(continuity_generation_id)
         self._available = True

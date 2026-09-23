@@ -97,8 +97,8 @@ unauthorized decisions must be inexpressible through the supported public API.
 Keep a functional semantic core and thin imperative shells for I/O and resource
 ownership. Mutable process handles, queues, task registries, and lifecycle
 resources belong to their explicit owners; they are not mutable semantic
-payloads shared across modules. The deprecated OpenCode adapter remains an
-explicit supported contract until an ADR authorizes its removal.
+payloads shared across modules. [ADR-018](adrs/018-remove-openai-compatible-adapter.md)
+removes the deprecated OpenCode adapter; the direct ACP contract remains binding.
 
 ## Module and Code Organisation
 

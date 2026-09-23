@@ -18,13 +18,11 @@ Python edits. Do not add diagnostic baselines or weaken checks to obtain a pass.
 
 ## Project Overview
 
-This repo owns two explicit inbound contracts over GitHub Copilot's
-`copilot-language-server` ACP interface: Meadow's authenticated direct protocol
-and a deprecated OpenAI-compatible adapter for stock OpenCode.
+This repo connects Meadow to GitHub Copilot's `copilot-language-server` ACP
+interface through the authenticated `/meadow/v1` contract.
 
 ```
-Meadow ───────────────→ ACP Proxy `/meadow/v1` ─→ copilot-language-server
-OpenCode (deprecated) → ACP Proxy `/v1` ─────────→ copilot-language-server
+Meadow → ACP Proxy `/meadow/v1` → copilot-language-server
 ```
 
 ## ACP Specification Reference
@@ -67,19 +65,18 @@ The OpenAPI schema is at https://agentclientprotocol.com/api-reference/openapi.j
 | Module         | Owns                                                                                                                                                           | Does NOT own                                |
 |----------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------|
 | `transport.py` | Owned child lifecycle, NDJSON framing, bounded JSON-RPC correlation/callback tasks, ordered terminal signaling, and unexpected-close reporting | HTTP protocol and settlement policy          |
-| `client.py`    | ACP initialization, exact model acknowledgement, session/prompt primitives, mode-selected callback policy                                               | HTTP serving or direct operation identity   |
+| `client.py`    | ACP initialization, exact model acknowledgement, session/prompt primitives, deny-only callback policy                                               | HTTP serving or direct operation identity   |
 | `direct_protocol.py`, `direct_state.py` | Strict Meadow wire shapes, generation-long operation ledger, and state vocabulary                                               | ACP method execution                         |
 | `direct_service.py`, `direct_server.py` | Authenticated direct orchestration, explicit identities, prompt lifetime, settlement, evidence, and resource limits                    | Legacy replay or prompt hashing              |
-| `server.py`    | Isolated deprecated OpenAI-compatible endpoints, replay heuristics, and SSE translation                                                                        | Meadow direct traffic                        |
 | `discovery.py` | Binary resolution for the supported IntelliJ IDEA/PyCharm 2025.3 and 2026.1 plugin paths                                                                        | Protocol, sessions, serving                  |
-| `__main__.py`  | Mandatory mode selection, bind/auth policy, owned lifecycle, and HTTP wiring                                                                                    | Binary discovery logic                       |
+| `__main__.py`  | Direct bind/auth policy, owned lifecycle, and HTTP wiring                                                                                    | Binary discovery logic                       |
 
 ## Tests
 
 - Avoid mocks as much as possible
 - Test actual implementations, do not duplicate logic into tests
 - Favor writing property based tests
-- **Unit/property tests** (`test_transport.py`, `test_raw_events.py`, `test_client.py`, `test_model_binding_order.py`, `test_server.py`, `test_direct_*`, `test_discovery.py`): in-process boundaries, no real subprocess.
+- **Unit/property tests** (`test_transport.py`, `test_raw_events.py`, `test_client.py`, `test_model_binding_order.py`, `test_direct_*`, `test_discovery.py`): in-process boundaries, no real subprocess.
 - **Integration tests** (`test_integration.py`): Real copilot-language-server. **Fails** (not skips) if binary not found — a missing binary means the environment is misconfigured.
 - **No skips.** Tests must never use `skipif` or `pytest.skip()`. See CODING_STANDARDS.md.
 - Run all: `python -m pytest tests/ -v`
@@ -112,19 +109,17 @@ particularly the failure modes that motivated each decision.
 | [ADR-016](adrs/016-opt-in-raw-acp-event-capture.md) | Explicit raw event diagnostics with ordered capture, bounded queues, and visible failures |
 | [ADR-017](adrs/017-change-relative-typing-and-checkout-gate.md) | Meadow-derived typing, complete checkout validation, snapshot isolation, and no-skips enforcement |
 
+| [ADR-018](adrs/018-remove-openai-compatible-adapter.md) | Remove the deprecated adapter and consumer-mode selector; retain direct ACP semantics |
+
 The ADRs explain the *why* behind the module ownership rules in the table
 above. A change that contradicts an accepted ADR requires a new ADR
 superseding it, not a silent deviation.
 
 ## Configuration
 
-**`opencode.json`** (repo root) configures deprecated `opencode-legacy` mode as
-an OpenCode provider. It does not describe Meadow direct mode. It points OpenCode at the proxy as its
-Copilot provider. It points OpenCode at `http://127.0.0.1:8765/v1` with no
-auth, and declares the model IDs the proxy must handle: `gpt-4.1`, `gpt-4o`,
-`claude-sonnet-4`, `gemini-2.5-pro`, `auto`. When adding model routing logic,
-this file defines what model IDs are valid — they must match what the proxy
-advertises on `GET /v1/models`.
+User configuration contains network proxy settings only. Meadow owns prompt
+layers; the service has no OpenAI-compatible adapter, context-file injection,
+or consumer-mode selector. See ADR-018 for the removal decision.
 
 ## Diagnostic Scripts
 
@@ -144,15 +139,9 @@ code:
 - Commit messages describe the "why" not the "what".
 - No user IDs or environment-specific paths in committed code.
 
-## Target Environment Constraints
+## Runtime Constraints
 
-- The target is a restricted enterprise environment. The copilot-language-server
-  binary bundled with the JetBrains Copilot plugin is the only sanctioned path
-  to Copilot.
-- Binary path varies by user. Auto-discovery via `ps` or supported JetBrains plugin
-  directory search. Never hardcode user-specific paths.
-- OpenCode is the stock prebuilt binary installed via npm. No source builds,
-  no custom forks.
-- Available models and modes vary between environments. The proxy must handle
-  whatever the server advertises but must not silently degrade required
-  capabilities.
+- Use the installed JetBrains Copilot plugin language-server executable.
+- Discover per-user binary paths; never hardcode user-specific locations.
+- Available models and modes vary. Handle the advertised server capabilities
+  without silently degrading a required capability.

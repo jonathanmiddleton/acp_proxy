@@ -11,8 +11,8 @@ import asyncio
 import json
 import logging
 import re
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import Any, Protocol
 
 from .raw_events import RawEventCapture, RawEventCaptureError
 
@@ -42,6 +42,30 @@ def _message_kind(message: dict[str, Any]) -> str:
     return "invalid"
 
 
+class _WritableStream(Protocol):
+    def write(self, data: bytes) -> None: ...
+    async def drain(self) -> None: ...
+
+
+class _ReadableStream(Protocol):
+    async def readline(self) -> bytes: ...
+    async def read(self, size: int = -1, /) -> bytes: ...
+
+
+class AcpProcess(Protocol):
+    """Owned subprocess operations required by the ACP transport."""
+
+    @property
+    def stdin(self) -> _WritableStream | None: ...
+    @property
+    def stdout(self) -> _ReadableStream | None: ...
+    @property
+    def stderr(self) -> _ReadableStream | None: ...
+    def terminate(self) -> None: ...
+    def kill(self) -> None: ...
+    async def wait(self) -> int: ...
+
+
 class AcpTransport:
     """Async NDJSON transport over a subprocess's stdin/stdout.
 
@@ -53,7 +77,7 @@ class AcpTransport:
     """
 
     def __init__(self, *, raw_event_file: str | None = None) -> None:
-        self._process: asyncio.subprocess.Process | None = None
+        self._process: AcpProcess | None = None
         self._next_id: int = 1
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._pending_requests: dict[
@@ -61,7 +85,10 @@ class AcpTransport:
         ] = {}
         self._notification_handler: Callable[[dict[str, Any]], None] | None = None
         self._request_handler: (
-            Callable[[dict[str, Any]], asyncio.Future[dict[str, Any]] | None] | None
+            Callable[
+                [dict[str, Any]],
+                dict[str, object] | Awaitable[dict[str, object]] | None,
+            ] | None
         ) = None
         self._request_observer: Callable[[dict[str, Any]], None] | None = None
         self._request_sent_observer: (
@@ -75,7 +102,6 @@ class AcpTransport:
         self._stderr_task: asyncio.Task[None] | None = None
         self._closed = False
         self._failed = False
-        self._strict_response_correlation = False
         self._close_handler: Callable[[], None] | None = None
         self._raw_capture = (
             RawEventCapture(raw_event_file, self._capture_failed)
@@ -200,12 +226,15 @@ class AcpTransport:
 
     def on_request(
         self,
-        handler: Callable[[dict[str, Any]], asyncio.Future[dict[str, Any]] | None],
+        handler: Callable[
+            [dict[str, Any]],
+            dict[str, object] | Awaitable[dict[str, object]] | None,
+        ],
     ) -> None:
         """Register a handler for incoming requests (has 'id' and 'method').
 
         The handler receives the full JSON-RPC request and should return
-        a Future that resolves to the response result, or None to reject.
+        a response object, an awaitable response object, or None.
         """
         self._request_handler = handler
 
@@ -233,11 +262,6 @@ class AcpTransport:
         """Observe a response in read order before its future is resolved."""
 
         self._response_observer = observer
-
-    def set_strict_response_correlation(self, enabled: bool) -> None:
-        """Select fail-closed handling for unknown/late response IDs."""
-
-        self._strict_response_correlation = enabled
 
     def has_pending_incoming_requests(self, session_id: str) -> bool:
         """Whether an agent callback for ``session_id`` remains unsettled."""
@@ -398,7 +422,7 @@ class AcpTransport:
 
     def _dispatch(self, msg: dict[str, Any]) -> None:
         """Route an incoming message to the appropriate handler."""
-        if self._strict_response_correlation and not self._valid_strict_envelope(msg):
+        if not self._valid_strict_envelope(msg):
             logger.warning("Malformed direct ACP envelope; revoking continuity")
             self.fail_closed("direct ACP envelope validation failure")
             return
@@ -430,9 +454,7 @@ class AcpTransport:
         elif "id" in msg:
             # Response to one of our requests
             req_id = msg["id"]
-            if self._strict_response_correlation and not self._valid_strict_response(
-                msg
-            ):
+            if not self._valid_strict_response(msg):
                 logger.warning("Malformed direct ACP response; revoking continuity")
                 self.fail_closed("direct ACP response correlation failure")
                 return
@@ -460,14 +482,8 @@ class AcpTransport:
                 else:
                     future.set_result(msg.get("result", {}))
             else:
-                if self._strict_response_correlation:
-                    logger.warning("Uncorrelated ACP response; revoking continuity")
-                    self.fail_closed("direct ACP response correlation failure")
-                else:
-                    logger.warning(
-                        "Unexpected ACP response: id_type=%s",
-                        type(req_id).__name__,
-                    )
+                logger.warning("Uncorrelated ACP response; revoking continuity")
+                self.fail_closed("direct ACP response correlation failure")
         else:
             # Notification
             if self._notification_handler:
@@ -477,9 +493,8 @@ class AcpTransport:
         """Handle an incoming request from the agent."""
         assert self._request_handler
         try:
-            result = self._request_handler(msg)
-            if asyncio.isfuture(result) or asyncio.iscoroutine(result):
-                result = await result
+            response = self._request_handler(msg)
+            result = await response if isinstance(response, Awaitable) else response
             await self.send_response(msg["id"], result=result)
         except asyncio.CancelledError:
             raise
@@ -577,6 +592,6 @@ class AcpTransport:
 class AcpError(Exception):
     """Error returned by the ACP agent."""
 
-    def __init__(self, message: str, error_obj: dict[str, Any] | None = None):
+    def __init__(self, message: str, error_obj: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.error_obj = error_obj or {}

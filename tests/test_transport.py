@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Iterator
 
 import pytest
 
@@ -12,12 +13,13 @@ from acp_proxy.transport import (
     MAX_ACP_STDOUT_LINE_BYTES,
     STDERR_DRAIN_CHUNK_BYTES,
     AcpError,
+    AcpProcess,
     AcpTransport,
 )
 
 
 @pytest.fixture
-def event_loop():
+def event_loop() -> Iterator[asyncio.AbstractEventLoop]:
     loop = asyncio.new_event_loop()
     yield loop
     loop.close()
@@ -84,10 +86,10 @@ class FakeStdout:
         return data
 
 
-def make_transport_with_fake(fake: FakeProcess) -> AcpTransport:
+def make_transport_with_fake(fake: AcpProcess) -> AcpTransport:
     """Create a transport wired to a FakeProcess (bypass subprocess spawn)."""
     transport = AcpTransport()
-    transport._process = fake  # type: ignore[assignment]
+    transport._process = fake
     transport._reader_task = asyncio.create_task(transport._read_loop())
     transport._stderr_task = asyncio.create_task(transport._drain_stderr())
     return transport
@@ -102,7 +104,7 @@ async def test_start_configures_stream_limit_above_negotiated_event_limit(
     captured: dict[str, object] = {}
     fake = FakeProcess()
 
-    async def fake_create(*args, **kwargs):
+    async def fake_create(*args: object, **kwargs: object) -> FakeProcess:
         captured.update(kwargs)
         return fake
 
@@ -119,9 +121,11 @@ async def test_start_configures_stream_limit_above_negotiated_event_limit(
 async def test_near_limit_event_crosses_real_stream_reader() -> None:
     """ADI-08/15: a near-4MB ACP event is read, not rejected at 64 KiB."""
 
-    class StreamReaderProcess(FakeProcess):
+    class StreamReaderProcess:
         def __init__(self) -> None:
-            super().__init__()
+            self.stdin = FakeStdin()
+            self.stderr = FakeStdout()
+            self._returncode: int | None = None
             self.stdout = asyncio.StreamReader(limit=MAX_ACP_STDOUT_LINE_BYTES)
 
         def terminate(self) -> None:
@@ -133,6 +137,9 @@ async def test_near_limit_event_crosses_real_stream_reader() -> None:
             self._returncode = -9
             self.stdout.feed_eof()
             self.stderr.close()
+
+        async def wait(self) -> int:
+            return self._returncode or 0
 
     fake = StreamReaderProcess()
     transport = make_transport_with_fake(fake)
@@ -164,7 +171,7 @@ async def test_near_limit_event_crosses_real_stream_reader() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_request_receives_response():
+async def test_send_request_receives_response() -> None:
     """Sending a request and receiving a matching response resolves the future."""
     fake = FakeProcess()
     transport = make_transport_with_fake(fake)
@@ -194,7 +201,7 @@ async def test_send_request_receives_response():
 
 
 @pytest.mark.asyncio
-async def test_send_request_error_raises():
+async def test_send_request_error_raises() -> None:
     """An error response raises AcpError."""
     fake = FakeProcess()
     transport = make_transport_with_fake(fake)
@@ -220,12 +227,12 @@ async def test_send_request_error_raises():
 
 
 @pytest.mark.asyncio
-async def test_notification_dispatch():
+async def test_notification_dispatch() -> None:
     """Incoming notifications are dispatched to the registered handler."""
     fake = FakeProcess()
     transport = make_transport_with_fake(fake)
 
-    received: list[dict] = []
+    received: list[dict[str, object]] = []
     transport.on_notification(lambda msg: received.append(msg))
 
     fake.stdout.feed(
@@ -250,12 +257,12 @@ async def test_notification_dispatch():
 
 
 @pytest.mark.asyncio
-async def test_incoming_request_dispatch():
+async def test_incoming_request_dispatch() -> None:
     """Incoming requests from the agent are dispatched and responded to."""
     fake = FakeProcess()
     transport = make_transport_with_fake(fake)
 
-    def handle_request(msg):
+    def handle_request(msg: dict[str, object]) -> dict[str, object] | None:
         if msg["method"] == "session/request_permission":
             return {"outcome": {"outcome": "cancelled"}}
         return None
@@ -286,7 +293,7 @@ async def test_incoming_request_dispatch():
 
 
 @pytest.mark.asyncio
-async def test_request_ids_increment():
+async def test_request_ids_increment() -> None:
     """Each request gets a unique incrementing ID."""
     fake = FakeProcess()
     transport = make_transport_with_fake(fake)
@@ -402,7 +409,7 @@ async def test_transport_debug_logs_never_persist_child_stderr(
 
 
 @pytest.mark.asyncio
-async def test_stop_rejects_pending():
+async def test_stop_rejects_pending() -> None:
     """Stopping the transport rejects all pending request futures."""
     fake = FakeProcess()
     transport = make_transport_with_fake(fake)
@@ -417,7 +424,7 @@ async def test_stop_rejects_pending():
 
 
 @pytest.mark.asyncio
-async def test_unexpected_stdout_close_rejects_pending_and_signals_owner_once():
+async def test_unexpected_stdout_close_rejects_pending_and_signals_owner_once() -> None:
     """ADI-10/13: ACP child loss cannot leave pending work or readiness alive."""
     fake = FakeProcess()
     transport = make_transport_with_fake(fake)
@@ -506,7 +513,7 @@ async def test_request_observer_runs_before_callback_response() -> None:
     order: list[str] = []
     transport.on_request_observed(lambda _message: order.append("observed"))
 
-    def handle_request(_message):
+    def handle_request(_message: dict[str, object]) -> dict[str, object]:
         order.append("handled")
         return {"outcome": {"outcome": "cancelled"}}
 
@@ -584,8 +591,13 @@ async def test_blocked_callback_response_is_visible_at_prompt_terminal() -> None
         lambda _message: {"outcome": {"outcome": "cancelled"}}
     )
     terminal_observation: list[bool] = []
-    def observe_terminal(_message, _method, params) -> None:
-        unsettled = transport.has_pending_incoming_requests(params["sessionId"])
+    def observe_terminal(
+        _message: dict[str, object], _method: str, params: dict[str, object] | None
+    ) -> None:
+        assert params is not None
+        session_id = params["sessionId"]
+        assert isinstance(session_id, str)
+        unsettled = transport.has_pending_incoming_requests(session_id)
         terminal_observation.append(unsettled)
         if unsettled:
             transport.fail_closed("callback settlement protocol failure")
@@ -629,7 +641,7 @@ async def test_blocked_callback_response_is_visible_at_prompt_terminal() -> None
 
 
 @pytest.mark.asyncio
-async def test_non_json_line_revokes_transport_before_followup_response():
+async def test_non_json_line_revokes_transport_before_followup_response() -> None:
     """Malformed output cannot be hidden by a later valid response."""
     fake = FakeProcess()
     transport = make_transport_with_fake(fake)
@@ -657,34 +669,6 @@ async def test_non_json_line_revokes_transport_before_followup_response():
     await transport.stop()
 
 
-@pytest.mark.asyncio
-async def test_unexpected_response_id_ignored():
-    """A response with an unknown ID is logged and ignored."""
-    fake = FakeProcess()
-    transport = make_transport_with_fake(fake)
-
-    # Send a response for an ID that was never requested
-    fake.stdout.feed(
-        json.dumps({"jsonrpc": "2.0", "id": 99999, "result": {"orphan": True}})
-    )
-
-    # Give the read loop time to process
-    await asyncio.sleep(0.1)
-
-    # Transport should still be functional
-    task = asyncio.create_task(transport.send_request("test/method"))
-    await asyncio.sleep(0.05)
-
-    sent = json.loads(fake.stdin.written[0].decode())
-    fake.stdout.feed(
-        json.dumps({"jsonrpc": "2.0", "id": sent["id"], "result": {"ok": True}})
-    )
-
-    result = await asyncio.wait_for(task, timeout=2.0)
-    assert result == {"ok": True}
-
-    fake.stdout.close()
-    fake.stderr.close()
 
 
 @pytest.mark.asyncio
@@ -693,7 +677,6 @@ async def test_unknown_response_id_fails_strict_direct_correlation() -> None:
 
     fake = FakeProcess()
     transport = make_transport_with_fake(fake)
-    transport.set_strict_response_correlation(True)
     closed = asyncio.Event()
     transport.on_close(closed.set)
 
@@ -730,7 +713,6 @@ async def test_malformed_response_cannot_collide_with_direct_request(
 
     fake = FakeProcess()
     transport = make_transport_with_fake(fake)
-    transport.set_strict_response_correlation(True)
     closed = asyncio.Event()
     transport.on_close(closed.set)
     pending = asyncio.create_task(transport.send_request("session/prompt"))
@@ -772,9 +754,8 @@ async def test_malformed_direct_request_or_notification_fails_closed(
 
     fake = FakeProcess()
     transport = make_transport_with_fake(fake)
-    transport.set_strict_response_correlation(True)
     closed = asyncio.Event()
-    observed: list[dict] = []
+    observed: list[dict[str, object]] = []
     transport.on_close(closed.set)
     transport.on_notification(observed.append)
     transport.on_request(lambda request: observed.append(request))
@@ -788,12 +769,12 @@ async def test_malformed_direct_request_or_notification_fails_closed(
 
 
 @pytest.mark.asyncio
-async def test_handler_exception_returns_error_response():
+async def test_handler_exception_returns_error_response() -> None:
     """If a request handler raises, an error response is sent back."""
     fake = FakeProcess()
     transport = make_transport_with_fake(fake)
 
-    def exploding_handler(msg):
+    def exploding_handler(msg: dict[str, object]) -> None:
         raise ValueError("handler blew up")
 
     transport.on_request(exploding_handler)
@@ -824,7 +805,7 @@ async def test_handler_exception_returns_error_response():
 
 
 @pytest.mark.asyncio
-async def test_send_notification_no_id():
+async def test_send_notification_no_id() -> None:
     """send_notification sends a message without an 'id' field."""
     fake = FakeProcess()
     transport = make_transport_with_fake(fake)

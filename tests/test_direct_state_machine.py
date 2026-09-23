@@ -12,7 +12,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from acp_proxy.client import CallbackPolicy, ModelInfo
+from acp_proxy.client import ModelInfo
 from acp_proxy.direct_protocol import (
     CancelRequest,
     CreateSessionRequest,
@@ -36,7 +36,6 @@ class _Descriptor:
 
 class _TraceAcp:
     def __init__(self) -> None:
-        self.callback_policy = CallbackPolicy.DIRECT_DENY
         self.models = [ModelInfo("gpt-5.3-codex", "GPT-5.3 Codex")]
         self.protocol_version = 1
         self.agent_info = {"name": "trace", "version": "1"}

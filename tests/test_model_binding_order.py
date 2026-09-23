@@ -13,7 +13,6 @@ import pytest
 
 from acp_proxy.client import (
     AcpClient,
-    CallbackPolicy,
     DirectModelBindingStrategy,
     ModelAcknowledgementError,
 )
@@ -59,10 +58,9 @@ class _Peer:
         self.workspace = str(workspace)
         self.process = FakeProcess()
         self.transport = AcpTransport()
-        self.transport._process = self.process  # type: ignore[assignment]
-        self.client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        self.transport._process = self.process
+        self.client = AcpClient("unused")
         self.client._transport = self.transport
-        self.transport.set_strict_response_correlation(True)
         self.transport.on_notification(self.client._handle_notification)
         self.transport.on_response_observed(self.client._observe_response)
         self.transport.on_request_sent(self.client._observe_request_sent)
@@ -80,7 +78,9 @@ class _Peer:
         async def wait_for_write() -> dict[str, Any]:
             while len(self.process.stdin.written) <= self.request_index:
                 await asyncio.sleep(0)
-            request = json.loads(self.process.stdin.written[self.request_index])
+            decoded: object = json.loads(self.process.stdin.written[self.request_index])
+            assert isinstance(decoded, dict)
+            request = dict(decoded)
             self.request_index += 1
             assert request["method"] == expected_method
             return request

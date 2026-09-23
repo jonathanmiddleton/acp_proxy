@@ -3,6 +3,11 @@
 **Status:** Accepted; startup contract amended by [ADR-012](012-meadow-direct-consumer-protocol.md)
 **Date:** 2026-04-03  
 
+> **2026-09-23 amendment:** [ADR-018](018-remove-openai-compatible-adapter.md)
+> removes the deprecated OpenAI-compatible adapter and consumer-mode selection.
+> Historical observations below are retained; only remaining direct ACP
+> provisions govern the current service.
+
 ## Context
 
 The proxy has evolved from a proof-of-concept bridge into the foundational

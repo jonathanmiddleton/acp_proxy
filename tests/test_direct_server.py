@@ -14,7 +14,7 @@ from httpx import ASGITransport, AsyncClient
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from acp_proxy.client import CallbackPolicy, ModelAcknowledgementError, ModelInfo
+from acp_proxy.client import ModelAcknowledgementError, ModelInfo
 from acp_proxy.direct_protocol import (
     CancelRequest,
     CreateSessionRequest,
@@ -39,7 +39,6 @@ class FakeDirectAcpClient:
     """Observable ACP boundary double; protocol state remains real in the service."""
 
     def __init__(self) -> None:
-        self.callback_policy = CallbackPolicy.DIRECT_DENY
         self.models = [ModelInfo("gpt-5.3-codex", "GPT-5.3 Codex")]
         self.protocol_version = 1
         self.agent_info = {"name": "fake-copilot", "version": "1.0"}
@@ -210,19 +209,6 @@ def direct_boundary(tmp_path: Path) -> tuple[DirectService, FakeDirectAcpClient,
     return service, fake, create_direct_app(service)
 
 
-def test_direct_service_rejects_permissive_callback_client(tmp_path: Path) -> None:
-    """ADI-09: deny-only capability claims require client-side attestation."""
-
-    fake = FakeDirectAcpClient()
-    fake.callback_policy = CallbackPolicy.LEGACY_PERMISSIVE
-
-    with pytest.raises(ValueError, match="direct-deny callback policy"):
-        DirectService(
-            fake,
-            cwd=str(tmp_path),
-            launch_secret=TOKEN,
-            execution_authority="trusted-host",
-        )
 
 
 @pytest.mark.asyncio
@@ -485,10 +471,10 @@ async def test_permission_outcome_is_request_scoped_ordered_evidence(
 
 
 @pytest.mark.asyncio
-async def test_direct_mode_rejects_legacy_endpoint(
+async def test_removed_adapter_has_no_route(
     direct_boundary: tuple[DirectService, FakeDirectAcpClient, Any],
 ) -> None:
-    """ADI-12: direct and deprecated heuristic traffic never share routing."""
+    """Removed adapter requests cannot dispatch ACP work."""
     _, _, app = direct_boundary
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://direct.test"
@@ -496,34 +482,9 @@ async def test_direct_mode_rejects_legacy_endpoint(
         response = await client.post(
             "/v1/chat/completions", json={"messages": []}, headers=_auth()
         )
-    assert response.status_code == 410
-    assert response.json()["error"]["code"] == "legacy_mode_required"
+    assert response.status_code == 404
 
 
-@pytest.mark.asyncio
-async def test_direct_mode_rejects_legacy_endpoint_without_auth(
-    direct_boundary: tuple[DirectService, FakeDirectAcpClient, Any],
-) -> None:
-    """ADI-12: stock OpenCode sees migration guidance rather than generic 401."""
-
-    _, _, app = direct_boundary
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://direct.test"
-    ) as client:
-        response = await client.post(
-            "/v1/chat/completions", json={"messages": []}
-        )
-
-    assert response.status_code == 410
-    assert response.json() == {
-        "error": {
-            "code": "legacy_mode_required",
-            "message": (
-                "/v1/chat/completions is available only in explicit "
-                "opencode-legacy mode"
-            ),
-        }
-    }
 
 
 @pytest.mark.asyncio

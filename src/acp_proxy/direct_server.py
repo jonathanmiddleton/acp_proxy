@@ -178,17 +178,6 @@ def create_direct_app(service: DirectService) -> FastAPI:
         status = 200 if view.state == "completed" else 409
         return JSONResponse(view.model_dump(mode="json"), status_code=status)
 
-    @app.api_route(
-        "/v1/{legacy_path:path}",
-        methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-    )
-    async def reject_legacy(legacy_path: str) -> JSONResponse:
-        return _error(
-            410,
-            "legacy_mode_required",
-            f"/v1/{legacy_path} is available only in explicit opencode-legacy mode",
-        )
-
     return app
 
 

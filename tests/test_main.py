@@ -13,13 +13,14 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import uvicorn
 
 from acp_proxy import __main__ as cli
 from acp_proxy import discovery
 from acp_proxy.application_policy import MIN_COPILOT_LANGUAGE_SERVER_VERSION
 from acp_proxy.client import ModelAcknowledgementError
 from acp_proxy.copilot_auth import CopilotOAuthCredentialError
-from acp_proxy.direct_protocol import CreateSessionRequest, DirectLimits, PromptRequest
+from acp_proxy.direct_protocol import CreateSessionRequest, DirectLimits, PromptRequest, PromptPhase
 from acp_proxy.discovery import BinaryAdmission, BinaryCompatibilityError
 
 
@@ -73,9 +74,9 @@ def _old_version_executable(tmp_path: Path) -> str:
 @pytest.mark.parametrize(
     ("argv", "expected_host"),
     [
-        (["--consumer-mode", "opencode-legacy"], "127.0.0.1"),
+        ([], "127.0.0.1"),
         (
-            ["--consumer-mode", "opencode-legacy", "--host", "0.0.0.0"],
+            ["--host", "0.0.0.0"],
             "0.0.0.0",
         ),
     ],
@@ -100,7 +101,7 @@ def test_metadata_records_requested_bind_host(tmp_path: Path) -> None:
 
 def test_raw_capture_cli_is_explicit(tmp_path: Path) -> None:
     parser = cli._build_parser()
-    base = ["--consumer-mode", "meadow-direct"]
+    base: list[str] = []
     assert parser.parse_args(base).raw_event_file is None
     path = str(tmp_path / "events.jsonl")
     assert parser.parse_args([*base, "--raw-event-file", path]).raw_event_file == path
@@ -137,78 +138,6 @@ def test_windows_shutdown_handles_ctrl_break(
     assert shutdowns == ["shutdown"]
 
 
-@pytest.mark.asyncio
-async def test_run_passes_requested_bind_host_to_uvicorn(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The requested CLI bind address reaches the HTTP server boundary."""
-    observed: dict[str, Any] = {}
-
-    class FakeAcpClient:
-        def __init__(self, binary: str, **_kwargs: Any) -> None:
-            self.binary = binary
-            self.models = [SimpleNamespace(model_id="test-model")]
-            self.default_model = "test-model"
-            self.stopped = False
-            self._close_handler: Any = None
-            observed["client"] = self
-
-        def on_transport_closed(self, handler: Any) -> None:
-            self._close_handler = handler
-
-        async def start(self, env: dict[str, str] | None = None) -> None:
-            observed["subprocess_env"] = env
-
-        async def create_session(self, cwd: str) -> None:
-            observed["cwd"] = cwd
-
-        async def stop(self) -> None:
-            self.stopped = True
-
-    class FakeSocket:
-        def getsockname(self) -> tuple[str, int]:
-            return ("0.0.0.0", 8765)
-
-    class FakeUvicornServer:
-        def __init__(self, config: Any) -> None:
-            observed["config"] = config
-            self.servers: list[Any] = []
-            self.should_exit = False
-
-        async def startup(self) -> None:
-            self.servers = [SimpleNamespace(sockets=[FakeSocket()])]
-
-        async def main_loop(self) -> None:
-            return None
-
-        async def shutdown(self) -> None:
-            observed["shutdown"] = True
-
-    class FakeSignalLoop:
-        def add_signal_handler(self, *_args: Any) -> None:
-            return None
-
-    async def fake_app(
-        _scope: dict[str, Any], _receive: Any, _send: Any
-    ) -> None:
-        return None
-
-    monkeypatch.setattr(cli, "AcpClient", FakeAcpClient)
-    monkeypatch.setattr(cli, "create_app", lambda *_args, **_kwargs: fake_app)
-    monkeypatch.setattr(cli.uvicorn, "Server", FakeUvicornServer)
-    monkeypatch.setattr(cli.asyncio, "get_event_loop", lambda: FakeSignalLoop())
-
-    await cli.run(
-        "/fake/copilot-language-server",
-        8765,
-        str(tmp_path),
-        host="0.0.0.0",
-        consumer_mode="opencode-legacy",
-    )
-
-    assert observed["config"].host == "0.0.0.0"
-    assert observed["client"].stopped is True
-    assert observed["shutdown"] is True
 
 
 @pytest.mark.asyncio
@@ -234,7 +163,6 @@ async def test_programmatic_run_rejects_old_binary_before_client_start(
             old_binary,
             8765,
             "/workspace",
-            consumer_mode="meadow-direct",
             launch_secret="s" * 48,
             execution_authority="trusted-host",
         )
@@ -267,8 +195,6 @@ def test_cli_explicit_old_binary_fails_before_client_start(
         "argv",
         [
             "acp-proxy",
-            "--consumer-mode",
-            "meadow-direct",
             "--execution-authority",
             "trusted-host",
             "--binary",
@@ -318,8 +244,6 @@ def test_cli_direct_injects_prior_oauth_into_child_environment(
         "argv",
         [
             "acp-proxy",
-            "--consumer-mode",
-            "meadow-direct",
             "--execution-authority",
             "trusted-host",
             "--binary",
@@ -360,8 +284,6 @@ def test_cli_direct_oauth_error_stops_before_child_start(
         "argv",
         [
             "acp-proxy",
-            "--consumer-mode",
-            "meadow-direct",
             "--execution-authority",
             "trusted-host",
             "--binary",
@@ -377,27 +299,6 @@ def test_cli_direct_oauth_error_stops_before_child_start(
     assert token not in caplog.text
 
 
-@pytest.mark.asyncio
-async def test_legacy_mode_shares_the_global_binary_floor(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Deprecation does not create a weaker language-server admission path."""
-
-    old_binary = _old_version_executable(tmp_path)
-    monkeypatch.setattr(cli, "admit_compatible_binary", discovery.admit_compatible_binary)
-
-    required_version = _version_text(MIN_COPILOT_LANGUAGE_SERVER_VERSION)
-    with pytest.raises(
-        BinaryCompatibilityError,
-        match=re.escape(required_version),
-    ):
-        await cli.run(
-            old_binary,
-            8765,
-            "/workspace",
-            consumer_mode="opencode-legacy",
-        )
 
 
 @pytest.mark.asyncio
@@ -447,14 +348,13 @@ async def test_direct_readiness_requires_usable_catalog_default(
 
     metadata = tmp_path / "ready.json"
     monkeypatch.setattr(cli, "AcpClient", IncompleteCatalogClient)
-    monkeypatch.setattr(cli.uvicorn, "Server", ForbiddenServer)
+    monkeypatch.setattr(uvicorn, "Server", ForbiddenServer)
 
     with pytest.raises(BinaryCompatibilityError) as exc_info:
         await cli.run(
             "/fake/copilot-language-server",
             8765,
             str(tmp_path),
-            consumer_mode="meadow-direct",
             launch_secret="s" * 48,
             execution_authority="trusted-host",
             metadata_file=str(metadata),
@@ -480,7 +380,6 @@ async def test_direct_readiness_follows_strategy_negotiation(
 
     class ProvenCatalogClient:
         def __init__(self, _binary: str, **kwargs: Any) -> None:
-            self.callback_policy = kwargs["callback_policy"]
             self.models = [SimpleNamespace(model_id="catalog-model")]
             self.default_model = "catalog-model"
             self.protocol_version = 1
@@ -538,14 +437,13 @@ async def test_direct_readiness_follows_strategy_negotiation(
 
     monkeypatch.setattr(cli, "AcpClient", ProvenCatalogClient)
     monkeypatch.setattr(cli, "create_direct_app", lambda _service: fake_app)
-    monkeypatch.setattr(cli.uvicorn, "Server", OrderedServer)
-    monkeypatch.setattr(cli.asyncio, "get_event_loop", lambda: FakeSignalLoop())
+    monkeypatch.setattr(uvicorn, "Server", OrderedServer)
+    monkeypatch.setattr(asyncio, "get_event_loop", lambda: FakeSignalLoop())
 
     await cli.run(
         "/fake/copilot-language-server",
         8765,
         str(tmp_path),
-        consumer_mode="meadow-direct",
         launch_secret="s" * 48,
         execution_authority="trusted-host",
         metadata_file=str(metadata),
@@ -596,14 +494,13 @@ async def test_direct_strategy_negotiation_failure_prevents_readiness(
 
     metadata = tmp_path / "ready.json"
     monkeypatch.setattr(cli, "AcpClient", FailingStrategyClient)
-    monkeypatch.setattr(cli.uvicorn, "Server", ForbiddenServer)
+    monkeypatch.setattr(uvicorn, "Server", ForbiddenServer)
 
     with pytest.raises(BinaryCompatibilityError) as exc_info:
         await cli.run(
             "/fake/copilot-language-server",
             8765,
             str(tmp_path),
-            consumer_mode="meadow-direct",
             launch_secret="s" * 48,
             execution_authority="trusted-host",
             metadata_file=str(metadata),
@@ -655,14 +552,13 @@ async def test_direct_strategy_negotiation_timeout_prevents_readiness(
 
     metadata = tmp_path / "ready.json"
     monkeypatch.setattr(cli, "AcpClient", HangingStrategyClient)
-    monkeypatch.setattr(cli.uvicorn, "Server", ForbiddenServer)
+    monkeypatch.setattr(uvicorn, "Server", ForbiddenServer)
 
     with pytest.raises(BinaryCompatibilityError, match="bounded startup"):
         await cli.run(
             "/fake/copilot-language-server",
             8765,
             str(tmp_path),
-            consumer_mode="meadow-direct",
             launch_secret="s" * 48,
             execution_authority="trusted-host",
             metadata_file=str(metadata),
@@ -674,10 +570,6 @@ async def test_direct_strategy_negotiation_timeout_prevents_readiness(
     assert not metadata.exists()
 
 
-def test_consumer_mode_is_mandatory() -> None:
-    """ADI-12: the proxy never guesses direct versus legacy caller semantics."""
-    with pytest.raises(SystemExit):
-        cli._build_parser().parse_args([])
 
 
 def test_cli_invalid_direct_config_never_probes_auto_discovery(
@@ -696,8 +588,6 @@ def test_cli_invalid_direct_config_never_probes_auto_discovery(
         "argv",
         [
             "acp-proxy",
-            "--consumer-mode",
-            "meadow-direct",
             "--execution-authority",
             "trusted-host",
         ],
@@ -725,12 +615,13 @@ def test_cli_auto_discovery_reports_old_only_environment_without_traceback(
             f"version {observed_version} is below required minimum {required_version}"
         )
 
+    monkeypatch.setenv(cli.DIRECT_SECRET_ENV, "s" * 48)
     monkeypatch.setattr(cli, "_configure_logging", lambda *_args: None)
     monkeypatch.setattr(cli, "find_binary", reject_old_only)
     monkeypatch.setattr(
         sys,
         "argv",
-        ["acp-proxy", "--consumer-mode", "opencode-legacy"],
+        ["acp-proxy", "--execution-authority", "trusted-host"],
     )
 
     with pytest.raises(SystemExit) as exc_info:
@@ -740,11 +631,6 @@ def test_cli_auto_discovery_reports_old_only_environment_without_traceback(
     assert required_version in caplog.text
 
 
-@pytest.mark.asyncio
-async def test_programmatic_run_requires_explicit_consumer_mode() -> None:
-    """ADI-12: non-CLI callers cannot inherit a compatibility mode default."""
-    with pytest.raises(TypeError, match="consumer_mode"):
-        await cli.run("/fake/copilot-language-server", 8765, "/workspace")
 
 
 @pytest.mark.asyncio
@@ -753,7 +639,6 @@ async def test_programmatic_run_requires_explicit_consumer_mode() -> None:
     [
         (
             {
-                "consumer_mode": "meadow-direct",
                 "host": "0.0.0.0",
                 "launch_secret": "s" * 48,
                 "execution_authority": "trusted-host",
@@ -762,20 +647,10 @@ async def test_programmatic_run_requires_explicit_consumer_mode() -> None:
         ),
         (
             {
-                "consumer_mode": "meadow-direct",
                 "launch_secret": "short",
                 "execution_authority": "trusted-host",
             },
             "32 bytes",
-        ),
-        (
-            {
-                "consumer_mode": "meadow-direct",
-                "launch_secret": "s" * 48,
-                "execution_authority": "trusted-host",
-                "system_prompt": "proxy text",
-            },
-            "proxy-authored",
         ),
     ],
 )
@@ -843,7 +718,8 @@ async def test_post_start_catalog_failure_still_stops_owned_child(
             "/fake/copilot-language-server",
             8765,
             str(tmp_path),
-            consumer_mode="opencode-legacy",
+            launch_secret="s" * 48,
+            execution_authority="trusted-host",
         )
 
     assert observed["client"].stopped is True
@@ -859,12 +735,11 @@ async def test_child_loss_during_startup_invalidates_direct_service_and_cleans_u
 
     class ChildLossClient:
         def __init__(self, _binary: str, **kwargs: Any) -> None:
-            self.callback_policy = kwargs["callback_policy"]
             self.models = [SimpleNamespace(model_id="gpt-5.3-codex")]
             self.default_model = "gpt-5.3-codex"
             self.protocol_version = 1
             self.agent_info = {"name": "fake", "version": "1"}
-            self.agent_capabilities = {}
+            self.agent_capabilities: dict[str, object] = {}
             self.is_alive = True
             self.stopped = False
             self.close_handler: Any = None
@@ -920,15 +795,14 @@ async def test_child_loss_during_startup_invalidates_direct_service_and_cleans_u
 
     monkeypatch.setattr(cli, "AcpClient", ChildLossClient)
     monkeypatch.setattr(cli, "create_direct_app", capture_service)
-    monkeypatch.setattr(cli.uvicorn, "Server", FakeServer)
-    monkeypatch.setattr(cli.asyncio, "get_event_loop", lambda: FakeSignalLoop())
+    monkeypatch.setattr(uvicorn, "Server", FakeServer)
+    monkeypatch.setattr(asyncio, "get_event_loop", lambda: FakeSignalLoop())
 
     with pytest.raises(ConnectionError, match="HTTP startup"):
         await cli.run(
             "/fake/copilot-language-server",
             8765,
             str(tmp_path),
-            consumer_mode="meadow-direct",
             launch_secret="s" * 48,
             execution_authority="trusted-host",
         )
@@ -956,12 +830,11 @@ async def test_graceful_owner_shutdown_quarantines_active_direct_work_first(
 
     class ActiveClient:
         def __init__(self, _binary: str, **kwargs: Any) -> None:
-            self.callback_policy = kwargs["callback_policy"]
             self.models = [SimpleNamespace(model_id="gpt-5.3-codex")]
             self.default_model = "gpt-5.3-codex"
             self.protocol_version = 1
             self.agent_info = {"name": "fake", "version": "1"}
-            self.agent_capabilities = {}
+            self.agent_capabilities: dict[str, object] = {}
             self.is_alive = True
             self.prompt_started = asyncio.Event()
             self.prompt_release = asyncio.Event()
@@ -1041,7 +914,7 @@ async def test_graceful_owner_shutdown_quarantines_active_direct_work_first(
                     continuity_generation_id=service.continuity_generation_id,
                     operation_id="prompt",
                     invocation_id="invocation",
-                    phase="initial",
+                    phase=PromptPhase.INITIAL,
                     stable_instruction_digest=stable_digest,
                     output_contract_digest=contract_digest,
                     execution_timeout_s=30,
@@ -1077,14 +950,13 @@ async def test_graceful_owner_shutdown_quarantines_active_direct_work_first(
 
     monkeypatch.setattr(cli, "AcpClient", make_client)
     monkeypatch.setattr(cli, "create_direct_app", capture_service)
-    monkeypatch.setattr(cli.uvicorn, "Server", FakeServer)
-    monkeypatch.setattr(cli.asyncio, "get_event_loop", lambda: FakeSignalLoop())
+    monkeypatch.setattr(uvicorn, "Server", FakeServer)
+    monkeypatch.setattr(asyncio, "get_event_loop", lambda: FakeSignalLoop())
 
     await cli.run(
         "/fake/copilot-language-server",
         8765,
         str(tmp_path),
-        consumer_mode="meadow-direct",
         launch_secret="s" * 48,
         execution_authority="trusted-host",
     )
@@ -1109,8 +981,6 @@ def test_trusted_host_direct_rejects_non_loopback(
     monkeypatch.setenv(cli.DIRECT_SECRET_ENV, "s" * 48)
     args = cli._build_parser().parse_args(
         [
-            "--consumer-mode",
-            "meadow-direct",
             "--execution-authority",
             "trusted-host",
             "--host",
@@ -1118,7 +988,7 @@ def test_trusted_host_direct_rejects_non_loopback(
         ]
     )
     with pytest.raises(ValueError, match="loopback"):
-        cli._validate_mode_options(args)
+        cli._validate_options(args)
 
 
 def test_confined_container_direct_accepts_declared_private_bind(
@@ -1130,15 +1000,13 @@ def test_confined_container_direct_accepts_declared_private_bind(
     monkeypatch.setattr(cli, "_has_observable_container_boundary", lambda: True)
     args = cli._build_parser().parse_args(
         [
-            "--consumer-mode",
-            "meadow-direct",
             "--execution-authority",
             "confined-container",
             "--host",
             "0.0.0.0",
         ]
     )
-    assert cli._validate_mode_options(args) == "s" * 48
+    assert cli._validate_options(args) == "s" * 48
 
 
 def test_container_env_claim_without_runtime_boundary_fails_pre_child(
@@ -1150,8 +1018,6 @@ def test_container_env_claim_without_runtime_boundary_fails_pre_child(
     monkeypatch.setattr(cli, "_has_observable_container_boundary", lambda: False)
     args = cli._build_parser().parse_args(
         [
-            "--consumer-mode",
-            "meadow-direct",
             "--execution-authority",
             "confined-container",
             "--host",
@@ -1159,7 +1025,7 @@ def test_container_env_claim_without_runtime_boundary_fails_pre_child(
         ]
     )
     with pytest.raises(ValueError, match="observable container runtime"):
-        cli._validate_mode_options(args)
+        cli._validate_options(args)
 
 
 @pytest.mark.parametrize("authority", ["trusted-host", "confined-container"])
@@ -1221,22 +1087,3 @@ def test_direct_child_environment_allows_runtime_and_github_namespaces(
     assert child["GITHUB_TOKEN"] == "github-general-credential"
     assert canary not in child.values()
     assert authority in {"trusted-host", "confined-container"}
-
-
-def test_direct_mode_rejects_proxy_authored_prompt_options(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """ADI-06/12: legacy prompt injection cannot enter Meadow direct mode."""
-    monkeypatch.setenv(cli.DIRECT_SECRET_ENV, "s" * 48)
-    args = cli._build_parser().parse_args(
-        [
-            "--consumer-mode",
-            "meadow-direct",
-            "--execution-authority",
-            "trusted-host",
-            "--system-prompt",
-            "/tmp/legacy.md",
-        ]
-    )
-    with pytest.raises(ValueError, match="rejects"):
-        cli._validate_mode_options(args)

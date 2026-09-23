@@ -3,7 +3,7 @@ ACP client for copilot-language-server.
 
 Manages initialization, session lifecycle, model selection, and prompt
 execution. Translates between ACP's stateful session model and the
-request/response pattern needed by the OpenAI-compatible proxy layer.
+explicit session and prompt primitives needed by the direct service.
 """
 
 from __future__ import annotations
@@ -12,10 +12,10 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, ClassVar
+from typing import Any
 
 from . import __version__
 from .transport import AcpError, AcpTransport
@@ -84,19 +84,6 @@ class ModelAcknowledgementError(RuntimeError):
     """ACP failed to settle the requested session model binding."""
 
 
-def _summarize(obj: Any, max_len: int = 200) -> str:
-    """Summarize an object for logging — truncate long values."""
-    import json
-
-    try:
-        s = json.dumps(obj, default=str)
-    except Exception:  # noqa: BLE001 - diagnostic summarization must never escape
-        s = repr(obj)
-    if len(s) > max_len:
-        return s[:max_len] + f"... ({len(s)} chars)"
-    return s
-
-
 @dataclass
 class ModelInfo:
     """A model available through the ACP agent."""
@@ -112,13 +99,6 @@ class AcpSessionDescriptor:
 
     session_id: str
     model_id: str
-
-
-class CallbackPolicy(StrEnum):
-    """Client callback authority selected before ACP initialization."""
-
-    LEGACY_PERMISSIVE = "legacy-permissive"
-    DIRECT_DENY = "direct-deny"
 
 
 class DirectModelBindingStrategy(StrEnum):
@@ -156,18 +136,16 @@ class AcpClient:
     - ACP initialization handshake
     - Session creation with model selection
     - Prompt execution with streaming response collection
-    - Handling agent callbacks (permission requests, fs, terminal)
+    - Denying client callbacks while retaining ordered callback evidence
     """
 
     def __init__(
         self,
         binary_path: str,
         *,
-        callback_policy: CallbackPolicy = CallbackPolicy.LEGACY_PERMISSIVE,
         raw_event_file: str | None = None,
     ) -> None:
         self._binary_path = binary_path
-        self._callback_policy = callback_policy
         self._transport = AcpTransport(raw_event_file=raw_event_file)
         self._models: list[ModelInfo] = []
         self._default_model: str | None = None
@@ -222,13 +200,7 @@ class AcpClient:
 
         return self._transport.is_open
 
-    @property
-    def callback_policy(self) -> CallbackPolicy:
-        """Return the immutable callback authority selected before startup."""
-
-        return self._callback_policy
-
-    def on_transport_closed(self, handler: Any) -> None:
+    def on_transport_closed(self, handler: Callable[[], None]) -> None:
         """Notify the process owner when the ACP child stream closes unexpectedly."""
 
         self._transport.on_close(handler)
@@ -241,9 +213,6 @@ class AcpClient:
                 current process environment is inherited.
         """
         self._transport.on_notification(self._handle_notification)
-        self._transport.set_strict_response_correlation(
-            self._callback_policy is CallbackPolicy.DIRECT_DENY
-        )
         self._transport.on_request_observed(self._observe_agent_request)
         self._transport.on_request(self._handle_agent_request)
         self._transport.on_request_sent(self._observe_request_sent)
@@ -288,9 +257,7 @@ class AcpClient:
         self._sessions.clear()
         self._direct_model_binding_strategy = None
         self._direct_model_binding_negotiation = None
-        self._direct_model_binding_generation = (
-            getattr(self, "_direct_model_binding_generation", 0) + 1
-        )
+        self._direct_model_binding_generation += 1
 
     async def create_session(self, cwd: str, model_id: str | None = None) -> str:
         """Create a new ACP session.
@@ -299,43 +266,26 @@ class AcpClient:
         set after session creation.
         """
         params = {"cwd": cwd, "mcpServers": []}
-        direct_mode = (
-            getattr(self, "_callback_policy", CallbackPolicy.LEGACY_PERMISSIVE)
-            is CallbackPolicy.DIRECT_DENY
+        logger.debug(
+            "session/new request: cwd_present=%s mcp_server_count=0",
+            bool(cwd),
         )
-        if direct_mode:
-            logger.debug(
-                "session/new request: cwd_present=%s mcp_server_count=0",
-                bool(cwd),
-            )
-        else:
-            logger.debug("session/new request params: %s", params)
         try:
             result = await self._transport.send_request("session/new", params)
         except AcpError as e:
-            if direct_mode:
-                logger.error(
-                    "session/new failed: error_type=%s", type(e).__name__
-                )
-            else:
-                logger.error(
-                    "session/new failed: %s | full error: %s | cwd: %s",
-                    e,
-                    e.error_obj,
-                    cwd,
-                )
-            raise
-        if direct_mode:
-            logger.debug(
-                "session/new response: session_id_present=%s models_present=%s",
-                isinstance(result.get("sessionId"), str),
-                "models" in result,
+            logger.error(
+                "session/new failed: error_type=%s", type(e).__name__
             )
-        else:
-            logger.debug("session/new response: %s", result)
-        session_id = result["sessionId"]
-        if direct_mode:
-            self._bind_provisional_session(session_id)
+            raise
+        logger.debug(
+            "session/new response: session_id_present=%s models_present=%s",
+            isinstance(result.get("sessionId"), str),
+            "models" in result,
+        )
+        session_id = result.get("sessionId")
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session/new omitted a non-empty sessionId")
+        self._bind_provisional_session(session_id)
 
         session_current_model: str | None = None
         session_available_models: frozenset[str] | None = None
@@ -344,7 +294,7 @@ class AcpClient:
         # catalog probe's current model when its own response omits that state.
         if "models" in result:
             models_data = result["models"]
-            if not direct_mode or not self._sessions:
+            if not self._sessions:
                 self._extract_models(models_data)
             current_model = models_data.get("currentModelId")
             if isinstance(current_model, str) and current_model:
@@ -361,33 +311,20 @@ class AcpClient:
 
         session = SessionState(
             session_id=session_id,
-            model_id=(
-                session_current_model
-                if direct_mode
-                else self._default_model
-            ),
+            model_id=session_current_model,
             available_model_ids=session_available_models,
         )
         self._sessions[session_id] = session
 
-        # Direct callers bind through the strategy negotiated before HTTP
-        # readiness. Legacy callers retain their historical best-effort path.
-        if model_id and (direct_mode or model_id != session.model_id):
-            if direct_mode:
-                self._require_direct_session_catalog(session_id, model_id)
-                await self._bind_direct_model(session_id, model_id)
-            else:
-                await self._try_set_model(session_id, model_id)
+        # Bind through the strategy negotiated before HTTP readiness.
+        if model_id:
+            self._require_direct_session_catalog(session_id, model_id)
+            await self._bind_direct_model(session_id, model_id)
 
-        if direct_mode:
-            logger.info(
-                "Created direct ACP session: model_bound=%s",
-                session.model_id is not None,
-            )
-        else:
-            logger.info(
-                "Created session %s with model %s", session_id, session.model_id
-            )
+        logger.info(
+            "Created direct ACP session: model_bound=%s",
+            session.model_id is not None,
+        )
         return session_id
 
     async def create_session_exact(
@@ -395,16 +332,14 @@ class AcpClient:
     ) -> AcpSessionDescriptor:
         """Create a session and settle its requested model binding.
 
-        Direct mode applies the startup-negotiated strategy to every logical
+        The client applies the startup-negotiated strategy to every logical
         session before it is returned. Standard configuration requires an
         explicitly reported matching current value. The Copilot-specific
         strategy requires successful settlement of the exact
-        ``session/set_model`` request. Non-direct callers retain the former
-        per-session compatibility selection behavior.
+        ``session/set_model`` request.
         """
 
-        direct_mode = self._callback_policy is CallbackPolicy.DIRECT_DENY
-        if direct_mode and self._direct_model_binding_strategy is None:
+        if self._direct_model_binding_strategy is None:
             raise ModelAcknowledgementError(
                 "direct model binding strategy was not negotiated before session creation"
             )
@@ -415,12 +350,9 @@ class AcpClient:
             )
         session_id = await self.create_session(cwd)
         session = self._require_direct_session_catalog(session_id, model_id)
-        if direct_mode:
-            await self._bind_direct_model(session_id, model_id)
-        elif session.model_id != model_id:
-            await self._settle_compatibility_model(session_id, model_id)
+        await self._bind_direct_model(session_id, model_id)
         bound_model = session.model_id
-        if bound_model != model_id:
+        if bound_model is None or bound_model != model_id:
             raise ModelAcknowledgementError(
                 "copilot-language-server did not settle the requested session model"
             )
@@ -431,8 +363,6 @@ class AcpClient:
     ) -> DirectModelBindingStrategy:
         """Select and freeze one direct model-binding strategy before readiness."""
 
-        if self._callback_policy is not CallbackPolicy.DIRECT_DENY:
-            raise RuntimeError("direct model binding requires direct callback policy")
         if self._direct_model_binding_strategy is not None:
             raise RuntimeError("direct model binding strategy is already negotiated")
         if self._direct_model_binding_negotiation is not None:
@@ -483,51 +413,6 @@ class AcpClient:
             if self._direct_model_binding_negotiation is negotiation:
                 self._direct_model_binding_negotiation = None
 
-    async def acknowledge_session_model(
-        self, session_id: str, model_id: str
-    ) -> str:
-        """Require the standard method to report the requested model as current.
-
-        This compatibility API intentionally retains its former exact
-        ``session/set_config_option`` semantics. Direct strategy negotiation is
-        a separate operation because ``session/set_model`` does not report an
-        independently observed post-state.
-        """
-
-        if session_id not in self._sessions:
-            raise ModelAcknowledgementError(
-                "cannot prove model configuration for an unknown ACP session"
-            )
-        try:
-            observed = await self._set_config_option_exact(session_id, model_id)
-        except AcpError as exc:
-            if exc.error_obj.get("code") == -32601:
-                logger.error(
-                    "ACP agent does not expose the required exact model "
-                    "configuration method"
-                )
-                message = (
-                    "copilot-language-server does not expose required exact "
-                    "model configuration"
-                )
-            else:
-                logger.error(
-                    "Could not prove the required exact model configuration capability"
-                )
-                message = (
-                    "could not prove copilot-language-server required exact "
-                    "model configuration"
-                )
-            raise ModelAcknowledgementError(message) from None
-
-        if self._callback_policy is CallbackPolicy.DIRECT_DENY:
-            logger.info("ACP acknowledged the requested direct model")
-        else:
-            logger.info(
-                "ACP acknowledged model %s for session %s", observed, session_id
-            )
-        return observed
-
     def _require_direct_session_catalog(
         self, session_id: str, model_id: str
     ) -> SessionState:
@@ -573,45 +458,6 @@ class AcpClient:
             "configOptions did not contain the model option"
         )
 
-    async def prompt(
-        self,
-        session_id: str,
-        messages: list[dict[str, Any]],
-        timeout_s: float | None = None,
-    ) -> AsyncIterator[dict[str, Any]]:
-        """Send a prompt and yield streaming update events.
-
-        Translates the OpenAI messages array into an ACP prompt.
-        Yields individual session/update events as they arrive.
-        The final yield is a sentinel dict with 'done': True and the
-        stop reason.
-
-        Args:
-            session_id: The ACP session ID.
-            messages: OpenAI-format messages array.
-            timeout_s: Maximum seconds to wait for the prompt to complete.
-                Defaults to DEFAULT_PROMPT_TIMEOUT_S.  If the deadline is
-                exceeded, the prompt task is cancelled and PromptTimeout
-                is raised with any partial text collected so far.
-
-        Yields:
-            Update dicts from ACP session/update notifications.
-
-        Raises:
-            PromptTimeout: If the prompt does not complete within the deadline.
-            ValueError: If the session ID is unknown.
-        """
-        # Convert OpenAI messages to ACP prompt content blocks
-        prompt_content = self._messages_to_prompt(messages)
-
-        async for update in self._prompt_content(
-            session_id,
-            prompt_content,
-            timeout_s=timeout_s,
-            require_known_stop_reason=False,
-        ):
-            yield update
-
     async def prompt_blocks(
         self,
         session_id: str,
@@ -621,7 +467,7 @@ class AcpClient:
         event_byte_limit: int = 4_000_000,
         event_count_limit: int = 4096,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Send already-layered direct content blocks without chat-history logic."""
+        """Send the direct service's already-layered ACP text content blocks."""
 
         if not blocks or any(block.get("type") != "text" for block in blocks):
             raise ValueError("direct v1 accepts one or more ACP text content blocks")
@@ -629,7 +475,6 @@ class AcpClient:
             session_id,
             blocks,
             timeout_s=timeout_s,
-            require_known_stop_reason=True,
             event_byte_limit=event_byte_limit,
             event_count_limit=event_count_limit,
         ):
@@ -641,7 +486,6 @@ class AcpClient:
         prompt_content: list[dict[str, Any]],
         *,
         timeout_s: float | None = None,
-        require_known_stop_reason: bool,
         event_byte_limit: int | None = None,
         event_count_limit: int | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
@@ -663,32 +507,28 @@ class AcpClient:
             maxsize=queue_maxsize
         )
         self._update_queues[session_id] = queue
+        phase = self._direct_prompt_phases.get(session_id)
+        if phase not in {None, "terminal"}:
+            self._transport.fail_closed(
+                "direct ACP prompt correlation protocol failure"
+            )
+            raise ConnectionError(
+                "direct ACP prompt correlation protocol failure"
+            )
+        self._direct_prompt_phases[session_id] = "preparing"
         if (
-            getattr(self, "_callback_policy", CallbackPolicy.LEGACY_PERMISSIVE)
-            is CallbackPolicy.DIRECT_DENY
+            event_byte_limit is None
+            or event_byte_limit < 1
+            or event_count_limit is None
+            or event_count_limit < 1
         ):
-            phase = self._direct_prompt_phases.get(session_id)
-            if phase not in {None, "terminal"}:
-                self._transport.fail_closed(
-                    "direct ACP prompt correlation protocol failure"
-                )
-                raise ConnectionError(
-                    "direct ACP prompt correlation protocol failure"
-                )
-            self._direct_prompt_phases[session_id] = "preparing"
-            if (
-                event_byte_limit is None
-                or event_byte_limit < 1
-                or event_count_limit is None
-                or event_count_limit < 1
-            ):
-                raise ValueError("direct prompt requires positive event bounds")
-            self._direct_update_budgets[session_id] = {
-                "bytes": 0,
-                "count": 0,
-                "byte_limit": event_byte_limit,
-                "count_limit": event_count_limit,
-            }
+            raise ValueError("direct prompt requires positive event bounds")
+        self._direct_update_budgets[session_id] = {
+            "bytes": 0,
+            "count": 0,
+            "byte_limit": event_byte_limit,
+            "count_limit": event_count_limit,
+        }
 
         deadline = asyncio.get_event_loop().time() + effective_timeout
         partial_text = ""
@@ -708,28 +548,12 @@ class AcpClient:
                 remaining = deadline - asyncio.get_event_loop().time()
                 if remaining <= 0:
                     prompt_task.cancel()
-                    if (
-                        getattr(
-                            self,
-                            "_callback_policy",
-                            CallbackPolicy.LEGACY_PERMISSIVE,
-                        )
-                        is CallbackPolicy.DIRECT_DENY
-                    ):
-                        logger.error(
-                            "Direct ACP prompt timed out after %.1fs; "
-                            "partial_text_chars=%d",
-                            effective_timeout,
-                            len(partial_text),
-                        )
-                    else:
-                        logger.error(
-                            "Prompt timed out after %.1fs (session %s). "
-                            "Partial text collected: %d chars",
-                            effective_timeout,
-                            session_id[:8],
-                            len(partial_text),
-                        )
+                    logger.error(
+                        "Direct ACP prompt timed out after %.1fs; "
+                        "partial_text_chars=%d",
+                        effective_timeout,
+                        len(partial_text),
+                    )
                     raise PromptTimeout(session_id, effective_timeout, partial_text)
 
                 # Poll with the smaller of 0.1s or remaining time
@@ -759,18 +583,15 @@ class AcpClient:
             # Get the final response
             result = await prompt_task
             stop_reason = result.get("stopReason")
-            if require_known_stop_reason:
-                if not isinstance(stop_reason, str) or stop_reason not in DIRECT_STOP_REASONS:
-                    raise RuntimeError(
-                        "direct ACP prompt omitted a known non-empty stopReason"
-                    )
-            elif not isinstance(stop_reason, str) or not stop_reason:
-                stop_reason = "end_turn"
+            if not isinstance(stop_reason, str) or stop_reason not in DIRECT_STOP_REASONS:
+                raise RuntimeError(
+                    "direct ACP prompt omitted a known non-empty stopReason"
+                )
             yield {"done": True, "stopReason": stop_reason}
 
         finally:
             self._update_queues.pop(session_id, None)
-            getattr(self, "_direct_update_budgets", {}).pop(session_id, None)
+            self._direct_update_budgets.pop(session_id, None)
             if prompt_task is not None and not prompt_task.done():
                 prompt_task.cancel()
                 await asyncio.gather(prompt_task, return_exceptions=True)
@@ -787,25 +608,13 @@ class AcpClient:
     async def set_model(self, session_id: str, model_id: str) -> None:
         """Change the model for an existing session."""
 
-        if self._callback_policy is CallbackPolicy.DIRECT_DENY:
-            self._require_direct_session_catalog(session_id, model_id)
-            await self._bind_direct_model(session_id, model_id)
-        else:
-            await self._try_set_model(session_id, model_id)
+        self._require_direct_session_catalog(session_id, model_id)
+        await self._bind_direct_model(session_id, model_id)
 
     async def _initialize(self) -> None:
         """Complete the ACP initialization handshake."""
         client_capabilities: dict[str, Any]
-        if (
-            getattr(self, "_callback_policy", CallbackPolicy.LEGACY_PERMISSIVE)
-            is CallbackPolicy.DIRECT_DENY
-        ):
-            client_capabilities = {}
-        else:
-            client_capabilities = {
-                "fs": {"readTextFile": True, "writeTextFile": True},
-                "terminal": True,
-            }
+        client_capabilities = {}
         result = await self._transport.send_request(
             "initialize",
             {
@@ -814,56 +623,34 @@ class AcpClient:
                 "clientCapabilities": client_capabilities,
             },
         )
-        direct_mode = (
-            getattr(self, "_callback_policy", CallbackPolicy.LEGACY_PERMISSIVE)
-            is CallbackPolicy.DIRECT_DENY
+        logger.debug(
+            "initialize response received: protocol_type=%s "
+            "agent_info_present=%s capabilities_present=%s auth_present=%s",
+            type(result.get("protocolVersion")).__name__,
+            isinstance(result.get("agentInfo"), dict),
+            isinstance(result.get("agentCapabilities"), dict),
+            bool(result.get("authMethods", result.get("signin"))),
         )
-        if direct_mode:
-            logger.debug(
-                "initialize response received: protocol_type=%s "
-                "agent_info_present=%s capabilities_present=%s auth_present=%s",
-                type(result.get("protocolVersion")).__name__,
-                isinstance(result.get("agentInfo"), dict),
-                isinstance(result.get("agentCapabilities"), dict),
-                bool(result.get("authMethods", result.get("signin"))),
-            )
-        else:
-            logger.debug("initialize response: %s", result)
         info = result.get("agentInfo", {})
         protocol_version = result.get("protocolVersion")
         if type(protocol_version) is not int or protocol_version != 1:
-            if direct_mode:
-                raise RuntimeError("direct ACP protocol version mismatch")
+            raise RuntimeError("direct ACP protocol version mismatch")
             raise RuntimeError(
                 f"ACP protocol version mismatch: expected 1, got {protocol_version!r}"
             )
         self._protocol_version = protocol_version
         self._agent_name = info.get("name")
         self._agent_version = info.get("version")
-        if direct_mode:
-            logger.info("Initialized direct ACP agent: protocol=%s", protocol_version)
-        else:
-            logger.info(
-                "Initialized: %s v%s, protocol=%s",
-                self._agent_name,
-                self._agent_version,
-                result.get("protocolVersion"),
-            )
+        logger.info("Initialized direct ACP agent: protocol=%s", protocol_version)
         # Log capabilities for debugging environment differences
         caps = result.get("agentCapabilities")
         if not isinstance(caps, dict):
             raise TypeError("initialize response omitted agentCapabilities")
         self._agent_capabilities = dict(caps)
-        if direct_mode:
-            logger.debug("Server capabilities received: count=%d", len(caps))
-        else:
-            logger.debug("Server capabilities: %s", caps)
+        logger.debug("Server capabilities received: count=%d", len(caps))
         auth = result.get("authMethods", result.get("signin", {}))
         if auth:
-            if direct_mode:
-                logger.debug("ACP auth methods reported")
-            else:
-                logger.debug("Auth methods: %s", auth)
+            logger.debug("ACP auth methods reported")
 
     def _extract_models(self, models_data: dict[str, Any]) -> None:
         """Extract available models from a session/new response."""
@@ -877,39 +664,6 @@ class AcpClient:
                 )
             )
         self._default_model = models_data.get("currentModelId")
-
-    async def _try_set_model(self, session_id: str, model_id: str) -> None:
-        """Select a model for the deprecated legacy adapter."""
-
-        methods = [
-            ("session/set_model", {"sessionId": session_id, "modelId": model_id}),
-            (
-                "session/set_config_option",
-                {"sessionId": session_id, "configId": "model", "value": model_id},
-            ),
-        ]
-        for method, params in methods:
-            try:
-                await self._transport.send_request(method, params)
-                if session_id in self._sessions:
-                    self._sessions[session_id].model_id = model_id
-                logger.info(
-                    "Set model for session %s to %s (via %s)",
-                    session_id,
-                    model_id,
-                    method,
-                )
-                return
-            except AcpError as exc:
-                if "not found" in str(exc).lower():
-                    logger.debug("%s not supported, trying next method", method)
-                    continue
-                raise
-
-        raise RuntimeError(
-            f"Model selection not supported by this server. "
-            f"Tried: {[method for method, _ in methods]}. Requested model: {model_id}"
-        )
 
     async def _bind_direct_model(self, session_id: str, model_id: str) -> None:
         """Bind one direct session with the frozen generation strategy."""
@@ -933,41 +687,6 @@ class AcpClient:
             ) from None
 
         logger.info("Bound requested direct model via %s", strategy)
-
-    async def _settle_compatibility_model(
-        self, session_id: str, model_id: str
-    ) -> None:
-        """Preserve the pre-negotiation exact-session API outside direct mode."""
-
-        try:
-            await self._set_copilot_model_settled(session_id, model_id)
-        except AcpError as exc:
-            if exc.error_obj.get("code") != -32601:
-                raise ModelAcknowledgementError(
-                    "copilot-language-server rejected the requested session model"
-                ) from None
-        else:
-            return
-
-        prior_model = (
-            self._sessions[session_id].model_id
-            if session_id in self._sessions
-            else None
-        )
-        try:
-            await self._set_config_option_exact(session_id, model_id)
-        except ModelAcknowledgementError:
-            if session_id in self._sessions:
-                self._sessions[session_id].model_id = prior_model
-            raise
-        except AcpError as exc:
-            if exc.error_obj.get("code") == -32601:
-                raise ModelAcknowledgementError(
-                    "copilot-language-server exposes no supported session model selector"
-                ) from None
-            raise ModelAcknowledgementError(
-                "copilot-language-server rejected the requested session model"
-            ) from None
 
     async def _set_config_option_exact(
         self, session_id: str, model_id: str
@@ -1042,6 +761,8 @@ class AcpClient:
         if not isinstance(params, dict):
             return
         session_id = params.get("sessionId")
+        if not isinstance(session_id, str):
+            return
         binding = self._model_bindings.get(session_id)
         if binding is None:
             return
@@ -1063,107 +784,30 @@ class AcpClient:
             # messages are buffered and the coroutine has not resumed yet.
             binding.response_received = True
 
-    @staticmethod
-    def _extract_text(content: str | list[dict[str, Any]] | None) -> str:
-        """Extract plain text from an OpenAI message content field."""
-        if content is None:
-            return ""
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    parts.append(block["text"])
-            return "\n".join(parts)
-        return ""
-
-    @staticmethod
-    def extract_last_user_message(messages: list[dict[str, Any]]) -> str:
-        """Extract the final user message from an OpenAI messages array.
-
-        The ACP session is stateful and accumulates context across turns.
-        OpenCode sends the full conversation history with every request.
-        Forwarding the full history would duplicate context already in the
-        session. We extract only the last user message — the new content
-        for this turn.
-        """
-        for msg in reversed(messages):
-            if msg.get("role") == "user":
-                return AcpClient._extract_text(msg.get("content"))
-        # Fallback: if no user message, concatenate everything
-        return "\n\n".join(
-            AcpClient._extract_text(m.get("content"))
-            for m in messages
-            if AcpClient._extract_text(m.get("content"))
-        )
-
-    @staticmethod
-    def extract_first_user_message(messages: list[dict[str, Any]]) -> str:
-        """Extract the first user message — the conversation anchor.
-
-        Used to derive a stable session identifier: the first user message
-        is the same across all turns of a conversation (OpenCode replays
-        the full history each time). Hashing it gives a stable key.
-        """
-        for msg in messages:
-            if msg.get("role") == "user":
-                return AcpClient._extract_text(msg.get("content"))
-        return ""
-
-    def _messages_to_prompt(
-        self, messages: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-        """Convert OpenAI messages array to ACP prompt content blocks.
-
-        Extracts only the last user message. The ACP session maintains
-        its own conversation history — we do not replay prior turns.
-        """
-        text = self.extract_last_user_message(messages)
-        return [{"type": "text", "text": text}]
-
     def _handle_notification(self, msg: dict[str, Any]) -> None:
         """Route incoming notifications to the appropriate session queue."""
         method = msg.get("method", "")
         params = msg.get("params", {})
 
-        direct_mode = (
-            getattr(self, "_callback_policy", CallbackPolicy.LEGACY_PERMISSIVE)
-            is CallbackPolicy.DIRECT_DENY
-        )
-        if direct_mode:
-            self._log_direct_session_update(method, params)
-            if not self._direct_model_integrity_holds(params):
-                return
-            if self._handle_direct_state_update(method, params):
-                return
-            if not self._is_valid_direct_session_update(method, params):
-                self._transport.fail_closed(
-                    "direct ACP session update protocol failure"
-                )
-                return
-            session_id = params["sessionId"]
-            update = params["update"]
-            if update.get("sessionUpdate") in {"tool_call", "tool_call_update"}:
-                logger.info(
-                    "Tool activity [%s] in direct evidence stream",
-                    update["sessionUpdate"],
-                )
-            self._enqueue_direct_update(session_id, update)
+        self._log_direct_session_update(method, params)
+        if not self._direct_model_integrity_holds(params):
             return
-
-        if method == "session/update":
-            session_id = params.get("sessionId", "")
-            update = params.get("update", {})
-            update_type = update.get("sessionUpdate", "unknown")
-            # Log tool_call updates at INFO so we can see what the LSP
-            # is doing with tools — this is critical for understanding
-            # the tool execution model.
-            if update_type in ("tool_call", "tool_call_update"):
-                logger.info("Tool activity [%s]: %s", update_type, _summarize(update))
-            queue = self._update_queues.get(session_id)
-            if queue:
-                queue.put_nowait(update)
+        if self._handle_direct_state_update(method, params):
+            return
+        if not self._is_valid_direct_session_update(method, params):
+            self._transport.fail_closed(
+                "direct ACP session update protocol failure"
+            )
+            return
+        session_id = params["sessionId"]
+        update = params["update"]
+        if update.get("sessionUpdate") in {"tool_call", "tool_call_update"}:
+            logger.info(
+                "Tool activity [%s] in direct evidence stream",
+                update["sessionUpdate"],
+            )
+        self._enqueue_direct_update(session_id, update)
+        return
 
     def _log_direct_session_update(self, method: Any, params: Any) -> None:
         """Log correlation-safe structure for a direct session update."""
@@ -1209,7 +853,7 @@ class AcpClient:
             pending_session_new,
             isinstance(session_id, str) and session_id in self._update_queues,
         )
-        if kind == "config_option_update":
+        if kind == "config_option_update" and isinstance(update, dict):
             self._log_direct_config_option_shape(update)
 
     @staticmethod
@@ -1268,7 +912,7 @@ class AcpClient:
         if not isinstance(options, list):
             return True
         session = self._sessions.get(session_id)
-        binding = getattr(self, "_model_bindings", {}).get(session_id)
+        binding = self._model_bindings.get(session_id)
         selected_model = (
             binding.target_model
             if binding is not None
@@ -1337,7 +981,7 @@ class AcpClient:
             or not isinstance(update, dict)
             or not isinstance(kind, str)
             or kind not in _DIRECT_SESSION_STATE_UPDATE_TYPES
-            or getattr(self, "_direct_prompt_phases", {}).get(session_id) == "active"
+            or self._direct_prompt_phases.get(session_id) == "active"
         ):
             return False
         if not self._is_bounded_direct_state_update(kind, update):
@@ -1470,7 +1114,7 @@ class AcpClient:
     ) -> bool:
         """Bound direct evidence before retaining it in the reader-side queue."""
 
-        budget = getattr(self, "_direct_update_budgets", {}).get(session_id)
+        budget = self._direct_update_budgets.get(session_id)
         queue = self._update_queues.get(session_id)
         if budget is None or queue is None:
             self._transport.fail_closed(
@@ -1512,7 +1156,7 @@ class AcpClient:
     ) -> bool:
         """Validate the direct evidence stream before admitting any update.
 
-        Direct mode has one active prompt queue per ACP session.  Unknown,
+        Each ACP session has one active prompt queue. Unknown,
         pre-prompt, or post-prompt updates cannot be assigned truthfully to a
         Meadow request, so they revoke continuity rather than being dropped.
         """
@@ -1529,7 +1173,7 @@ class AcpClient:
             or not isinstance(update, dict)
         ):
             return False
-        if getattr(self, "_direct_prompt_phases", {}).get(session_id) != "active":
+        if self._direct_prompt_phases.get(session_id) != "active":
             return False
         kind = update.get("sessionUpdate")
         if not isinstance(kind, str) or kind not in DIRECT_SESSION_UPDATE_TYPES:
@@ -1570,11 +1214,6 @@ class AcpClient:
     ) -> None:
         """Open a direct update epoch only after prompt bytes are on the wire."""
 
-        if (
-            getattr(self, "_callback_policy", CallbackPolicy.LEGACY_PERMISSIVE)
-            is not CallbackPolicy.DIRECT_DENY
-        ):
-            return
         if method != "session/prompt":
             return
         session_id = params.get("sessionId") if isinstance(params, dict) else None
@@ -1596,11 +1235,6 @@ class AcpClient:
     ) -> None:
         """Order session creation, model binding, and prompt settlement."""
 
-        if (
-            getattr(self, "_callback_policy", CallbackPolicy.LEGACY_PERMISSIVE)
-            is not CallbackPolicy.DIRECT_DENY
-        ):
-            return
         if method == "session/new":
             self._observe_session_new_response(_message)
             return
@@ -1625,7 +1259,7 @@ class AcpClient:
             return
         if (
             not isinstance(session_id, str)
-            or getattr(self, "_direct_prompt_phases", {}).get(session_id) != "active"
+            or self._direct_prompt_phases.get(session_id) != "active"
             or queue is None
         ):
             self._transport.fail_closed(
@@ -1640,64 +1274,19 @@ class AcpClient:
             return
         queue.put_nowait(dict(_DIRECT_PROMPT_TERMINAL_MARKER))
 
-    def _handle_agent_request(self, msg: dict[str, Any]) -> Any:
-        """Handle incoming requests from the agent.
-
-        The agent may request:
-        - session/request_permission: auto-approve in Agent mode
-        - fs/read_text_file: read file from disk
-        - fs/write_text_file: write file to disk
-        - terminal/*: terminal operations
-
-        For now, auto-approve permissions and handle fs operations directly.
-        Terminal operations are handled with basic subprocess execution.
-        """
+    def _handle_agent_request(self, msg: dict[str, Any]) -> dict[str, object]:
+        """Cancel permission requests and deny unadvertised workspace callbacks."""
         method = msg.get("method", "")
-        params = msg.get("params", {})
 
-        if (
-            getattr(self, "_callback_policy", CallbackPolicy.LEGACY_PERMISSIVE)
-            is CallbackPolicy.DIRECT_DENY
-        ):
-            if method == "session/request_permission":
-                return {"outcome": {"outcome": "cancelled"}}
-            raise PermissionError(
-                f"ACP callback {method!r} was not advertised in Meadow direct mode"
-            )
-
-        logger.info("Agent request: %s params=%s", method, _summarize(params))
-
-        handler = {
-            "session/request_permission": self._handle_permission_request,
-            "fs/read_text_file": self._handle_read_file,
-            "fs/write_text_file": self._handle_write_file,
-            "terminal/create": self._handle_terminal_create,
-            "terminal/output": self._handle_terminal_output,
-            "terminal/wait_for_exit": self._handle_terminal_wait,
-            "terminal/release": self._handle_terminal_release,
-            "terminal/kill": self._handle_terminal_kill,
-        }.get(method)
-
-        if handler is None:
-            logger.warning("Unhandled agent request: %s params=%s", method, params)
-            return None
-
-        try:
-            result = handler(params)
-            logger.info("Agent request %s → response=%s", method, _summarize(result))
-            return result
-        except Exception:
-            logger.exception("Agent request %s failed", method)
-            raise
+        if method == "session/request_permission":
+            return {"outcome": {"outcome": "cancelled"}}
+        raise PermissionError(
+            f"ACP callback {method!r} was not advertised in Meadow direct mode"
+        )
 
     def _observe_agent_request(self, msg: dict[str, Any]) -> None:
         """Queue sanitized direct callback evidence at transport-read order."""
 
-        if (
-            getattr(self, "_callback_policy", CallbackPolicy.LEGACY_PERMISSIVE)
-            is not CallbackPolicy.DIRECT_DENY
-        ):
-            return
         method = str(msg.get("method", ""))
         params = msg.get("params", {})
         if not isinstance(params, dict):
@@ -1708,13 +1297,13 @@ class AcpClient:
         session_id = params.get("sessionId")
         if (
             not isinstance(session_id, str)
-            or getattr(self, "_direct_prompt_phases", {}).get(session_id) != "active"
+            or self._direct_prompt_phases.get(session_id) != "active"
         ):
             self._transport.fail_closed(
                 "direct ACP callback correlation protocol failure"
             )
             return
-        queue = getattr(self, "_update_queues", {}).get(session_id)
+        queue = self._update_queues.get(session_id)
         if queue is None:
             self._transport.fail_closed(
                 "direct ACP callback correlation protocol failure"
@@ -1756,164 +1345,3 @@ class AcpClient:
                 "outcome": "denied",
             },
         )
-
-    def _handle_permission_request(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Auto-approve all permission requests."""
-        options = params.get("options", [])
-        # Prefer allow_always, then allow_once
-        for opt in options:
-            if opt.get("kind") == "allow_always":
-                logger.info("Auto-approving (always): %s", opt.get("name"))
-                return {"outcome": {"outcome": "selected", "optionId": opt["optionId"]}}
-        for opt in options:
-            if opt.get("kind") == "allow_once":
-                logger.info("Auto-approving (once): %s", opt.get("name"))
-                return {"outcome": {"outcome": "selected", "optionId": opt["optionId"]}}
-        # Fallback: select first option
-        if options:
-            logger.info("Auto-selecting first option: %s", options[0].get("name"))
-            return {
-                "outcome": {"outcome": "selected", "optionId": options[0]["optionId"]}
-            }
-        return {"outcome": {"outcome": "cancelled"}}
-
-    def _handle_read_file(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Read a file from disk."""
-        path = params.get("path", "")
-        line = params.get("line")
-        limit = params.get("limit")
-        try:
-            with open(path) as f:
-                lines = f.readlines()
-            if line is not None:
-                start = max(0, line - 1)  # 1-based to 0-based
-                if limit is not None:
-                    lines = lines[start : start + limit]
-                else:
-                    lines = lines[start:]
-            content = "".join(lines)
-            return {"content": content}
-        except Exception as e:
-            logger.error("Failed to read %s: %s", path, e)
-            raise
-
-    def _handle_write_file(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Write content to a file."""
-        import os
-
-        path = params.get("path", "")
-        content = params.get("content", "")
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as f:
-                f.write(content)
-            return {}
-        except Exception as e:
-            logger.error("Failed to write %s: %s", path, e)
-            raise
-
-    # --- Terminal handling ---
-    # Basic implementation using asyncio subprocesses.
-    # Terminal state is tracked in _terminals dict.
-
-    _terminals: ClassVar[dict[str, dict[str, Any]]] = {}
-    _terminal_counter: ClassVar[int] = 0
-
-    def _handle_terminal_create(self, params: dict[str, Any]) -> Any:
-        """Create a terminal (run a command asynchronously)."""
-        import subprocess as sp
-
-        command = params.get("command", "")
-        args = params.get("args", [])
-        cwd = params.get("cwd")
-        env_vars = params.get("env", [])
-
-        import os
-
-        env = dict(os.environ)
-        for var in env_vars:
-            env[var["name"]] = var["value"]
-
-        self.__class__._terminal_counter += 1
-        term_id = f"term_{self.__class__._terminal_counter}"
-
-        try:
-            proc = sp.Popen(
-                [command] + args,
-                cwd=cwd,
-                env=env,
-                stdout=sp.PIPE,
-                stderr=sp.STDOUT,
-                text=True,
-            )
-            self.__class__._terminals[term_id] = {
-                "process": proc,
-                "output": "",
-                "byte_limit": params.get("outputByteLimit"),
-            }
-            logger.info("Created terminal %s: %s %s", term_id, command, args)
-            return {"terminalId": term_id}
-        except Exception as e:
-            logger.error("Failed to create terminal: %s", e)
-            raise
-
-    def _handle_terminal_output(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Get current terminal output."""
-        term_id = params.get("terminalId", "")
-        term = self.__class__._terminals.get(term_id)
-        if not term:
-            return {"output": "", "truncated": False}
-
-        proc = term["process"]
-        # Read any available output
-        if proc.stdout and proc.poll() is not None:
-            remaining = proc.stdout.read()
-            if remaining:
-                term["output"] += remaining
-
-        exit_status = None
-        if proc.poll() is not None:
-            exit_status = {"exitCode": proc.returncode, "signal": None}
-
-        return {
-            "output": term["output"],
-            "truncated": False,
-            "exitStatus": exit_status,
-        }
-
-    def _handle_terminal_wait(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Wait for terminal to exit."""
-        term_id = params.get("terminalId", "")
-        term = self.__class__._terminals.get(term_id)
-        if not term:
-            return {"exitCode": 1, "signal": None}
-
-        proc = term["process"]
-        try:
-            stdout, _ = proc.communicate(timeout=120)
-            if stdout:
-                term["output"] += stdout
-        except Exception:  # noqa: BLE001 - legacy subprocess boundary
-            proc.kill()
-        return {"exitCode": proc.returncode, "signal": None}
-
-    def _handle_terminal_release(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Release a terminal."""
-        term_id = params.get("terminalId", "")
-        term = self.__class__._terminals.pop(term_id, None)
-        if term:
-            proc = term["process"]
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
-        return {}
-
-    def _handle_terminal_kill(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Kill terminal command without releasing."""
-        term_id = params.get("terminalId", "")
-        term = self.__class__._terminals.get(term_id)
-        if term:
-            proc = term["process"]
-            if proc.poll() is None:
-                proc.kill()
-        return {}

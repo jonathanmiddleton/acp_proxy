@@ -1,8 +1,8 @@
 """Unit tests for the ACP client layer.
 
-Covers message extraction (ADR-002, ADR-004), agent callback handlers
-(ADR-007), model management, and notification routing. These tests
-exercise client.py in isolation — no subprocess, no transport.
+Covers denied callback authority, model binding, session-state correlation,
+and prompt deadlines. Tests use in-process transport boundaries and never
+launch a Copilot subprocess.
 """
 
 from __future__ import annotations
@@ -16,421 +16,19 @@ import pytest
 
 from acp_proxy.client import (
     AcpClient,
-    AcpSessionDescriptor,
-    CallbackPolicy,
     DirectModelBindingStrategy,
     ModelAcknowledgementError,
     ModelInfo,
     SessionState,
 )
 from acp_proxy.transport import AcpTransport
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _make_messages(*roles_and_contents: tuple[str, str | list | None]) -> list[dict]:
-    """Build an OpenAI-format messages array from (role, content) pairs."""
-    return [{"role": r, "content": c} for r, c in roles_and_contents]
-
-
-# ---------------------------------------------------------------------------
-# _extract_text
-# ---------------------------------------------------------------------------
-
-
-class TestExtractText:
-    """AcpClient._extract_text handles the three content shapes OpenCode sends."""
-
-    def test_string_content(self):
-        assert AcpClient._extract_text("hello world") == "hello world"
-
-    def test_none_content(self):
-        assert AcpClient._extract_text(None) == ""
-
-    def test_list_with_text_blocks(self):
-        content = [
-            {"type": "text", "text": "part one"},
-            {"type": "text", "text": "part two"},
-        ]
-        assert AcpClient._extract_text(content) == "part one\npart two"
-
-    def test_list_with_mixed_block_types(self):
-        """Non-text blocks (images, resources) are skipped."""
-        content = [
-            {"type": "image", "url": "http://example.com/img.png"},
-            {"type": "text", "text": "the text"},
-        ]
-        assert AcpClient._extract_text(content) == "the text"
-
-    def test_empty_list(self):
-        assert AcpClient._extract_text([]) == ""
-
-    def test_empty_string(self):
-        assert AcpClient._extract_text("") == ""
-
-
-# ---------------------------------------------------------------------------
-# extract_last_user_message (ADR-004)
-# ---------------------------------------------------------------------------
-
-
-class TestExtractLastUserMessage:
-    """ADR-004: only the last user message is forwarded to the ACP session."""
-
-    def test_single_user_message(self):
-        msgs = _make_messages(("user", "hello"))
-        assert AcpClient.extract_last_user_message(msgs) == "hello"
-
-    def test_multi_turn_returns_last_user(self):
-        """With full history replay, returns only the newest user message."""
-        msgs = _make_messages(
-            ("system", "You are helpful."),
-            ("user", "first question"),
-            ("assistant", "first answer"),
-            ("user", "second question"),
-        )
-        assert AcpClient.extract_last_user_message(msgs) == "second question"
-
-    def test_system_messages_stripped(self):
-        """System messages (OpenCode's prompt) are never returned."""
-        msgs = _make_messages(
-            ("system", "You are a coding assistant with tools..."),
-            ("user", "help me"),
-        )
-        assert AcpClient.extract_last_user_message(msgs) == "help me"
-
-    def test_assistant_messages_stripped(self):
-        """Assistant messages from prior turns are not included."""
-        msgs = _make_messages(
-            ("user", "question"),
-            ("assistant", "answer"),
-            ("user", "follow-up"),
-        )
-        result = AcpClient.extract_last_user_message(msgs)
-        assert result == "follow-up"
-        assert "answer" not in result
-
-    def test_system_reminder_in_earlier_user_message_stripped(self):
-        """<system-reminder> tags in earlier user messages don't leak through."""
-        msgs = _make_messages(
-            ("user", "<system-reminder>build mode</system-reminder>\nfirst msg"),
-            ("assistant", "ok"),
-            ("user", "second msg"),
-        )
-        result = AcpClient.extract_last_user_message(msgs)
-        assert result == "second msg"
-        assert "system-reminder" not in result
-
-    def test_list_content_in_last_user_message(self):
-        """Content blocks (list format) are extracted correctly."""
-        msgs = [
-            {"role": "user", "content": [{"type": "text", "text": "from blocks"}]},
-        ]
-        assert AcpClient.extract_last_user_message(msgs) == "from blocks"
-
-    def test_no_user_messages_fallback(self):
-        """If no user message exists, concatenate all non-empty content."""
-        msgs = _make_messages(
-            ("system", "system prompt"),
-            ("assistant", "stray assistant"),
-        )
-        result = AcpClient.extract_last_user_message(msgs)
-        assert "system prompt" in result
-        assert "stray assistant" in result
-
-    def test_none_content_user_message_skipped(self):
-        """A user message with None content is skipped in favor of earlier ones."""
-        msgs = _make_messages(
-            ("user", "real content"),
-            ("assistant", "reply"),
-            ("user", None),
-        )
-        # The last user message has None content, _extract_text returns "",
-        # but the method still returns it (empty string). The fallback only
-        # triggers when there are NO user messages at all.
-        result = AcpClient.extract_last_user_message(msgs)
-        # It returns "" because the last user message has None content
-        assert result == ""
-
-
-# ---------------------------------------------------------------------------
-# extract_first_user_message (ADR-002)
-# ---------------------------------------------------------------------------
-
-
-class TestExtractFirstUserMessage:
-    """ADR-002: first user message is the stable conversation anchor for session ID."""
-
-    def test_returns_first_user_message(self):
-        msgs = _make_messages(
-            ("system", "system prompt"),
-            ("user", "first question"),
-            ("assistant", "answer"),
-            ("user", "second question"),
-        )
-        assert AcpClient.extract_first_user_message(msgs) == "first question"
-
-    def test_stable_across_turns(self):
-        """Simulates OpenCode's full-replay: first user message is the same."""
-        turn_1 = _make_messages(("user", "hello agent"))
-        turn_2 = _make_messages(
-            ("user", "hello agent"),
-            ("assistant", "hi"),
-            ("user", "follow up"),
-        )
-        assert AcpClient.extract_first_user_message(
-            turn_1
-        ) == AcpClient.extract_first_user_message(turn_2)
-
-    def test_no_user_messages_returns_empty(self):
-        msgs = _make_messages(("system", "only system"))
-        assert AcpClient.extract_first_user_message(msgs) == ""
-
-    def test_system_message_not_returned(self):
-        """System messages are not user messages even though they come first."""
-        msgs = _make_messages(
-            ("system", "I am a system prompt"),
-            ("user", "I am the user"),
-        )
-        assert AcpClient.extract_first_user_message(msgs) == "I am the user"
-
-    def test_title_generator_different_anchor(self):
-        """Title generator messages differ from conversation messages."""
-        conversation = _make_messages(("user", "help me refactor this function"))
-        title_gen = _make_messages(
-            ("user", "You are a title generator. Summarize: help me refactor...")
-        )
-        assert AcpClient.extract_first_user_message(
-            conversation
-        ) != AcpClient.extract_first_user_message(title_gen)
-
-
-# ---------------------------------------------------------------------------
-# _messages_to_prompt (ADR-004)
-# ---------------------------------------------------------------------------
-
-
-class TestMessagesToPrompt:
-    """ADR-004: messages are converted to a single ACP text content block."""
-
-    def test_returns_single_text_block(self):
-        client = AcpClient.__new__(AcpClient)
-        msgs = _make_messages(
-            ("system", "ignored system prompt"),
-            ("user", "first question"),
-            ("assistant", "first answer"),
-            ("user", "second question"),
-        )
-        result = client._messages_to_prompt(msgs)
-        assert len(result) == 1
-        assert result[0]["type"] == "text"
-        assert result[0]["text"] == "second question"
-
-    def test_opencode_system_prompt_not_in_output(self):
-        """OpenCode's ~15K system prompt must never reach the ACP session."""
-        client = AcpClient.__new__(AcpClient)
-        long_system = "You are OpenCode. " * 1000
-        msgs = _make_messages(
-            ("system", long_system),
-            ("user", "actual question"),
-        )
-        result = client._messages_to_prompt(msgs)
-        assert "OpenCode" not in result[0]["text"]
-        assert result[0]["text"] == "actual question"
-
-
-# ---------------------------------------------------------------------------
-# _handle_permission_request (ADR-007)
-# ---------------------------------------------------------------------------
-
-
-class TestHandlePermissionRequest:
-    """ADR-007: auto-approve with priority allow_always > allow_once > first."""
-
-    def _make_client(self) -> AcpClient:
-        client = AcpClient.__new__(AcpClient)
-        client._sessions = {}
-        client._update_queues = {}
-        client._direct_prompt_phases = {}
-        client._direct_update_budgets = {}
-        client._model_bindings = {}
-        client._provisional_session_ids = set()
-        client._session_new_response_ids = set()
-        return client
-
-    def test_prefers_allow_always(self):
-        client = self._make_client()
-        params = {
-            "options": [
-                {"optionId": "1", "kind": "allow_once", "name": "Once"},
-                {"optionId": "2", "kind": "allow_always", "name": "Always"},
-                {"optionId": "3", "kind": "deny", "name": "Deny"},
-            ]
-        }
-        result = client._handle_permission_request(params)
-        assert result["outcome"]["optionId"] == "2"
-        assert result["outcome"]["outcome"] == "selected"
-
-    def test_falls_back_to_allow_once(self):
-        client = self._make_client()
-        params = {
-            "options": [
-                {"optionId": "1", "kind": "deny", "name": "Deny"},
-                {"optionId": "2", "kind": "allow_once", "name": "Once"},
-            ]
-        }
-        result = client._handle_permission_request(params)
-        assert result["outcome"]["optionId"] == "2"
-
-    def test_falls_back_to_first_option(self):
-        client = self._make_client()
-        params = {
-            "options": [
-                {"optionId": "1", "kind": "deny", "name": "Deny"},
-            ]
-        }
-        result = client._handle_permission_request(params)
-        assert result["outcome"]["optionId"] == "1"
-
-    def test_empty_options_returns_cancelled(self):
-        client = self._make_client()
-        params = {"options": []}
-        result = client._handle_permission_request(params)
-        assert result["outcome"]["outcome"] == "cancelled"
-
-
-# ---------------------------------------------------------------------------
-# _handle_read_file (ADR-007)
-# ---------------------------------------------------------------------------
-
-
-class TestHandleReadFile:
-    """ADR-007: fs/read_text_file callback reads from disk."""
-
-    def _make_client(self) -> AcpClient:
-        client = AcpClient.__new__(AcpClient)
-        return client
-
-    def test_read_full_file(self, tmp_path):
-        client = self._make_client()
-        f = tmp_path / "test.txt"
-        f.write_text("line one\nline two\nline three\n")
-        result = client._handle_read_file({"path": str(f)})
-        assert result["content"] == "line one\nline two\nline three\n"
-
-    def test_read_with_line_and_limit(self, tmp_path):
-        client = self._make_client()
-        f = tmp_path / "test.txt"
-        f.write_text("line1\nline2\nline3\nline4\nline5\n")
-        result = client._handle_read_file({"path": str(f), "line": 2, "limit": 2})
-        assert result["content"] == "line2\nline3\n"
-
-    def test_read_with_line_no_limit(self, tmp_path):
-        client = self._make_client()
-        f = tmp_path / "test.txt"
-        f.write_text("a\nb\nc\nd\n")
-        result = client._handle_read_file({"path": str(f), "line": 3})
-        assert result["content"] == "c\nd\n"
-
-    def test_read_nonexistent_file_raises(self):
-        client = self._make_client()
-        with pytest.raises(FileNotFoundError):
-            client._handle_read_file({"path": "/nonexistent/path/file.txt"})
-
-
-# ---------------------------------------------------------------------------
-# _handle_write_file (ADR-007)
-# ---------------------------------------------------------------------------
-
-
-class TestHandleWriteFile:
-    """ADR-007: fs/write_text_file callback writes to disk."""
-
-    def _make_client(self) -> AcpClient:
-        client = AcpClient.__new__(AcpClient)
-        return client
-
-    def test_write_creates_file(self, tmp_path):
-        client = self._make_client()
-        target = tmp_path / "output.txt"
-        client._handle_write_file({"path": str(target), "content": "hello"})
-        assert target.read_text() == "hello"
-
-    def test_write_creates_intermediate_directories(self, tmp_path):
-        client = self._make_client()
-        target = tmp_path / "a" / "b" / "c" / "file.txt"
-        client._handle_write_file({"path": str(target), "content": "nested"})
-        assert target.read_text() == "nested"
-
-    def test_write_overwrites_existing(self, tmp_path):
-        client = self._make_client()
-        target = tmp_path / "existing.txt"
-        target.write_text("old content")
-        client._handle_write_file({"path": str(target), "content": "new content"})
-        assert target.read_text() == "new content"
-
-
-# ---------------------------------------------------------------------------
-# _handle_agent_request dispatch (ADR-007)
-# ---------------------------------------------------------------------------
-
-
-class TestHandleAgentRequest:
-    """ADR-007: incoming agent requests are dispatched to the correct handler."""
-
-    def _make_client(self) -> AcpClient:
-        client = AcpClient.__new__(AcpClient)
-        client._sessions = {}
-        client._update_queues = {}
-        client._direct_prompt_phases = {}
-        client._direct_update_budgets = {}
-        client._model_bindings = {}
-        return client
-
-    def test_unknown_method_returns_none(self):
-        client = self._make_client()
-        result = client._handle_agent_request(
-            {"method": "unknown/method", "params": {}}
-        )
-        assert result is None
-
-    def test_permission_request_dispatched(self):
-        client = self._make_client()
-        result = client._handle_agent_request(
-            {
-                "method": "session/request_permission",
-                "params": {
-                    "options": [
-                        {"optionId": "1", "kind": "allow_always", "name": "Allow"}
-                    ]
-                },
-            }
-        )
-        assert result["outcome"]["outcome"] == "selected"
-
-    def test_handler_exception_propagates(self, tmp_path):
-        client = self._make_client()
-        with pytest.raises(FileNotFoundError):
-            client._handle_agent_request(
-                {
-                    "method": "fs/read_text_file",
-                    "params": {"path": "/nonexistent/file.txt"},
-                }
-            )
-
-
-# ---------------------------------------------------------------------------
-# _handle_notification routing
-# ---------------------------------------------------------------------------
-
+from tests.test_transport import FakeProcess
 
 class TestHandleNotification:
     """Notifications are routed to the correct session's update queue."""
 
     def _make_client(self) -> AcpClient:
-        client = AcpClient.__new__(AcpClient)
+        client = AcpClient("unused")
         client._sessions = {}
         client._update_queues = {}
         client._direct_prompt_phases = {}
@@ -440,51 +38,6 @@ class TestHandleNotification:
         client._session_new_response_ids = set()
         return client
 
-    def test_session_update_routed_to_queue(self):
-        client = self._make_client()
-        queue: asyncio.Queue = asyncio.Queue()
-        client._update_queues["session-1"] = queue
-
-        client._handle_notification(
-            {
-                "method": "session/update",
-                "params": {
-                    "sessionId": "session-1",
-                    "update": {
-                        "sessionUpdate": "agent_message_chunk",
-                        "content": {"type": "text", "text": "hello"},
-                    },
-                },
-            }
-        )
-        assert not queue.empty()
-        update = queue.get_nowait()
-        assert update["sessionUpdate"] == "agent_message_chunk"
-
-    def test_unknown_session_id_silently_dropped(self):
-        """Updates for sessions we're not tracking are dropped without error."""
-        client = self._make_client()
-        # No queues registered — should not raise
-        client._handle_notification(
-            {
-                "method": "session/update",
-                "params": {
-                    "sessionId": "unknown-session",
-                    "update": {"sessionUpdate": "agent_message_chunk"},
-                },
-            }
-        )
-
-    def test_non_session_update_notification_ignored(self):
-        """Notifications that aren't session/update are handled gracefully."""
-        client = self._make_client()
-        # Should not raise even though no handler exists for this method
-        client._handle_notification(
-            {
-                "method": "some/other_notification",
-                "params": {},
-            }
-        )
 
     @pytest.mark.parametrize(
         "message",
@@ -530,12 +83,11 @@ class TestHandleNotification:
         ],
     )
     def test_direct_unknown_late_or_malformed_update_fails_continuity(
-        self, message
+        self, message: dict[str, object]
     ) -> None:
         """ADI-08/10: direct mode never silently drops ambiguous evidence."""
 
         client = self._make_client()
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._direct_prompt_phases = {"active": "active"}
         client._sessions = {
             "known-but-not-prompting": SessionState(
@@ -557,10 +109,9 @@ class TestHandleNotification:
         """A well-formed active direct update remains ordered in its sole queue."""
 
         client = self._make_client()
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._direct_prompt_phases = {"active": "active"}
         client._sessions = {"active": SessionState(session_id="active")}
-        queue: asyncio.Queue = asyncio.Queue()
+        queue: asyncio.Queue[dict[str, object] | None] = asyncio.Queue()
         client._update_queues["active"] = queue
         client._direct_update_budgets["active"] = {
             "bytes": 0,
@@ -603,10 +154,9 @@ class TestHandleNotification:
         """ADI-08: agent-defined diagnostics are retained but not interpreted."""
 
         client = self._make_client()
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._direct_prompt_phases = {"active": "active"}
         client._sessions = {"active": SessionState(session_id="active")}
-        queue: asyncio.Queue = asyncio.Queue()
+        queue: asyncio.Queue[dict[str, object] | None] = asyncio.Queue()
         client._update_queues["active"] = queue
         client._direct_update_budgets["active"] = {
             "bytes": 0,
@@ -630,7 +180,6 @@ class TestHandleNotification:
         """ADI-03/08: a config notification cannot silently change the model."""
 
         client = self._make_client()
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._sessions = {
             "session": SessionState(
                 session_id="session", model_id="gpt-5.3-codex"
@@ -667,7 +216,6 @@ class TestHandleNotification:
         """A binding notification corroborates but does not settle the model RPC."""
 
         client = self._make_client()
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._sessions = {
             "session": SessionState(session_id="session", model_id="auto")
         }
@@ -705,7 +253,6 @@ class TestHandleNotification:
         """A pending binding permits only its prior model and requested target."""
 
         client = self._make_client()
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._sessions = {
             "session": SessionState(session_id="session", model_id="auto")
         }
@@ -746,7 +293,6 @@ class TestHandleNotification:
         """A complete config snapshot must preserve ready and binding models."""
 
         client = self._make_client()
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._sessions = {
             "session": SessionState(session_id="session", model_id="ready-model")
         }
@@ -783,7 +329,6 @@ class TestHandleNotification:
         """A matching post-binding snapshot is validated and discarded."""
 
         client = self._make_client()
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._sessions = {
             "session": SessionState(session_id="session", model_id="target")
         }
@@ -829,14 +374,13 @@ class TestHandleNotification:
         """ADI-03/08: active prompt evidence cannot normalize a model change."""
 
         client = self._make_client()
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._sessions = {
             "session": SessionState(
                 session_id="session", model_id="gpt-5.3-codex"
             )
         }
         client._direct_prompt_phases = {"session": "active"}
-        queue: asyncio.Queue = asyncio.Queue()
+        queue: asyncio.Queue[dict[str, object] | None] = asyncio.Queue()
         client._update_queues = {"session": queue}
         client._direct_update_budgets = {
             "session": {
@@ -877,7 +421,6 @@ class TestHandleNotification:
         """Known state is accepted without retaining an unused command snapshot."""
 
         client = self._make_client()
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._sessions = {"session": SessionState(session_id="session")}
         client._transport = MagicMock()
         commands = [{"name": "test", "description": "command"}]
@@ -914,7 +457,6 @@ class TestHandleNotification:
         """Diagnostics identify update shape without retaining agent-controlled data."""
 
         client = self._make_client()
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._transport = MagicMock()
         client._transport.pending_request_count.return_value = 1
         sensitive_session_id = "sensitive-session-id"
@@ -954,7 +496,6 @@ class TestHandleNotification:
         """Config diagnostics expose semantic shape without option data."""
 
         client = self._make_client()
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._transport = MagicMock()
         client._transport.pending_request_count.return_value = 1
         sensitive_value = "sensitive-current-value"
@@ -1033,7 +574,6 @@ class TestHandleNotification:
         """Stable state may precede session/new without becoming client state."""
 
         client = self._make_client()
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._transport = MagicMock()
         client._transport.pending_request_count.return_value = 1
 
@@ -1086,7 +626,6 @@ class TestHandleNotification:
         """A pending create does not authorize prompt-scoped evidence."""
 
         client = self._make_client()
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._transport = MagicMock()
         client._transport.pending_request_count.return_value = 1
 
@@ -1144,7 +683,6 @@ class TestHandleNotification:
         """Creation correlation never turns malformed state into tolerated noise."""
 
         client = self._make_client()
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._transport = MagicMock()
         client._transport.pending_request_count.return_value = 1
 
@@ -1201,7 +739,6 @@ class TestHandleNotification:
         """Every accepted creation-state kind shares one per-update byte bound."""
 
         client = self._make_client()
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._transport = MagicMock()
         client._transport.pending_request_count.return_value = 1
 
@@ -1225,7 +762,6 @@ class TestHandleNotification:
         """ADI-08/15: unknown pre-response IDs cannot flood retained state."""
 
         client = self._make_client()
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._transport = MagicMock()
         client._transport.pending_request_count.return_value = 1
 
@@ -1254,7 +790,6 @@ class TestHandleNotification:
         """ADI-03/08: a returned session ID must match its provisional stream."""
 
         client = self._make_client()
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._provisional_session_ids = {"provisional"}
         client._transport = MagicMock()
         client._transport.pending_request_count.return_value = 0
@@ -1273,7 +808,6 @@ class TestHandleNotification:
         """Response and waiter scheduling cannot orphan another valid create."""
 
         client = self._make_client()
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._provisional_session_ids = {"session-a"}
         client._transport = MagicMock()
 
@@ -1306,25 +840,10 @@ class TestHandleNotification:
     async def test_direct_session_new_response_bridges_registration_gap(self) -> None:
         """Buffered state after the response is correlated before task resumption."""
 
-        class StubStdin:
-            def __init__(self) -> None:
-                self.written: list[bytes] = []
-
-            def write(self, data: bytes) -> None:
-                self.written.append(data)
-
-            async def drain(self) -> None:
-                return None
-
-        class StubProcess:
-            def __init__(self) -> None:
-                self.stdin = StubStdin()
-
-        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        client = AcpClient("unused")
         transport = AcpTransport()
-        process = StubProcess()
-        transport._process = process  # type: ignore[assignment]
-        transport.set_strict_response_correlation(True)
+        process = FakeProcess()
+        transport._process = process
         transport.on_notification(client._handle_notification)
         transport.on_response_observed(client._observe_response)
         client._transport = transport
@@ -1398,10 +917,9 @@ class TestHandleNotification:
         """ADI-08/15: a fast child cannot outpace bounded evidence retention."""
 
         client = self._make_client()
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._sessions = {"session": SessionState(session_id="session")}
         client._direct_prompt_phases = {"session": "active"}
-        queue: asyncio.Queue = asyncio.Queue(maxsize=count_limit + 1)
+        queue: asyncio.Queue[dict[str, object] | None] = asyncio.Queue(maxsize=count_limit + 1)
         client._update_queues = {"session": queue}
         client._direct_update_budgets = {
             "session": {
@@ -1436,7 +954,6 @@ class TestHandleNotification:
         """ADI-03/08: every complete config option item is structurally checked."""
 
         client = self._make_client()
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._sessions = {
             "session": SessionState(
                 session_id="session", model_id="gpt-5.3-codex"
@@ -1479,9 +996,8 @@ class TestHandleNotification:
         """ADI-08/10: terminal response is an ordered, closed evidence boundary."""
 
         client = self._make_client()
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
         client._sessions = {"active": SessionState(session_id="active")}
-        queue: asyncio.Queue = asyncio.Queue()
+        queue: asyncio.Queue[dict[str, object] | None] = asyncio.Queue()
         client._update_queues["active"] = queue
         client._direct_prompt_phases = {"active": "active"}
         transport = MagicMock()
@@ -1519,40 +1035,6 @@ class TestHandleNotification:
 # ---------------------------------------------------------------------------
 
 
-class TestCreateSession:
-    """Legacy session creation applies a requested non-default model."""
-
-    @pytest.mark.asyncio
-    async def test_nondefault_model_is_set_before_it_is_recorded(self) -> None:
-        client = AcpClient("unused")
-        client._transport = AsyncMock()
-        client._transport.send_request.side_effect = [
-            {
-                "sessionId": "legacy-session",
-                "models": {
-                    "availableModels": [
-                        {"modelId": "auto", "name": "Auto"},
-                        {"modelId": "gpt-4o", "name": "GPT-4o"},
-                    ],
-                    "currentModelId": "auto",
-                },
-            },
-            {},
-        ]
-
-        session_id = await client.create_session("/workspace", model_id="gpt-4o")
-
-        assert session_id == "legacy-session"
-        assert client._transport.send_request.await_args_list == [
-            call("session/new", {"cwd": "/workspace", "mcpServers": []}),
-            call(
-                "session/set_model",
-                {"sessionId": "legacy-session", "modelId": "gpt-4o"},
-            ),
-        ]
-        assert client._sessions[session_id].model_id == "gpt-4o"
-
-
 # ---------------------------------------------------------------------------
 # _extract_models
 # ---------------------------------------------------------------------------
@@ -1562,12 +1044,12 @@ class TestExtractModels:
     """Model catalog parsing from ACP session/new response."""
 
     def _make_client(self) -> AcpClient:
-        client = AcpClient.__new__(AcpClient)
+        client = AcpClient("unused")
         client._models = []
         client._default_model = None
         return client
 
-    def test_typical_response(self):
+    def test_typical_response(self) -> None:
         client = self._make_client()
         client._extract_models(
             {
@@ -1583,13 +1065,13 @@ class TestExtractModels:
         assert client._models[1].meta == {"tier": "free"}
         assert client._default_model == "gpt-4.1"
 
-    def test_empty_models_list(self):
+    def test_empty_models_list(self) -> None:
         client = self._make_client()
         client._extract_models({"availableModels": [], "currentModelId": None})
         assert client._models == []
         assert client._default_model is None
 
-    def test_missing_name_uses_model_id(self):
+    def test_missing_name_uses_model_id(self) -> None:
         client = self._make_client()
         client._extract_models(
             {
@@ -1599,110 +1081,11 @@ class TestExtractModels:
         )
         assert client._models[0].name == "auto"
 
-    def test_missing_available_models_key(self):
+    def test_missing_available_models_key(self) -> None:
         client = self._make_client()
         client._extract_models({})
         assert client._models == []
         assert client._default_model is None
-
-
-# ---------------------------------------------------------------------------
-# _try_set_model
-# ---------------------------------------------------------------------------
-
-
-class TestTrySetModel:
-    """Model selection tries session/set_model, falls back, or raises."""
-
-    @pytest.mark.asyncio
-    async def test_first_method_succeeds(self):
-        """session/set_model works — no fallback needed."""
-        client = AcpClient.__new__(AcpClient)
-        client._sessions = {"s1": SessionState(session_id="s1", model_id="auto")}
-        client._model_bindings = {}
-
-        transport = AsyncMock()
-        transport.send_request = AsyncMock(return_value={})
-        client._transport = transport
-
-        await client._try_set_model("s1", "gpt-4o")
-        transport.send_request.assert_called_once_with(
-            "session/set_model", {"sessionId": "s1", "modelId": "gpt-4o"}
-        )
-        assert client._sessions["s1"].model_id == "gpt-4o"
-        assert client._model_bindings == {}
-
-    @pytest.mark.asyncio
-    async def test_fallback_to_set_config_option(self):
-        """session/set_model fails with 'not found', falls back to set_config_option."""
-        from acp_proxy.transport import AcpError
-
-        client = AcpClient.__new__(AcpClient)
-        client._sessions = {"s1": SessionState(session_id="s1", model_id="auto")}
-        client._model_bindings = {}
-
-        call_count = 0
-
-        async def mock_send(method, params):
-            nonlocal call_count
-            call_count += 1
-            if method == "session/set_model":
-                raise AcpError("Method not found", {"code": -32601})
-            return {
-                "configOptions": [
-                    {"id": "model", "currentValue": params["value"]}
-                ]
-            }
-
-        transport = MagicMock()
-        transport.send_request = mock_send
-        client._transport = transport
-
-        await client._try_set_model("s1", "gpt-4o")
-        assert call_count == 2
-        assert client._sessions["s1"].model_id == "gpt-4o"
-        assert client._model_bindings == {}
-
-    @pytest.mark.asyncio
-    async def test_both_methods_fail_raises(self):
-        """Both methods return method-not-found and leave the default bound."""
-        from acp_proxy.transport import AcpError
-
-        client = AcpClient.__new__(AcpClient)
-        client._sessions = {"s1": SessionState(session_id="s1", model_id="auto")}
-        client._model_bindings = {}
-
-        async def mock_send(method, params):
-            raise AcpError("Method not found", {"code": -32601})
-
-        transport = MagicMock()
-        transport.send_request = mock_send
-        client._transport = transport
-
-        with pytest.raises(RuntimeError, match="Model selection not supported"):
-            await client._try_set_model("s1", "gpt-4o")
-        assert client._sessions["s1"].model_id == "auto"
-        assert client._model_bindings == {}
-
-    @pytest.mark.asyncio
-    async def test_legacy_rejected_setter_propagates(self) -> None:
-        """Legacy retains its existing raw ACP error behavior."""
-        from acp_proxy.transport import AcpError
-
-        client = AcpClient.__new__(AcpClient)
-        client._sessions = {"s1": SessionState(session_id="s1", model_id="auto")}
-        client._model_bindings = {}
-        client._transport = AsyncMock()
-        client._transport.send_request.side_effect = AcpError(
-            "rejected with sensitive detail",
-            {"code": -32000},
-        )
-
-        with pytest.raises(AcpError, match="rejected with sensitive detail"):
-            await client._try_set_model("s1", "gpt-4o")
-
-        assert client._sessions["s1"].model_id == "auto"
-        assert client._model_bindings == {}
 
 
 class TestDirectModelBindingNegotiation:
@@ -1710,7 +1093,7 @@ class TestDirectModelBindingNegotiation:
 
     @staticmethod
     def _client() -> AcpClient:
-        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        client = AcpClient("unused")
         client._sessions = {
             "catalog": SessionState(
                 "catalog",
@@ -1721,29 +1104,11 @@ class TestDirectModelBindingNegotiation:
         client._transport = AsyncMock()
         return client
 
-    @staticmethod
-    def _non_direct_client(*selection_results: object) -> AcpClient:
-        client = AcpClient("unused")
-        client._models = [ModelInfo("target", "Target")]
-        client._transport = AsyncMock()
-        client._transport.send_request.side_effect = [
-            {
-                "sessionId": "session",
-                "models": {
-                    "availableModels": [
-                        {"modelId": "auto", "name": "Auto"},
-                        {"modelId": "target", "name": "Target"},
-                    ],
-                    "currentModelId": "auto",
-                },
-            },
-            *selection_results,
-        ]
-        return client
 
     @pytest.mark.asyncio
     async def test_standard_strategy_wins_without_probing_copilot(self) -> None:
         client = self._client()
+        assert isinstance(client._transport, AsyncMock)
         client._transport.send_request.return_value = {
             "configOptions": [{"id": "model", "currentValue": "auto"}]
         }
@@ -1763,6 +1128,7 @@ class TestDirectModelBindingNegotiation:
         from acp_proxy.transport import AcpError
 
         client = self._client()
+        assert isinstance(client._transport, AsyncMock)
         client._transport.send_request.side_effect = [
             AcpError("standard unavailable", {"code": -32601}),
             {},
@@ -1788,6 +1154,7 @@ class TestDirectModelBindingNegotiation:
         from acp_proxy.transport import AcpError
 
         client = self._client()
+        assert isinstance(client._transport, AsyncMock)
         child_canary = "CHILD-ERROR-MUST-NOT-CROSS"
         client._transport.send_request.side_effect = [
             AcpError(child_canary, {"code": -32601}),
@@ -1810,6 +1177,7 @@ class TestDirectModelBindingNegotiation:
         from acp_proxy.transport import AcpError
 
         client = self._client()
+        assert isinstance(client._transport, AsyncMock)
         client._transport.send_request.side_effect = AcpError(
             "rejected with child detail",
             {"code": error_code},
@@ -1834,6 +1202,7 @@ class TestDirectModelBindingNegotiation:
         self, result: dict[str, Any]
     ) -> None:
         client = self._client()
+        assert isinstance(client._transport, AsyncMock)
         client._transport.send_request.return_value = result
 
         with pytest.raises(ModelAcknowledgementError):
@@ -1846,6 +1215,7 @@ class TestDirectModelBindingNegotiation:
     @pytest.mark.asyncio
     async def test_strategy_is_immutable_until_client_state_is_cleared(self) -> None:
         client = self._client()
+        assert isinstance(client._transport, AsyncMock)
         client._transport.send_request.return_value = {
             "configOptions": [{"id": "model", "currentValue": "auto"}]
         }
@@ -1861,6 +1231,7 @@ class TestDirectModelBindingNegotiation:
     @pytest.mark.asyncio
     async def test_teardown_cannot_restore_an_inflight_strategy(self) -> None:
         client = self._client()
+        assert isinstance(client._transport, AsyncMock)
         setter_started = asyncio.Event()
         release_setter = asyncio.Event()
 
@@ -1886,77 +1257,11 @@ class TestDirectModelBindingNegotiation:
         assert client.direct_model_binding_strategy is None
         assert client._direct_model_binding_negotiation is None
 
-    @pytest.mark.asyncio
-    async def test_exact_compatibility_api_remains_standard_only(self) -> None:
-        client = self._client()
-        client._direct_model_binding_strategy = (
-            DirectModelBindingStrategy.COPILOT_SET_MODEL
-        )
-        client._transport.send_request.return_value = {
-            "configOptions": [{"id": "model", "currentValue": "target"}]
-        }
-
-        observed = await client.acknowledge_session_model("catalog", "target")
-
-        assert observed == "target"
-        client._transport.send_request.assert_awaited_once_with(
-            "session/set_config_option",
-            {"sessionId": "catalog", "configId": "model", "value": "target"},
-        )
-
-    @pytest.mark.asyncio
-    async def test_exact_compatibility_api_rejects_unknown_session(self) -> None:
-        client = self._client()
-
-        with pytest.raises(ModelAcknowledgementError, match="unknown ACP session"):
-            await client.acknowledge_session_model("missing", "target")
-
-        client._transport.send_request.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("code", [-32601, -32000])
-    async def test_exact_compatibility_api_sanitizes_method_errors(
-        self, code: int
-    ) -> None:
-        from acp_proxy.transport import AcpError
-
-        client = self._client()
-        child_canary = "EXACT-API-CHILD-DETAIL"
-        client._transport.send_request.side_effect = AcpError(
-            child_canary,
-            {"code": code, "data": child_canary},
-        )
-
-        with pytest.raises(ModelAcknowledgementError) as exc_info:
-            await client.acknowledge_session_model("catalog", "target")
-
-        assert child_canary not in str(exc_info.value)
-        assert client._sessions["catalog"].model_id == "auto"
-        assert client._model_bindings == {}
-
-    @pytest.mark.asyncio
-    async def test_exact_compatibility_api_rejects_wrong_reported_model(self) -> None:
-        client = self._client()
-        requested = "MODEL-TEXT-CANARY-REQUESTED"
-        observed = "MODEL-TEXT-CANARY-OBSERVED"
-        client._sessions["catalog"].available_model_ids = frozenset(
-            {"auto", requested, observed}
-        )
-        client._transport.send_request.return_value = {
-            "configOptions": [{"id": "model", "currentValue": observed}]
-        }
-
-        with pytest.raises(ModelAcknowledgementError) as exc_info:
-            await client.acknowledge_session_model("catalog", requested)
-
-        assert requested not in str(exc_info.value)
-        assert observed not in str(exc_info.value)
-        assert client._sessions["catalog"].model_id is None
-        assert client._model_bindings == {}
 
     @pytest.mark.asyncio
     async def test_public_direct_set_model_uses_frozen_strategy(self) -> None:
         client = self._client()
+        assert isinstance(client._transport, AsyncMock)
         client._direct_model_binding_strategy = (
             DirectModelBindingStrategy.COPILOT_SET_MODEL
         )
@@ -1969,105 +1274,6 @@ class TestDirectModelBindingNegotiation:
             {"sessionId": "catalog", "modelId": "target"},
         )
         assert client._sessions["catalog"].model_id == "target"
-
-    @pytest.mark.asyncio
-    async def test_non_direct_exact_session_preserves_dynamic_selection(self) -> None:
-        """Programmatic non-direct callers do not require startup negotiation."""
-
-        client = self._non_direct_client({})
-
-        descriptor = await client.create_session_exact("/workspace", "target")
-
-        assert descriptor == AcpSessionDescriptor("session", "target")
-        assert client._transport.send_request.await_args_list == [
-            call("session/new", {"cwd": "/workspace", "mcpServers": []}),
-            call(
-                "session/set_model",
-                {"sessionId": "session", "modelId": "target"},
-            ),
-        ]
-
-    @pytest.mark.asyncio
-    async def test_non_direct_exact_session_falls_back_to_verified_config(
-        self,
-    ) -> None:
-        from acp_proxy.transport import AcpError
-
-        client = self._non_direct_client(
-            AcpError("method missing", {"code": -32601}),
-            {"configOptions": [{"id": "model", "currentValue": "target"}]},
-        )
-
-        descriptor = await client.create_session_exact("/workspace", "target")
-
-        assert descriptor == AcpSessionDescriptor("session", "target")
-        assert client._transport.send_request.await_args_list == [
-            call("session/new", {"cwd": "/workspace", "mcpServers": []}),
-            call(
-                "session/set_model",
-                {"sessionId": "session", "modelId": "target"},
-            ),
-            call(
-                "session/set_config_option",
-                {"sessionId": "session", "configId": "model", "value": "target"},
-            ),
-        ]
-        assert client._model_bindings == {}
-
-    @pytest.mark.asyncio
-    async def test_non_direct_exact_session_rejection_does_not_fallback(
-        self,
-    ) -> None:
-        from acp_proxy.transport import AcpError
-
-        client = self._non_direct_client(
-            AcpError("selection rejected", {"code": -32000})
-        )
-
-        with pytest.raises(ModelAcknowledgementError, match="rejected"):
-            await client.create_session_exact("/workspace", "target")
-
-        assert len(client._transport.send_request.await_args_list) == 2
-        assert client._sessions["session"].model_id == "auto"
-        assert client._model_bindings == {}
-
-    @pytest.mark.asyncio
-    async def test_non_direct_exact_session_fails_when_both_methods_are_missing(
-        self,
-    ) -> None:
-        from acp_proxy.transport import AcpError
-
-        client = self._non_direct_client(
-            AcpError("target method missing", {"code": -32601}),
-            AcpError("standard method missing", {"code": -32601}),
-        )
-
-        with pytest.raises(ModelAcknowledgementError, match="no supported"):
-            await client.create_session_exact("/workspace", "target")
-
-        assert [
-            observed.args[0]
-            for observed in client._transport.send_request.await_args_list
-        ] == ["session/new", "session/set_model", "session/set_config_option"]
-        assert client._sessions["session"].model_id == "auto"
-        assert client._model_bindings == {}
-
-    @pytest.mark.asyncio
-    async def test_non_direct_exact_session_retains_current_on_wrong_config_value(
-        self,
-    ) -> None:
-        from acp_proxy.transport import AcpError
-
-        client = self._non_direct_client(
-            AcpError("target method missing", {"code": -32601}),
-            {"configOptions": [{"id": "model", "currentValue": "auto"}]},
-        )
-
-        with pytest.raises(ModelAcknowledgementError, match="exact model"):
-            await client.create_session_exact("/workspace", "target")
-
-        assert client._sessions["session"].model_id == "auto"
-        assert client._model_bindings == {}
 
 
 class TestDirectAcpContract:
@@ -2084,7 +1290,7 @@ class TestDirectAcpContract:
         session_canary = "T122-BACKEND-SESSION-SECRET"
         agent_canary = "T122-AGENT-INFO-SECRET"
         auth_canary = "T122-AUTH-METHOD-SECRET"
-        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        client = AcpClient("unused")
         transport = AsyncMock()
         transport.send_request.side_effect = [
             {
@@ -2120,7 +1326,7 @@ class TestDirectAcpContract:
         """ADI-02/15: an agent-controlled protocol value cannot escape startup."""
 
         protocol_canary = "T122-PROTOCOL-CREDENTIAL-SECRET"
-        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        client = AcpClient("unused")
         transport = AsyncMock()
         transport.send_request.return_value = {
             "protocolVersion": protocol_canary,
@@ -2144,7 +1350,7 @@ class TestDirectAcpContract:
     ) -> None:
         """ADI-02: bool/float values cannot alias ACP protocol v1."""
 
-        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        client = AcpClient("unused")
         transport = AsyncMock()
         transport.send_request.return_value = {
             "protocolVersion": invalid_protocol,
@@ -2161,8 +1367,7 @@ class TestDirectAcpContract:
         self,
     ) -> None:
         """ADI-02/09: direct initialization is truthful and least-capability."""
-        client = AcpClient.__new__(AcpClient)
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client = AcpClient("unused")
         client._protocol_version = None
         client._agent_capabilities = {}
         client._agent_name = None
@@ -2204,7 +1409,7 @@ class TestDirectAcpContract:
     ) -> None:
         """Every logical session awaits its frozen setter, including the default."""
 
-        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        client = AcpClient("unused")
         client._models = [ModelInfo("target", "Target")]
         client._direct_model_binding_strategy = strategy
         setter_started = asyncio.Event()
@@ -2257,7 +1462,7 @@ class TestDirectAcpContract:
 
     @pytest.mark.asyncio
     async def test_exact_session_requires_negotiated_strategy_before_new(self) -> None:
-        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        client = AcpClient("unused")
         client._models = [ModelInfo("target", "Target")]
         client._transport = AsyncMock()
 
@@ -2286,7 +1491,7 @@ class TestDirectAcpContract:
         session_models: dict[str, Any] | None,
     ) -> None:
         """A logical session never inherits the catalog probe's default."""
-        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        client = AcpClient("unused")
         client._models = [ModelInfo("auto", "Auto")]
         client._default_model = "auto"
         client._direct_model_binding_strategy = (
@@ -2310,7 +1515,7 @@ class TestDirectAcpContract:
     @pytest.mark.asyncio
     async def test_exact_session_revalidates_requested_model_catalog(self) -> None:
         """A model removed from the new session's catalog is not selected."""
-        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        client = AcpClient("unused")
         client._models = [ModelInfo("target", "Target")]
         client._direct_model_binding_strategy = (
             DirectModelBindingStrategy.COPILOT_SET_MODEL
@@ -2333,7 +1538,7 @@ class TestDirectAcpContract:
     @pytest.mark.asyncio
     async def test_rejected_session_cannot_replace_startup_model_catalog(self) -> None:
         """Per-session divergence leaves generation capabilities immutable."""
-        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        client = AcpClient("unused")
         client._transport = AsyncMock()
         client._transport.send_request.side_effect = [
             {
@@ -2389,7 +1594,7 @@ class TestDirectAcpContract:
         """A post-readiness method loss fails instead of switching strategies."""
         from acp_proxy.transport import AcpError
 
-        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        client = AcpClient("unused")
         client._models = [ModelInfo("gpt-5.3-codex", "GPT-5.3 Codex")]
         client._direct_model_binding_strategy = strategy
         client._transport = AsyncMock()
@@ -2449,7 +1654,7 @@ class TestDirectAcpContract:
 
     @pytest.mark.asyncio
     async def test_standard_strategy_rejects_wrong_current_model(self) -> None:
-        client = AcpClient.__new__(AcpClient)
+        client = AcpClient("unused")
         requested = "MODEL_TEXT_CANARY_REQUESTED"
         observed = "MODEL_TEXT_CANARY_OBSERVED"
         client._sessions = {"session": SessionState("session", model_id="auto")}
@@ -2477,7 +1682,7 @@ class TestDirectAcpContract:
         """A rejected setter cannot make the requested model appear bound."""
         from acp_proxy.transport import AcpError
 
-        client = AcpClient("unused", callback_policy=CallbackPolicy.DIRECT_DENY)
+        client = AcpClient("unused")
         client._models = [ModelInfo("gpt-5.3-codex", "GPT-5.3 Codex")]
         client._direct_model_binding_strategy = (
             DirectModelBindingStrategy.COPILOT_SET_MODEL
@@ -2505,7 +1710,7 @@ class TestDirectAcpContract:
     @pytest.mark.asyncio
     async def test_cancel_is_stable_session_notification(self) -> None:
         """ADI-10: cancellation reaches ACP and is not local-task-only."""
-        client = AcpClient.__new__(AcpClient)
+        client = AcpClient("unused")
         client._sessions = {"session": SessionState("session")}
         client._transport = AsyncMock()
 
@@ -2522,8 +1727,8 @@ class TestDirectAcpContract:
     ) -> None:
         """ADI-13/15: evidence backpressure cannot prevent owned teardown."""
 
-        client = AcpClient.__new__(AcpClient)
-        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        client = AcpClient("unused")
+        queue: asyncio.Queue[dict[str, object] | None] = asyncio.Queue(maxsize=1)
         queue.put_nowait({"sessionUpdate": "agent_message_chunk"})
         client._update_queues = {"session": queue}
         client._direct_prompt_phases = {"session": "active"}
@@ -2547,7 +1752,7 @@ class TestDirectAcpContract:
         self, result: dict[str, Any]
     ) -> None:
         """ADI-08/10: direct terminal state is never synthesized or unknown."""
-        client = AcpClient.__new__(AcpClient)
+        client = AcpClient("unused")
         client._sessions = {"session": SessionState("session")}
         client._update_queues = {}
         transport = AsyncMock()
@@ -2562,8 +1767,7 @@ class TestDirectAcpContract:
 
     def test_direct_callback_policy_denies_unadvertised_callbacks(self) -> None:
         """ADI-09: direct callbacks fail closed and never select allow_always."""
-        client = AcpClient.__new__(AcpClient)
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client = AcpClient("unused")
         permission = client._handle_agent_request(
             {
                 "method": "session/request_permission",
@@ -2583,8 +1787,7 @@ class TestDirectAcpContract:
 
     def test_direct_callback_evidence_is_ordered_and_sanitized(self) -> None:
         """ADI-08/09: denied callbacks retain outcome without raw sensitive params."""
-        client = AcpClient.__new__(AcpClient)
-        client._callback_policy = CallbackPolicy.DIRECT_DENY
+        client = AcpClient("unused")
         queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         client._update_queues = {"session": queue}
         client._direct_prompt_phases = {"session": "active"}
@@ -2639,25 +1842,6 @@ class TestDirectAcpContract:
         }
         assert "private" not in repr((permission, denied)).lower()
 
-    @pytest.mark.asyncio
-    async def test_non_not_found_error_propagates(self):
-        """A non-'not found' legacy error is re-raised without fallback."""
-        from acp_proxy.transport import AcpError
-
-        client = AcpClient.__new__(AcpClient)
-        client._sessions = {"s1": SessionState(session_id="s1", model_id="auto")}
-
-        async def mock_send(method, params):
-            raise AcpError("Server exploded", {"code": -32000})
-
-        transport = MagicMock()
-        transport.send_request = mock_send
-        client._transport = transport
-
-        with pytest.raises(AcpError, match="Server exploded"):
-            await client._try_set_model("s1", "gpt-4o")
-        assert client._sessions["s1"].model_id == "auto"
-
 
 # ---------------------------------------------------------------------------
 # Prompt timeout (prompt-level deadline enforcement)
@@ -2667,32 +1851,33 @@ class TestDirectAcpContract:
 class TestPromptTimeout:
     """Prompt-level timeout enforces a deadline on session/prompt.
 
-    The prompt() method must raise PromptTimeout if the ACP server does
+    The prompt_blocks() method must raise PromptTimeout if the ACP server does
     not complete within the configured deadline.  This prevents a hung
     language server from blocking the HTTP connection indefinitely.
     """
 
     @pytest.mark.asyncio
-    async def test_timeout_raises_prompt_timeout(self):
+    async def test_timeout_raises_prompt_timeout(self) -> None:
         """A prompt that exceeds the deadline raises PromptTimeout."""
         from acp_proxy.client import PromptTimeout
 
-        client = AcpClient.__new__(AcpClient)
+        client = AcpClient("unused")
         client._sessions = {"s1": SessionState(session_id="s1")}
         client._update_queues = {}
 
         # Transport that never responds — simulates a hung server
-        async def never_respond(method, params):
+        async def never_respond(method: str, params: dict[str, object]) -> dict[str, object]:
             await asyncio.sleep(999)
+            raise AssertionError("unresponsive transport unexpectedly completed")
 
         transport = MagicMock()
         transport.send_request = never_respond
         client._transport = transport
 
         with pytest.raises(PromptTimeout) as exc_info:
-            async for _ in client.prompt(
+            async for _ in client.prompt_blocks(
                 "s1",
-                [{"role": "user", "content": "hello"}],
+                [{"type": "text", "text": "hello"}],
                 timeout_s=0.2,
             ):
                 pass
@@ -2701,25 +1886,26 @@ class TestPromptTimeout:
         assert exc_info.value.timeout_s == 0.2
 
     @pytest.mark.asyncio
-    async def test_timeout_includes_partial_text(self):
+    async def test_timeout_includes_partial_text(self) -> None:
         """Partial text collected before the timeout is preserved in the exception."""
         from acp_proxy.client import PromptTimeout
 
-        client = AcpClient.__new__(AcpClient)
+        client = AcpClient("unused")
         client._sessions = {"s1": SessionState(session_id="s1")}
         client._update_queues = {}
 
-        async def slow_respond(method, params):
+        async def slow_respond(method: str, params: dict[str, object]) -> dict[str, object]:
             # Wait long enough that chunks are delivered, then hang
             await asyncio.sleep(999)
+            raise AssertionError("unresponsive transport unexpectedly completed")
 
         transport = MagicMock()
         transport.send_request = slow_respond
         client._transport = transport
 
-        async def push_chunks():
+        async def push_chunks() -> None:
             """Push chunks into the queue shortly after it's created."""
-            # Wait for prompt() to create the queue
+            # Wait for prompt_blocks() to create the queue
             for _ in range(50):
                 if "s1" in client._update_queues:
                     break
@@ -2743,9 +1929,9 @@ class TestPromptTimeout:
         push_task = asyncio.create_task(push_chunks())
 
         with pytest.raises(PromptTimeout) as exc_info:
-            async for _ in client.prompt(
+            async for _ in client.prompt_blocks(
                 "s1",
-                [{"role": "user", "content": "hello"}],
+                [{"type": "text", "text": "hello"}],
                 timeout_s=0.5,
             ):
                 pass
@@ -2754,13 +1940,13 @@ class TestPromptTimeout:
         assert exc_info.value.partial_text == "partial response"
 
     @pytest.mark.asyncio
-    async def test_normal_completion_within_timeout(self):
+    async def test_normal_completion_within_timeout(self) -> None:
         """A prompt that completes before the deadline works normally."""
-        client = AcpClient.__new__(AcpClient)
+        client = AcpClient("unused")
         client._sessions = {"s1": SessionState(session_id="s1")}
         client._update_queues = {}
 
-        async def fast_respond(method, params):
+        async def fast_respond(method: str, params: dict[str, object]) -> dict[str, object]:
             # Respond quickly
             await asyncio.sleep(0.05)
             return {"stopReason": "end_turn"}
@@ -2772,7 +1958,7 @@ class TestPromptTimeout:
         client._transport = transport
 
         # Push an update and then let the prompt task complete
-        async def push_update():
+        async def push_update() -> None:
             await asyncio.sleep(0.01)
             q = client._update_queues.get("s1")
             if q:
@@ -2786,9 +1972,9 @@ class TestPromptTimeout:
         asyncio.create_task(push_update())
 
         results = []
-        async for update in client.prompt(
+        async for update in client.prompt_blocks(
             "s1",
-            [{"role": "user", "content": "hi"}],
+            [{"type": "text", "text": "hi"}],
             timeout_s=5.0,
         ):
             results.append(update)
@@ -2797,39 +1983,40 @@ class TestPromptTimeout:
         assert any(r.get("done") for r in results)
 
     @pytest.mark.asyncio
-    async def test_unknown_session_raises_value_error(self):
+    async def test_unknown_session_raises_value_error(self) -> None:
         """Prompting an unknown session raises ValueError, not timeout."""
-        client = AcpClient.__new__(AcpClient)
+        client = AcpClient("unused")
         client._sessions = {}
         client._update_queues = {}
 
         with pytest.raises(ValueError, match="Unknown session"):
-            async for _ in client.prompt(
+            async for _ in client.prompt_blocks(
                 "nonexistent",
-                [{"role": "user", "content": "hello"}],
+                [{"type": "text", "text": "hello"}],
             ):
                 pass
 
     @pytest.mark.asyncio
-    async def test_queue_cleanup_after_timeout(self):
+    async def test_queue_cleanup_after_timeout(self) -> None:
         """The update queue is removed after a timeout to prevent leaks."""
         from acp_proxy.client import PromptTimeout
 
-        client = AcpClient.__new__(AcpClient)
+        client = AcpClient("unused")
         client._sessions = {"s1": SessionState(session_id="s1")}
         client._update_queues = {}
 
-        async def never_respond(method, params):
+        async def never_respond(method: str, params: dict[str, object]) -> dict[str, object]:
             await asyncio.sleep(999)
+            raise AssertionError("unresponsive transport unexpectedly completed")
 
         transport = MagicMock()
         transport.send_request = never_respond
         client._transport = transport
 
         with pytest.raises(PromptTimeout):
-            async for _ in client.prompt(
+            async for _ in client.prompt_blocks(
                 "s1",
-                [{"role": "user", "content": "hello"}],
+                [{"type": "text", "text": "hello"}],
                 timeout_s=0.1,
             ):
                 pass

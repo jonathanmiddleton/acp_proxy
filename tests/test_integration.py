@@ -2,8 +2,7 @@
 
 The tests launch the real CLI and observe only process exit, readiness
 metadata, and TCP HTTP.  Meadow startup owns credential setup, binary
-admission, ACP startup, model negotiation, service construction, and wiring;
-the deprecated legacy contract receives its documented explicit child token.
+admission, ACP startup, model negotiation, service construction, and wiring.
 """
 
 from __future__ import annotations
@@ -28,7 +27,6 @@ from typing import Any, BinaryIO
 import httpx
 import pytest
 
-from acp_proxy.copilot_auth import inject_prior_copilot_oauth
 from acp_proxy.discovery import BinaryCompatibilityError, find_binary
 
 REQUIRED_LIVE_MODEL = "gpt-5.3-codex"
@@ -73,12 +71,10 @@ class LiveProxy:
     base_url: str
     metadata: dict[str, Any]
     debug_log_path: Path
-    launch_secret: str | None = field(default=None, repr=False)
+    launch_secret: str = field(repr=False)
 
     @property
     def authorization_headers(self) -> dict[str, str]:
-        if self.launch_secret is None:
-            raise RuntimeError("this proxy mode has no inbound bearer credential")
         return {"Authorization": f"Bearer {self.launch_secret}"}
 
 
@@ -332,7 +328,7 @@ def _wait_for_readiness(
     )
 
 
-def _wait_for_health(base_url: str, expected_mode: str) -> None:
+def _wait_for_health(base_url: str) -> None:
     deadline = time.monotonic() + 5.0
     last_error: httpx.HTTPError | None = None
     while time.monotonic() < deadline:
@@ -347,11 +343,8 @@ def _wait_for_health(base_url: str, expected_mode: str) -> None:
         assert response.status_code == 200, response.text
         health = response.json()
         assert health["status"] == "ok"
-        assert health["consumer_mode"] == expected_mode
-        if expected_mode == "meadow-direct":
-            assert health["protocol_major"] == 1
-        else:
-            assert health["deprecated"] is True
+        assert health["consumer_mode"] == "meadow-direct"
+        assert health["protocol_major"] == 1
         return
     raise AssertionError(f"proxy health endpoint did not become ready: {last_error}")
 
@@ -360,10 +353,9 @@ def _wait_for_health(base_url: str, expected_mode: str) -> None:
 def _running_proxy(
     *,
     binary: str,
-    consumer_mode: str,
     environment: Mapping[str, str],
     runtime_dir: Path,
-    launch_secret: str | None = None,
+    launch_secret: str,
 ) -> Iterator[LiveProxy]:
     """Launch the real CLI and yield only after its HTTP socket is ready."""
 
@@ -373,8 +365,6 @@ def _running_proxy(
         sys.executable,
         "-m",
         "acp_proxy",
-        "--consumer-mode",
-        consumer_mode,
         "--host",
         "127.0.0.1",
         "--port",
@@ -390,24 +380,23 @@ def _running_proxy(
         "--log-level",
         "INFO",
     ]
-    if consumer_mode == "meadow-direct":
-        command.extend(["--execution-authority", "trusted-host"])
+    command.extend(["--execution-authority", "trusted-host"])
 
     process_env = _source_environment(environment)
-    if launch_secret is not None:
-        process_env[_DIRECT_SECRET_ENV] = launch_secret
+    process_env[_DIRECT_SECRET_ENV] = launch_secret
     sensitive_values = tuple(
         dict.fromkeys(
-            (*_copilot_credential_values(process_env), launch_secret or "")
+            (*_copilot_credential_values(process_env), launch_secret)
         )
     )
     sensitive_values = tuple(value for value in sensitive_values if value)
 
-    process_options: dict[str, Any] = {}
+    creation_flag = 0
     if os.name == "nt":
-        process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        process_options["start_new_session"] = True
+        windows_creation_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP")
+        if not isinstance(windows_creation_flag, int):
+            raise TypeError("Windows subprocess creation flag must be an integer")
+        creation_flag = windows_creation_flag
 
     runtime_dir.mkdir(parents=True, exist_ok=True)
     console = _ConsoleCapture(sensitive_values)
@@ -418,7 +407,8 @@ def _running_proxy(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        **process_options,
+        creationflags=creation_flag,
+        start_new_session=os.name != "nt",
     )
     assert process.stdout is not None
     process_group_id = process.pid
@@ -455,17 +445,16 @@ def _running_proxy(
             assert metadata_pid == process.pid
         assert metadata["status"] == "ready"
         assert metadata["host"] == "127.0.0.1"
-        assert metadata["consumer_mode"] == consumer_mode
+        assert metadata["consumer_mode"] == "meadow-direct"
         port = metadata["port"]
         assert type(port) is int and 1 <= port <= 65535
-        if consumer_mode == "meadow-direct":
-            protocol_major = metadata["protocol_major"]
-            assert type(protocol_major) is int and protocol_major == 1
-            generation_id = metadata["continuity_generation_id"]
-            assert isinstance(generation_id, str)
-            assert _PATH_SAFE_GENERATION.fullmatch(generation_id) is not None
+        protocol_major = metadata["protocol_major"]
+        assert type(protocol_major) is int and protocol_major == 1
+        generation_id = metadata["continuity_generation_id"]
+        assert isinstance(generation_id, str)
+        assert _PATH_SAFE_GENERATION.fullmatch(generation_id) is not None
         base_url = f"http://127.0.0.1:{port}"
-        _wait_for_health(base_url, consumer_mode)
+        _wait_for_health(base_url)
         ready = True
         yield LiveProxy(
             base_url=base_url,
@@ -548,27 +537,9 @@ def meadow_proxy(binary: str, tmp_path: Path) -> Iterator[LiveProxy]:
     launch_secret = secrets.token_urlsafe(32)
     with _running_proxy(
         binary=binary,
-        consumer_mode="meadow-direct",
         environment=os.environ,
         runtime_dir=tmp_path / "meadow-direct",
         launch_secret=launch_secret,
-    ) as proxy:
-        yield proxy
-
-
-@pytest.fixture
-def legacy_proxy(binary: str, tmp_path: Path) -> Iterator[LiveProxy]:
-    """Run the deprecated production adapter with an explicit child credential."""
-
-    legacy_environment = inject_prior_copilot_oauth(dict(os.environ))
-    assert _copilot_credential_values(legacy_environment), (
-        "legacy credential provisioning did not produce a Copilot child token"
-    )
-    with _running_proxy(
-        binary=binary,
-        consumer_mode="opencode-legacy",
-        environment=legacy_environment,
-        runtime_dir=tmp_path / "opencode-legacy",
     ) as proxy:
         yield proxy
 
@@ -607,8 +578,6 @@ def test_meadow_direct_cli_rejects_missing_oauth_before_child_start(
             sys.executable,
             "-m",
             "acp_proxy",
-            "--consumer-mode",
-            "meadow-direct",
             "--execution-authority",
             "trusted-host",
             "--port",
@@ -679,8 +648,7 @@ def test_meadow_direct_proxy_model_binding_and_continuity(
         assert UNADVERTISED_LIVE_MODEL not in capabilities["model_ids"]
 
         legacy_route = http.get("/v1/models")
-        assert legacy_route.status_code == 410, legacy_route.text
-        assert legacy_route.json()["error"]["code"] == "legacy_mode_required"
+        assert legacy_route.status_code == 404, legacy_route.text
 
         stable_instructions = ""
         stable_digest = hashlib.sha256(stable_instructions.encode("utf-8")).hexdigest()
