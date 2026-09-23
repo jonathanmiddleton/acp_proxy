@@ -3,7 +3,7 @@
 This index tracks all Architecture Decision Records in this repository.
 See [GUIDE.md](GUIDE.md) for how and when to write ADRs.
 
-## Proxy architecture and protocol bridging
+## Bridge architecture and protocol bridging
 
 - [ADR-001: Route OpenCode Through ACP Proxy to copilot-language-server](001-acp-proxy-architecture.md) — historical; adapter removed by ADR-018
 - [ADR-003: System Prompt Injection as Primary Control Surface](003-system-prompt-injection.md) — historical; adapter removed by ADR-018
@@ -32,3 +32,5 @@ See [GUIDE.md](GUIDE.md) for how and when to write ADRs.
 - [ADR-017: Change-Relative Typing and a Complete Checkout Gate](017-change-relative-typing-and-checkout-gate.md)
 
 - [ADR-018: Remove the Deprecated OpenAI-Compatible Adapter](018-remove-openai-compatible-adapter.md) — direct ACP remains the sole consumer contract
+
+- [ADR-019: Meadow Bridge Product Identity](019-meadow-bridge-product-identity.md) — coordinated breaking product/package/command rename; direct wire contract retained

@@ -10,8 +10,8 @@ from typing import Any
 
 import pytest
 
-from acp_proxy.raw_events import RawEventCapture, RawEventCaptureError
-from acp_proxy.transport import AcpError, AcpTransport
+from meadow_bridge.raw_events import RawEventCapture, RawEventCaptureError
+from meadow_bridge.transport import AcpError, AcpTransport
 from tests.test_transport import FakeProcess
 
 

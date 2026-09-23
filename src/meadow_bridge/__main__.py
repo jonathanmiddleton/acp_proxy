@@ -2,7 +2,7 @@
 Entry point for the authenticated direct ACP service.
 
 Usage:
-    acp-proxy [OPTIONS]
+    meadow-bridge [OPTIONS]
 
     Start the proxy from your project directory. The current working directory
     becomes the ACP workspace — the copilot-language-server scans it and scopes
@@ -13,8 +13,8 @@ Usage:
     --host HOST         Address to bind (default: 127.0.0.1).
     --port PORT         Port to listen on (default: 8765). Use 0 for ephemeral.
     --cwd PATH          Working directory for ACP sessions (default: current dir)
-    --log-level LEVEL   Console logging level (default: DEBUG)
-    --log-file PATH     Log file path (default: logs/proxy.log)
+    --log-level LEVEL   Console logging level (default: WARNING)
+    --log-file PATH     Log file path (default: logs/meadow-bridge.log)
     --metadata-file     Write JSON metadata (port, pid, status) after startup.
 """
 
@@ -58,13 +58,13 @@ from .raw_events import RawEventCaptureError
 
 logger = logging.getLogger(__name__)
 
-LOG_LEVEL_ENV = "ACP_PROXY_LOG_LEVEL"
+LOG_LEVEL_ENV = "MEADOW_BRIDGE_LOG_LEVEL"
 LOG_LEVEL_CHOICES = ("DEBUG", "INFO", "WARNING", "ERROR")
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB per file
 LOG_BACKUP_COUNT = 3
-DIRECT_SECRET_ENV = "ACP_PROXY_MEADOW_SECRET"
-CONTAINER_BOUNDARY_ENV = "ACP_PROXY_CONTAINER_BOUNDARY"
+DIRECT_SECRET_ENV = "MEADOW_BRIDGE_MEADOW_SECRET"
+CONTAINER_BOUNDARY_ENV = "MEADOW_BRIDGE_CONTAINER_BOUNDARY"
 CONTAINER_MARKERS = ("/run/.containerenv", "/.dockerenv")
 DIRECT_CHILD_ENV_KEYS = frozenset(
     {
@@ -265,7 +265,7 @@ def _validate_startup(
     if execution_authority == "confined-container":
         if os.environ.get(CONTAINER_BOUNDARY_ENV) != "1":
             raise ValueError(
-                "confined-container requires ACP_PROXY_CONTAINER_BOUNDARY=1 from "
+                "confined-container requires MEADOW_BRIDGE_CONTAINER_BOUNDARY=1 from "
                 "the managed container launcher"
             )
         if not _has_observable_container_boundary():
@@ -436,7 +436,7 @@ async def run(
         # Run the server main loop in a background task
         server_task = asyncio.create_task(server.main_loop())
 
-        logger.info("Proxy listening on http://%s:%d", host, actual_port)
+        logger.info("Meadow Bridge listening on http://%s:%d", host, actual_port)
         logger.info(
             "Direct capabilities endpoint: http://%s:%d/meadow/v1/capabilities",
             host,
@@ -456,7 +456,7 @@ async def run(
         await asyncio.gather(signal_task, child_task, return_exceptions=True)
 
         if child_task in done and child_lost_event.is_set():
-            logger.error("Owned ACP child transport closed; stopping proxy")
+            logger.error("Owned ACP child transport closed; stopping Meadow Bridge")
             if generation_loss_task is not None:
                 await generation_loss_task
             elif direct_service is not None:
@@ -474,7 +474,7 @@ async def run(
             await generation_loss_task
         if direct_service is not None:
             await direct_service.mark_generation_lost(
-                "owned proxy is shutting down", expected_shutdown=True
+                "owned Meadow Bridge is shutting down", expected_shutdown=True
             )
         if server is not None and server_start_attempted:
             try:
@@ -490,7 +490,7 @@ async def run(
             raise
         except Exception:
             logger.exception("ACP child cleanup failed")
-        logger.info("Proxy stopped.")
+        logger.info("Meadow Bridge stopped.")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -524,13 +524,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Console logging level (default: DEBUG during development). "
+        help="Console logging level (default: WARNING, or MEADOW_BRIDGE_LOG_LEVEL). "
         "File always logs DEBUG.",
     )
     parser.add_argument(
         "--log-file",
-        default="logs/proxy.log",
-        help="Log file path (default: logs/proxy.log). DEBUG level always.",
+        default="logs/meadow-bridge.log",
+        help="Log file path (default: logs/meadow-bridge.log). DEBUG level always.",
     )
     parser.add_argument(
         "--raw-event-file",

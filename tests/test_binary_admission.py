@@ -12,9 +12,9 @@ import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from acp_proxy import discovery
-from acp_proxy.application_policy import MIN_COPILOT_LANGUAGE_SERVER_VERSION
-from acp_proxy.discovery import (
+from meadow_bridge import discovery
+from meadow_bridge.application_policy import MIN_COPILOT_LANGUAGE_SERVER_VERSION
+from meadow_bridge.discovery import (
     BinaryCompatibilityError,
     _probe_binary_version,
     _read_bounded_version_output,
@@ -105,7 +105,7 @@ def test_version_probe_env_matches_windows_names_case_insensitively() -> None:
     source = {
         "SYSTEMROOT": r"C:\Windows",
         "appdata": r"C:\Users\example\AppData\Roaming",
-        "ACP_PROXY_MEADOW_SECRET": "must-not-pass",
+        "MEADOW_BRIDGE_MEADOW_SECRET": "must-not-pass",
     }
 
     assert _version_probe_env(source) == {
@@ -268,7 +268,7 @@ def test_version_probe_excludes_ambient_credentials(
         unix=(
             "#!/bin/sh\n"
             "if [ -n \"$MEADOW_OPENAI_API_KEY\" ] || "
-            "[ -n \"$ACP_PROXY_MEADOW_SECRET\" ]; then\n"
+            "[ -n \"$MEADOW_BRIDGE_MEADOW_SECRET\" ]; then\n"
             "  printf '9.9.9\\n'\n"
             "else\n"
             f"  printf '{configured_version}\\n'\n"
@@ -276,14 +276,14 @@ def test_version_probe_excludes_ambient_credentials(
         ),
         windows=(
             "@if defined MEADOW_OPENAI_API_KEY (echo 9.9.9) else "
-            "if defined ACP_PROXY_MEADOW_SECRET (echo 9.9.9) else "
+            "if defined MEADOW_BRIDGE_MEADOW_SECRET (echo 9.9.9) else "
             f"echo {configured_version}\r\n"
         ),
     )
 
     monkeypatch.setenv("PATH", "/safe/path")
     monkeypatch.setenv("MEADOW_OPENAI_API_KEY", "provider-canary")
-    monkeypatch.setenv("ACP_PROXY_MEADOW_SECRET", "launch-canary")
+    monkeypatch.setenv("MEADOW_BRIDGE_MEADOW_SECRET", "launch-canary")
 
     assert _probe_binary_version(binary) == MIN_COPILOT_LANGUAGE_SERVER_VERSION
 

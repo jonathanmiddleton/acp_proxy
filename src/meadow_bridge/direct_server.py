@@ -36,7 +36,7 @@ def create_direct_app(service: DirectService) -> FastAPI:
     """Create an app that exposes only the direct Meadow consumer mode."""
 
     app = FastAPI(
-        title="ACP Proxy Meadow Direct API",
+        title="Meadow Bridge Meadow Direct API",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,

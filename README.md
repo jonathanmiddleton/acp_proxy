@@ -1,10 +1,10 @@
-# ACP Proxy
+# Meadow Bridge
 
 Connects Meadow to the installed GitHub Copilot `copilot-language-server`
 through its ACP interface and the authenticated `/meadow/v1` HTTP contract.
 
 ```
-Meadow → ACP Proxy `/meadow/v1` → copilot-language-server (ACP)
+Meadow → Meadow Bridge `/meadow/v1` → copilot-language-server (ACP)
 ```
 
 Copilot owns model access, authentication refresh, and agent-internal tools.
@@ -51,8 +51,8 @@ an equivalent pre-shared value through a secret manager, then bind loopback:
 
 ```bash
 cd ~/projects/my-app
-export ACP_PROXY_MEADOW_SECRET='<at-least-32-secret-bytes>'
-acp-proxy \
+export MEADOW_BRIDGE_MEADOW_SECRET='<at-least-32-secret-bytes>'
+meadow-bridge \
   --execution-authority trusted-host
 ```
 
@@ -72,7 +72,7 @@ its `/v1/*` routes have been removed.
 
 `confined-container` may bind `0.0.0.0` only inside an actual container runtime
 with both the runtime marker and the managed launch attestation
-`ACP_PROXY_CONTAINER_BOUNDARY=1`. This profile is intended for a private
+`MEADOW_BRIDGE_CONTAINER_BOUNDARY=1`. This profile is intended for a private
 container namespace. Meadow's managed launcher publishes its host port only on
 loopback. The proxy can observe the runtime marker but cannot inspect external
 port publishing, so a standalone operator must provide an equally private
@@ -105,14 +105,14 @@ release, plugin layout, and bundled architecture are not compatibility
 evidence. To specify the path explicitly:
 
 ```bash
-acp-proxy --execution-authority trusted-host --binary /path/to/copilot-language-server
+meadow-bridge --execution-authority trusted-host --binary /path/to/copilot-language-server
 ```
 
 `--binary` bypasses candidate discovery only. The selected executable must
 still report a strict `MAJOR.MINOR.PATCH` version at or above that configured
 application minimum.
 
-`python -m acp_proxy` supports the same mandatory options.
+`python -m meadow_bridge` supports the same mandatory options.
 
 ## Development and validation
 
@@ -169,11 +169,11 @@ completion.
 
 ## Configuration
 
-On first run, the proxy creates a default config at `~/.acp_proxy/config.json`:
+On first run, the proxy creates a default config at `~/.meadow_bridge/config.json`:
 
 ```json
 {
-  "_doc": "ACP Proxy configuration. See README.md for details.",
+  "_doc": "Meadow Bridge configuration. See README.md for details.",
   "https_proxy": "",
   "http_proxy": "",
   "no_proxy": "localhost,127.0.0.1"
@@ -235,9 +235,9 @@ Key references: [session setup](https://agentclientprotocol.com/protocol/session
 | `--binary`        | auto-discovered   | Path to `copilot-language-server`                                              |
 | `--host`          | 127.0.0.1         | Address on which the HTTP server listens                                       |
 | `--port`          | 8765              | Port for the HTTP server                                                       |
-| `--cwd`           | current directory | Working directory for ACP sessions (default: `cwd` where acp_proxy is executed |
+| `--cwd`           | current directory | Working directory for ACP sessions (default: `cwd` where meadow_bridge is executed |
 | `--log-level`     | WARNING           | DEBUG, INFO, WARNING, ERROR; environment override supported            |
-| `--log-file`      | logs/proxy.log    | Log file path (always DEBUG level)                                             |
+| `--log-file`      | logs/meadow-bridge.log    | Log file path (always DEBUG level)                                             |
 | `--raw-event-file` | disabled        | Separate opt-in NDJSON capture of full ACP updates and prompt boundaries       |
 | `--execution-authority` | none        | Required direct profile: `trusted-host` or `confined-container`                |
 
@@ -268,6 +268,6 @@ Records are flushed without truncation or rotation. A bounded writer queue
 keeps filesystem I/O off the event loop; overflow or I/O failure reports an
 error, revokes transport continuity, and makes proxy shutdown fail.
 
-Meadow's `acp_proxy.capture_raw_events: true` setting passes a run-owned file at
+Meadow's `meadow_bridge.capture_raw_events: true` setting passes a run-owned file at
 `<run-log-directory>/acp-events-<run_id>.jsonl`. Both the host proxy installation
 and any selected container image must include this option.

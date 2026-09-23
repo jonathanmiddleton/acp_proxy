@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run ACP Proxy's complete repository checkout gate.
+"""Run Meadow Bridge's complete repository checkout gate.
 
 The executable inventory is intentionally centralized here so agents and
 developers invoke one standard-library Python entry point instead of copying a
@@ -426,7 +426,7 @@ def main() -> int:
         return 0
 
     log_directory = Path(
-        tempfile.mkdtemp(prefix="acp-proxy-checkout-gate-")
+        tempfile.mkdtemp(prefix="meadow-bridge-checkout-gate-")
     ).resolve()
     step_count = sum(len(suite.steps) for suite in SUITES)
     print(

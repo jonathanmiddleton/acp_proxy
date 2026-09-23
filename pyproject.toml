@@ -1,6 +1,6 @@
 [project]
-name = "acp-proxy"
-version = "0.2.1"
+name = "meadow-bridge"
+version = "0.3.0"
 description = "Authenticated Meadow integration with GitHub Copilot over ACP"
 requires-python = ">=3.11"
 dependencies = [
@@ -22,7 +22,7 @@ dev = [
 ]
 
 [project.scripts]
-acp-proxy = "acp_proxy.__main__:main"
+meadow-bridge = "meadow_bridge.__main__:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"

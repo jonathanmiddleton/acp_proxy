@@ -8,6 +8,9 @@
 > Historical observations below are retained; only remaining direct ACP
 > provisions govern the current service.
 
+> **Product identity amendment:** [ADR-019](019-meadow-bridge-product-identity.md)
+> replaces the product, package and command names with Meadow Bridge.
+
 ## Context
 
 The proxy has evolved from a proof-of-concept bridge into the foundational

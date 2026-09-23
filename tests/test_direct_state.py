@@ -6,7 +6,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from acp_proxy.direct_state import (
+from meadow_bridge.direct_state import (
     DirectConflict,
     DirectLedger,
     DirectLimitExceeded,

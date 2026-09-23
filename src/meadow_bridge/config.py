@@ -1,7 +1,7 @@
 """
-User configuration for the ACP proxy.
+User configuration for the Meadow Bridge.
 
-Loads settings from ``~/.acp_proxy/config.json``.  This file is per-user,
+Loads settings from ``~/.meadow_bridge/config.json``.  This file is per-user,
 not per-project — it stores environment-specific settings like proxy
 configuration that apply to all repos on the machine.
 
@@ -18,7 +18,7 @@ from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
 
-_CONFIG_DIR = ".acp_proxy"
+_CONFIG_DIR = ".meadow_bridge"
 _CONFIG_FILE = "config.json"
 
 # Proxy-related environment variable names.  Both upper and lowercase
@@ -34,7 +34,7 @@ _PROXY_ENV_VARS = (
 
 
 def config_dir() -> str:
-    """Return the path to the config directory (``~/.acp_proxy/``)."""
+    """Return the path to the config directory (``~/.meadow_bridge/``)."""
     return os.path.join(os.path.expanduser("~"), _CONFIG_DIR)
 
 
@@ -69,7 +69,7 @@ def ensure_default_config() -> str:
 def load_config() -> dict[str, object]:
     """Load user configuration from disk.
 
-    On first run, creates a default config file at ``~/.acp_proxy/config.json``
+    On first run, creates a default config file at ``~/.meadow_bridge/config.json``
     with default network proxy fields.
 
     Returns an empty dict if the config file cannot be read.
@@ -140,7 +140,7 @@ def build_subprocess_env(cfg: Mapping[str, object] | None = None) -> dict[str, s
 
 # Default network configuration written on first run.
 _DEFAULT_CONFIG: dict[str, str] = {
-    "_doc": "ACP Proxy configuration. See README.md for details.",
+    "_doc": "Meadow Bridge configuration. See README.md for details.",
     "https_proxy": "",
     "http_proxy": "",
     "no_proxy": "localhost,127.0.0.1",

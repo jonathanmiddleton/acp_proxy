@@ -4,7 +4,7 @@ Read this document before making any changes to the codebase. These standards
 are binding and reflect the realities of building on partially documented,
 externally controlled interfaces.
 
-ACP Proxy's ADRs remain
+Meadow Bridge's ADRs remain
 authoritative for its protocols, resource ownership, and failure policy.
 See [ADR-017](adrs/017-change-relative-typing-and-checkout-gate.md) for the
 adoption decision and migration boundary.
@@ -105,7 +105,7 @@ removes the deprecated OpenCode adapter; the direct ACP contract remains binding
 - Gather code that changes for the same reasons behind one owning contract.
   Functions have one responsibility; collaborating modules form cohesive
   packages with a deliberate public surface.
-- Production package code lives in `src/acp_proxy/`; maintained tests live in
+- Production package code lives in `src/meadow_bridge/`; maintained tests live in
   `tests/`, validation tools in `scripts/`, and experiments in `experiments/`.
   The standalone `src/acp_probe.py` and `src/acp_validate.py` diagnostics are
   not production imports.
@@ -307,4 +307,4 @@ When a test depends on an external resource (binary, service, credential):
   their declared owners. Async code can interleave at every `await`; do not
   assume a single event loop makes a multi-step transition atomic.
 - Preserve bounded resource lifetimes, ordered terminal signaling, and explicit
-  failure reporting required by the relevant ACP Proxy ADRs.
+  failure reporting required by the relevant Meadow Bridge ADRs.

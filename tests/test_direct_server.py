@@ -10,21 +10,22 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from starlette.types import Message
 from httpx import ASGITransport, AsyncClient
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from acp_proxy.client import ModelAcknowledgementError, ModelInfo
-from acp_proxy.direct_protocol import (
+from meadow_bridge.client import ModelAcknowledgementError, ModelInfo
+from meadow_bridge.direct_protocol import (
     CancelRequest,
     CreateSessionRequest,
     DirectLimits,
     PromptRequest,
     RetireSessionRequest,
 )
-from acp_proxy.direct_server import RequestBodyLimitMiddleware, create_direct_app
-from acp_proxy.direct_service import DirectGenerationMismatch, DirectService
-from acp_proxy.direct_state import DirectConflict, DirectLimitExceeded
+from meadow_bridge.direct_server import RequestBodyLimitMiddleware, create_direct_app
+from meadow_bridge.direct_service import DirectGenerationMismatch, DirectService
+from meadow_bridge.direct_state import DirectConflict, DirectLimitExceeded
 
 TOKEN = "t" * 48
 
@@ -1120,12 +1121,12 @@ async def test_actual_chunked_request_bytes_are_bounded_without_content_length()
             {"type": "http.request", "body": b"def", "more_body": False},
         )
     )
-    sent: list[dict[str, Any]] = []
+    sent: list[Message] = []
 
     async def receive() -> dict[str, Any]:
         return next(chunks)
 
-    async def send(message: dict[str, Any]) -> None:
+    async def send(message: Message) -> None:
         sent.append(message)
 
     await middleware(
@@ -1165,9 +1166,9 @@ async def test_far_over_limit_first_chunk_is_rejected_before_retention() -> None
             "more_body": False,
         }
 
-    sent: list[dict[str, Any]] = []
+    sent: list[Message] = []
 
-    async def send(message: dict[str, Any]) -> None:
+    async def send(message: Message) -> None:
         sent.append(message)
 
     await middleware(

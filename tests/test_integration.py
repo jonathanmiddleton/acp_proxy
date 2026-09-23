@@ -1,4 +1,4 @@
-"""Black-box integration tests for the proxy's public process contracts.
+"""Black-box integration tests for the bridge's public process contracts.
 
 The tests launch the real CLI and observe only process exit, readiness
 metadata, and TCP HTTP.  Meadow startup owns credential setup, binary
@@ -27,16 +27,16 @@ from typing import Any, BinaryIO
 import httpx
 import pytest
 
-from acp_proxy.discovery import BinaryCompatibilityError, find_binary
+from meadow_bridge.discovery import BinaryCompatibilityError, find_binary
 
 REQUIRED_LIVE_MODEL = "gpt-5.3-codex"
-UNADVERTISED_LIVE_MODEL = "acp-proxy-negative-control-model"
-_DIRECT_SECRET_ENV = "ACP_PROXY_MEADOW_SECRET"
+UNADVERTISED_LIVE_MODEL = "meadow-bridge-negative-control-model"
+_DIRECT_SECRET_ENV = "MEADOW_BRIDGE_MEADOW_SECRET"
 _COPILOT_TOKEN_ENV_NAMES = frozenset(
     {"GH_COPILOT_TOKEN", "GITHUB_COPILOT_TOKEN"}
 )
-_PROXY_START_TIMEOUT_S = 90.0
-_PROXY_STOP_TIMEOUT_S = 20.0
+_BRIDGE_START_TIMEOUT_S = 90.0
+_BRIDGE_STOP_TIMEOUT_S = 20.0
 _CONSOLE_TAIL_BYTES = 256 * 1024
 _HTTP_TIMEOUT = httpx.Timeout(180.0, connect=5.0)
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -65,8 +65,8 @@ _AUTH_GATE_RUNTIME_ENV_NAMES = frozenset(
 
 
 @dataclass(frozen=True)
-class LiveProxy:
-    """One ready proxy process exposed only through its public boundary."""
+class LiveBridge:
+    """One ready bridge process exposed only through its public boundary."""
 
     base_url: str
     metadata: dict[str, Any]
@@ -203,9 +203,9 @@ def _process_diagnostic(
     sensitive_values: tuple[str, ...],
 ) -> str:
     return (
-        f"proxy return code: {process.poll()}\n"
-        f"proxy DEBUG log: {debug_log_path}\n"
-        "bounded proxy console tail:\n"
+        f"bridge return code: {process.poll()}\n"
+        f"bridge DEBUG log: {debug_log_path}\n"
+        "bounded bridge console tail:\n"
         f"{_redact(console.text(), sensitive_values)}"
     )
 
@@ -243,14 +243,14 @@ def _terminate_process_tree(
     graceful: bool,
     process_group_id: int,
 ) -> int:
-    """Stop the owned proxy tree without leaving its ACP child behind."""
+    """Stop the owned bridge tree without leaving its ACP child behind."""
 
     if os.name == "nt":
         if process.poll() is None and graceful:
             try:
                 # Windows process groups disable CTRL+C but accept CTRL+BREAK.
                 process.send_signal(getattr(signal, "CTRL_BREAK_EVENT"))
-                return process.wait(timeout=_PROXY_STOP_TIMEOUT_S)
+                return process.wait(timeout=_BRIDGE_STOP_TIMEOUT_S)
             except (OSError, subprocess.TimeoutExpired):
                 pass
         if process.poll() is None:
@@ -269,7 +269,7 @@ def _terminate_process_tree(
     if return_code is None and graceful:
         process.send_signal(signal.SIGTERM)
         try:
-            return_code = process.wait(timeout=_PROXY_STOP_TIMEOUT_S)
+            return_code = process.wait(timeout=_BRIDGE_STOP_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             pass
     elif return_code is None:
@@ -289,7 +289,7 @@ def _terminate_process_tree(
             _signal_posix_group(process_group_id, signal.SIGKILL)
             if not _wait_for_posix_group_exit(process_group_id, 5.0):
                 raise RuntimeError(
-                    f"proxy process group {process_group_id} survived SIGKILL"
+                    f"bridge process group {process_group_id} survived SIGKILL"
                 )
     return return_code
 
@@ -301,11 +301,11 @@ def _wait_for_readiness(
     debug_log_path: Path,
     sensitive_values: tuple[str, ...],
 ) -> dict[str, Any]:
-    deadline = time.monotonic() + _PROXY_START_TIMEOUT_S
+    deadline = time.monotonic() + _BRIDGE_START_TIMEOUT_S
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise AssertionError(
-                "proxy exited before readiness\n"
+                "bridge exited before readiness\n"
                 + _process_diagnostic(
                     process, console, debug_log_path, sensitive_values
                 )
@@ -315,15 +315,15 @@ def _wait_for_readiness(
                 metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 raise AssertionError(
-                    f"proxy readiness metadata is unreadable: {exc}"
+                    f"bridge readiness metadata is unreadable: {exc}"
                 ) from exc
             if not isinstance(metadata, dict):
-                raise AssertionError("proxy readiness metadata is not an object")
+                raise AssertionError("bridge readiness metadata is not an object")
             return metadata
         time.sleep(0.05)
 
     raise AssertionError(
-        f"proxy did not become ready within {_PROXY_START_TIMEOUT_S:.0f}s\n"
+        f"bridge did not become ready within {_BRIDGE_START_TIMEOUT_S:.0f}s\n"
         + _process_diagnostic(process, console, debug_log_path, sensitive_values)
     )
 
@@ -346,25 +346,25 @@ def _wait_for_health(base_url: str) -> None:
         assert health["consumer_mode"] == "meadow-direct"
         assert health["protocol_major"] == 1
         return
-    raise AssertionError(f"proxy health endpoint did not become ready: {last_error}")
+    raise AssertionError(f"bridge health endpoint did not become ready: {last_error}")
 
 
 @contextmanager
-def _running_proxy(
+def _running_bridge(
     *,
     binary: str,
     environment: Mapping[str, str],
     runtime_dir: Path,
     launch_secret: str,
-) -> Iterator[LiveProxy]:
+) -> Iterator[LiveBridge]:
     """Launch the real CLI and yield only after its HTTP socket is ready."""
 
     metadata_path = runtime_dir / "ready.json"
-    debug_log_path = runtime_dir / "proxy.log"
+    debug_log_path = runtime_dir / "bridge.log"
     command = [
         sys.executable,
         "-m",
-        "acp_proxy",
+        "meadow_bridge",
         "--host",
         "127.0.0.1",
         "--port",
@@ -415,7 +415,7 @@ def _running_proxy(
     console_thread = threading.Thread(
         target=console.drain,
         args=(process.stdout,),
-        name=f"proxy-console-{process.pid}",
+        name=f"bridge-console-{process.pid}",
         daemon=True,
     )
     try:
@@ -456,7 +456,7 @@ def _running_proxy(
         base_url = f"http://127.0.0.1:{port}"
         _wait_for_health(base_url)
         ready = True
-        yield LiveProxy(
+        yield LiveBridge(
             base_url=base_url,
             metadata=metadata,
             launch_secret=launch_secret,
@@ -474,40 +474,40 @@ def _running_proxy(
             )
             if ready and pre_stop_return_code is not None:
                 cleanup_errors.append(
-                    "ready proxy exited before fixture teardown\n"
+                    "ready bridge exited before fixture teardown\n"
                     + _process_diagnostic(
                         process, console, debug_log_path, sensitive_values
                     )
                 )
             elif ready and return_code != 0:
                 cleanup_errors.append(
-                    f"ready proxy exited with status {return_code}\n"
+                    f"ready bridge exited with status {return_code}\n"
                     + _process_diagnostic(
                         process, console, debug_log_path, sensitive_values
                     )
                 )
         except (OSError, subprocess.SubprocessError) as exc:
-            cleanup_errors.append(f"could not stop proxy process tree: {exc}")
+            cleanup_errors.append(f"could not stop bridge process tree: {exc}")
 
         console_thread.join(timeout=5.0)
         if console_thread.is_alive():
-            cleanup_errors.append("proxy console drain thread did not stop")
+            cleanup_errors.append("bridge console drain thread did not stop")
         if console.drain_error is not None:
             cleanup_errors.append(
-                f"proxy console drain failed: {console.drain_error}"
+                f"bridge console drain failed: {console.drain_error}"
             )
         if ready and metadata_path.exists():
-            cleanup_errors.append("ready proxy did not remove readiness metadata")
+            cleanup_errors.append("ready bridge did not remove readiness metadata")
         if console.sensitive_value_seen or _files_contain_sensitive_value(
             debug_log_path, sensitive_values
         ):
-            cleanup_errors.append("proxy diagnostics exposed a launch credential")
+            cleanup_errors.append("bridge diagnostics exposed a launch credential")
 
         if cleanup_errors:
             cleanup_message = "\n".join(cleanup_errors)
             if active_exception is not None:
                 active_exception.add_note(
-                    f"Additional proxy cleanup failure:\n{cleanup_message}"
+                    f"Additional bridge cleanup failure:\n{cleanup_message}"
                 )
             else:
                 raise AssertionError(cleanup_message)
@@ -531,17 +531,17 @@ def binary() -> str:
 
 
 @pytest.fixture
-def meadow_proxy(binary: str, tmp_path: Path) -> Iterator[LiveProxy]:
+def meadow_bridge(binary: str, tmp_path: Path) -> Iterator[LiveBridge]:
     """Run the production Meadow-direct process with its real OAuth setup."""
 
     launch_secret = secrets.token_urlsafe(32)
-    with _running_proxy(
+    with _running_bridge(
         binary=binary,
         environment=os.environ,
         runtime_dir=tmp_path / "meadow-direct",
         launch_secret=launch_secret,
-    ) as proxy:
-        yield proxy
+    ) as bridge:
+        yield bridge
 
 
 def test_meadow_direct_cli_rejects_missing_oauth_before_child_start(
@@ -577,7 +577,7 @@ def test_meadow_direct_cli_rejects_missing_oauth_before_child_start(
         [
             sys.executable,
             "-m",
-            "acp_proxy",
+            "meadow_bridge",
             "--execution-authority",
             "trusted-host",
             "--port",
@@ -610,17 +610,17 @@ def test_meadow_direct_cli_rejects_missing_oauth_before_child_start(
     if launch_secret in output or _files_contain_sensitive_value(
         log_path, (launch_secret,)
     ):
-        raise AssertionError("launch credential leaked into proxy diagnostics")
+        raise AssertionError("launch credential leaked into bridge diagnostics")
     assert not metadata_path.exists()
 
 
-def test_meadow_direct_proxy_model_binding_and_continuity(
-    meadow_proxy: LiveProxy,
+def test_meadow_direct_bridge_model_binding_and_continuity(
+    meadow_bridge: LiveBridge,
 ) -> None:
-    """The real direct proxy binds the requested model and preserves continuity."""
+    """The real direct bridge binds the requested model and preserves continuity."""
 
     with httpx.Client(
-        base_url=meadow_proxy.base_url,
+        base_url=meadow_bridge.base_url,
         timeout=_HTTP_TIMEOUT,
         trust_env=False,
     ) as http:
@@ -630,14 +630,14 @@ def test_meadow_direct_proxy_model_binding_and_continuity(
 
         capability_response = http.get(
             "/meadow/v1/capabilities",
-            headers=meadow_proxy.authorization_headers,
+            headers=meadow_bridge.authorization_headers,
         )
         assert capability_response.status_code == 200, capability_response.text
         capabilities = capability_response.json()
         assert capabilities["protocol"] == "meadow-acp-direct"
         assert capabilities["protocol_major"] == 1
         assert capabilities["consumer_mode"] == "meadow-direct"
-        assert capabilities["continuity_generation_id"] == meadow_proxy.metadata[
+        assert capabilities["continuity_generation_id"] == meadow_bridge.metadata[
             "continuity_generation_id"
         ]
         assert capabilities["canonical_workspace"] == os.path.realpath(
@@ -656,7 +656,7 @@ def test_meadow_direct_proxy_model_binding_and_continuity(
         workspace = capabilities["canonical_workspace"]
         negative_create = http.post(
             "/meadow/v1/sessions",
-            headers=meadow_proxy.authorization_headers,
+            headers=meadow_bridge.authorization_headers,
             json={
                 "protocol_major": 1,
                 "continuity_generation_id": generation_id,
@@ -675,7 +675,7 @@ def test_meadow_direct_proxy_model_binding_and_continuity(
         logical_session_id = "live-session"
         create_response = http.post(
             "/meadow/v1/sessions",
-            headers=meadow_proxy.authorization_headers,
+            headers=meadow_bridge.authorization_headers,
             json={
                 "protocol_major": 1,
                 "continuity_generation_id": generation_id,
@@ -691,7 +691,7 @@ def test_meadow_direct_proxy_model_binding_and_continuity(
         assert create_response.status_code == 200, create_response.text
         created = create_response.json()
         assert created["kind"] == "create_session"
-        assert created["state"] == "completed", (created, meadow_proxy.debug_log_path)
+        assert created["state"] == "completed", (created, meadow_bridge.debug_log_path)
         assert created["error"] is None
         assert created["result"]["logical_session_id"] == logical_session_id
         assert created["result"]["model_id"] == REQUIRED_LIVE_MODEL
@@ -705,7 +705,7 @@ def test_meadow_direct_proxy_model_binding_and_continuity(
         ).hexdigest()
         initial_response = http.post(
             f"/meadow/v1/sessions/{logical_session_id}/requests",
-            headers=meadow_proxy.authorization_headers,
+            headers=meadow_bridge.authorization_headers,
             json={
                 "protocol_major": 1,
                 "continuity_generation_id": generation_id,
@@ -727,7 +727,7 @@ def test_meadow_direct_proxy_model_binding_and_continuity(
         assert initial_response.status_code == 200, initial_response.text
         initial = initial_response.json()
         assert initial["kind"] == "prompt"
-        assert initial["state"] == "completed", (initial, meadow_proxy.debug_log_path)
+        assert initial["state"] == "completed", (initial, meadow_bridge.debug_log_path)
         assert initial["error"] is None
         initial_result = initial["result"]
         assert initial_result["logical_session_id"] == logical_session_id
@@ -742,7 +742,7 @@ def test_meadow_direct_proxy_model_binding_and_continuity(
 
         later_response = http.post(
             f"/meadow/v1/sessions/{logical_session_id}/requests",
-            headers=meadow_proxy.authorization_headers,
+            headers=meadow_bridge.authorization_headers,
             json={
                 "protocol_major": 1,
                 "continuity_generation_id": generation_id,
@@ -762,7 +762,7 @@ def test_meadow_direct_proxy_model_binding_and_continuity(
         assert later_response.status_code == 200, later_response.text
         later = later_response.json()
         assert later["kind"] == "prompt"
-        assert later["state"] == "completed", (later, meadow_proxy.debug_log_path)
+        assert later["state"] == "completed", (later, meadow_bridge.debug_log_path)
         assert later["error"] is None
         later_result = later["result"]
         assert later_result["logical_session_id"] == logical_session_id
@@ -777,7 +777,7 @@ def test_meadow_direct_proxy_model_binding_and_continuity(
 
         status_response = http.get(
             "/meadow/v1/operations/live-later",
-            headers=meadow_proxy.authorization_headers,
+            headers=meadow_bridge.authorization_headers,
             params={
                 "protocol_major": 1,
                 "continuity_generation_id": generation_id,

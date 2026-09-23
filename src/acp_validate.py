@@ -6,7 +6,7 @@ Runs through the full lifecycle: init, session creation, prompt, response.
 Prints structured results for each step.
 
 Usage:
-    python3 acp_validate.py [/path/to/copilot-language-server]
+    python3 src/acp_validate.py [/path/to/copilot-language-server]
 
 If no path is given, attempts to find the binary via 'ps'.
 """
@@ -127,10 +127,11 @@ def _as_string(value: object) -> str:
 
 
 def main() -> None:
+    """Report the real ACP initialization, session, and prompt lifecycle."""
     binary = sys.argv[1] if len(sys.argv) > 1 else find_binary()
     if not binary:
         print("ERROR: Could not find copilot-language-server.")
-        print("Pass the path as an argument: python3 acp_validate.py /path/to/binary")
+        print("Pass the path as an argument: python3 src/acp_validate.py /path/to/binary")
         sys.exit(1)
 
     print(f"Binary: {binary}")
@@ -170,7 +171,7 @@ def main() -> None:
             "method": "initialize",
             "params": {
                 "protocolVersion": 1,
-                "clientInfo": {"name": "meadow-validate", "version": "0.1.0"},
+                "clientInfo": {"name": "meadow-bridge-validate", "version": "0.1.0"},
                 "clientCapabilities": {
                     "fs": {"readTextFile": True, "writeTextFile": True},
                     "terminal": True,

@@ -8,8 +8,8 @@ from typing import Any
 
 import pytest
 
-from acp_proxy import discovery
-from acp_proxy.discovery import (
+from meadow_bridge import discovery
+from meadow_bridge.discovery import (
     BinaryCompatibilityError,
     _select_best_binary,
     require_compatible_binary,

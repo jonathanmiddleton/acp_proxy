@@ -14,7 +14,7 @@ from typing import Any, Literal
 from .client import DIRECT_STOP_REASONS, ModelAcknowledgementError
 from .direct_protocol import (
     DIRECT_PROTOCOL_MAJOR,
-    PROXY_VERSION,
+    BRIDGE_VERSION,
     CancelRequest,
     CapabilitiesResponse,
     CreateSessionRequest,
@@ -161,7 +161,7 @@ class DirectService:
             ),
         )
         return CapabilitiesResponse(
-            proxy_version=PROXY_VERSION,
+            proxy_version=BRIDGE_VERSION,
             continuity_generation_id=self.continuity_generation_id,
             canonical_workspace=self.canonical_workspace,
             execution_authority=authority,

@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from acp_proxy.copilot_auth import (
+from meadow_bridge.copilot_auth import (
     CopilotOAuthCredentialError,
     copilot_oauth_path,
     inject_prior_copilot_oauth,
@@ -215,7 +215,7 @@ def test_prior_oauth_is_injected_only_into_the_child_environment(
         "GITHUB_COPILOT_API_URL": "https://company-managed-endpoint.example",
     }
     ambient_before = dict(os.environ)
-    caplog.set_level("DEBUG", logger="acp_proxy.copilot_auth")
+    caplog.set_level("DEBUG", logger="meadow_bridge.copilot_auth")
 
     child_env = inject_prior_copilot_oauth(
         env,
@@ -244,7 +244,7 @@ def test_macos_prior_oauth_is_discovered_from_home(
     oauth_path = oauth_dir / "oauth.json"
     oauth_path.write_text(json.dumps(_oauth_document(_TOKEN_A)), encoding="utf-8")
     env = {"HOME": str(tmp_path)}
-    caplog.set_level("DEBUG", logger="acp_proxy.copilot_auth")
+    caplog.set_level("DEBUG", logger="meadow_bridge.copilot_auth")
 
     child_env = inject_prior_copilot_oauth(
         env,

@@ -141,11 +141,12 @@ def _read_bounded_version_output(
 ) -> bytes:
     """Execute ``--version`` while retaining at most 257 stdout bytes."""
 
-    process_kwargs: dict[str, object] = {}
+    creationflags = 0
     if os.name == "nt":
-        process_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        process_kwargs["start_new_session"] = True
+        flag: object = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP")
+        if not isinstance(flag, int):
+            raise BinaryCompatibilityError("invalid Windows process-group flag")
+        creationflags = flag
 
     try:
         process = subprocess.Popen(
@@ -154,13 +155,15 @@ def _read_bounded_version_output(
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             env=_version_probe_env(dict(os.environ)),
-            **process_kwargs,
+            creationflags=creationflags,
+            start_new_session=os.name != "nt",
         )
     except OSError:
         raise BinaryCompatibilityError(
             "copilot-language-server version probe failed"
         ) from None
-    if process.stdout is None:  # pragma: no cover - guaranteed by PIPE
+    stdout = process.stdout
+    if stdout is None:  # pragma: no cover - guaranteed by PIPE
         _terminate_probe_process_group(process)
         raise BinaryCompatibilityError(
             "copilot-language-server version probe failed"
@@ -174,7 +177,7 @@ def _read_bounded_version_output(
         try:
             while len(output) <= _VERSION_OUTPUT_LIMIT_BYTES:
                 chunk = os.read(
-                    process.stdout.fileno(),
+                    stdout.fileno(),
                     (_VERSION_OUTPUT_LIMIT_BYTES + 1) - len(output),
                 )
                 if not chunk:
@@ -221,7 +224,7 @@ def _read_bounded_version_output(
             )
         return bytes(output)
     finally:
-        process.stdout.close()
+        stdout.close()
         _terminate_probe_process_group(process)
         reader.join(timeout=1.0)
 

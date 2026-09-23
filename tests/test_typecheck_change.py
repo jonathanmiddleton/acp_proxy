@@ -43,11 +43,11 @@ def _commit(root: Path) -> None:
 @pytest.fixture
 def checkout(tmp_path: Path) -> Path:
     root = tmp_path / "checkout"
-    for directory in ("scripts", "src/acp_proxy", "tests", "experiments/demo"):
+    for directory in ("scripts", "src/meadow_bridge", "tests", "experiments/demo"):
         (root / directory).mkdir(parents=True)
     shutil.copyfile(VALIDATOR, root / "scripts/typecheck_change.py")
-    (root / "src/acp_proxy/__init__.py").write_text("", encoding="utf-8")
-    (root / "src/acp_proxy/sample.py").write_text(LEGACY_SOURCE, encoding="utf-8")
+    (root / "src/meadow_bridge/__init__.py").write_text("", encoding="utf-8")
+    (root / "src/meadow_bridge/sample.py").write_text(LEGACY_SOURCE, encoding="utf-8")
     (root / "tests/__init__.py").write_text("", encoding="utf-8")
     (root / "experiments/demo/check.py").write_text("VALUE: int = 1\n", encoding="utf-8")
     (root / "pyproject.toml").write_text(
@@ -98,7 +98,7 @@ def _assert_both_failed(result: subprocess.CompletedProcess[str]) -> None:
 def test_unchanged_declaration_debt_survives_line_shifts(
     checkout: Path, checker_environment: dict[str, str],
 ) -> None:
-    sample = checkout / "src/acp_proxy/sample.py"
+    sample = checkout / "src/meadow_bridge/sample.py"
     sample.write_text("def added() -> int:\n    return 1\n\n" + LEGACY_SOURCE, encoding="utf-8")
     before = _git(checkout, "diff", "--binary")
 
@@ -107,14 +107,14 @@ def test_unchanged_declaration_debt_survives_line_shifts(
     _assert_passed(result)
     assert "existing outside the changed surface" in result.stdout
     assert _git(checkout, "diff", "--binary") == before
-    assert _git(checkout, "status", "--short") == " M src/acp_proxy/sample.py\n"
+    assert _git(checkout, "status", "--short") == " M src/meadow_bridge/sample.py\n"
 
 
 @pytest.mark.parametrize("change", ["addition", "edit", "deletion"])
 def test_new_errors_and_changed_declaration_debt_block(
     checkout: Path, checker_environment: dict[str, str], change: str,
 ) -> None:
-    sample = checkout / "src/acp_proxy/sample.py"
+    sample = checkout / "src/meadow_bridge/sample.py"
     if change == "addition":
         sample.write_text(LEGACY_SOURCE + '\ndef broken() -> str:\n    return 1\n', encoding="utf-8")
     elif change == "edit":
@@ -133,7 +133,7 @@ def test_new_errors_and_changed_declaration_debt_block(
 def test_removing_a_predecessor_does_not_own_the_untouched_successor(
     checkout: Path, checker_environment: dict[str, str],
 ) -> None:
-    sample = checkout / "src/acp_proxy/sample.py"
+    sample = checkout / "src/meadow_bridge/sample.py"
     sample.write_text("def removable() -> int:\n    return 1\n\n" + LEGACY_SOURCE, encoding="utf-8")
     _commit(checkout)
     sample.write_text(LEGACY_SOURCE, encoding="utf-8")
@@ -144,13 +144,13 @@ def test_removing_a_predecessor_does_not_own_the_untouched_successor(
 def test_base_and_current_src_imports_use_their_own_snapshot(
     checkout: Path, checker_environment: dict[str, str],
 ) -> None:
-    api = checkout / "src/acp_proxy/api.py"
+    api = checkout / "src/meadow_bridge/api.py"
     api.write_text('def value() -> str:\n    return "base"\n', encoding="utf-8")
     (checkout / "tests/consumer.py").write_text(
-        "from acp_proxy.api import value\nRESULT: str = value()\n", encoding="utf-8",
+        "from meadow_bridge.api import value\nRESULT: str = value()\n", encoding="utf-8",
     )
     (checkout / "experiments/demo/check.py").write_text(
-        "from acp_proxy.api import value\nRESULT: str = value()\n", encoding="utf-8",
+        "from meadow_bridge.api import value\nRESULT: str = value()\n", encoding="utf-8",
     )
     _commit(checkout)
     api.write_text("def value() -> int:\n    return 1\n", encoding="utf-8")
@@ -168,7 +168,7 @@ def test_warm_imported_debt_keeps_snapshot_relative_diagnostic_paths(
     checkout: Path, checker_environment: dict[str, str],
 ) -> None:
     consumer = checkout / "tests/consumer.py"
-    original = "from acp_proxy.sample import legacy\nVALUE: int = legacy()\n"
+    original = "from meadow_bridge.sample import legacy\nVALUE: int = legacy()\n"
     consumer.write_text(original, encoding="utf-8")
     _commit(checkout)
     project = checkout / "pyproject.toml"
@@ -206,7 +206,7 @@ def test_script_change_checks_its_unchanged_test_consumer(
 def test_bootstrap_configuration_does_not_create_false_debt(
     checkout: Path, checker_environment: dict[str, str],
 ) -> None:
-    (checkout / "src/acp_proxy/any_return.py").write_text(
+    (checkout / "src/meadow_bridge/any_return.py").write_text(
         'import json\ndef value() -> int:\n    return json.loads("0")\n',
         encoding="utf-8",
     )
@@ -223,7 +223,7 @@ def test_bootstrap_configuration_does_not_create_false_debt(
 def test_configuration_severity_changes_remain_effective(
     checkout: Path, checker_environment: dict[str, str],
 ) -> None:
-    sample = checkout / "src/acp_proxy/sample.py"
+    sample = checkout / "src/meadow_bridge/sample.py"
     sample.write_text(
         'import json\ndef value() -> int:\n    return json.loads("0")\n',
         encoding="utf-8",
@@ -253,7 +253,7 @@ def test_default_main_covers_committed_changes_despite_feature_upstream(
     checkout: Path, checker_environment: dict[str, str],
 ) -> None:
     _git(checkout, "switch", "--quiet", "--create", "feature")
-    (checkout / "src/acp_proxy/new.py").write_text('VALUE: int = "wrong"\n', encoding="utf-8")
+    (checkout / "src/meadow_bridge/new.py").write_text('VALUE: int = "wrong"\n', encoding="utf-8")
     _commit(checkout)
     _git(checkout, "branch", "feature-upstream", "HEAD")
     _git(checkout, "branch", "--set-upstream-to=feature-upstream", "feature")
@@ -283,14 +283,14 @@ def test_missing_main_requires_an_explicit_comparison_base(
 def test_warm_cache_rechecks_same_size_and_timestamp_edits(
     checkout: Path, checker_environment: dict[str, str],
 ) -> None:
-    sample = checkout / "src/acp_proxy/sample.py"
+    sample = checkout / "src/meadow_bridge/sample.py"
     valid = "VALUE: int = 1\n"
     sample.write_text(valid, encoding="utf-8")
     _commit(checkout)
-    (checkout / "src/acp_proxy/added.py").write_text("", encoding="utf-8")
+    (checkout / "src/meadow_bridge/added.py").write_text("", encoding="utf-8")
     _assert_passed(_validate(checkout, checker_environment))
     git_directory = Path(_git(checkout, "rev-parse", "--absolute-git-dir").strip())
-    cache = git_directory / "acp-proxy-typecheck-cache"
+    cache = git_directory / "meadow-bridge-typecheck-cache"
     assert tuple(cache.rglob("*.db")) or tuple(cache.rglob("*.json"))
     timestamp = int(_git(checkout, "show", "-s", "--format=%ct", "HEAD"))
     sample.write_text(valid.replace("int", "str"), encoding="utf-8")

@@ -1,6 +1,6 @@
 # CoT Injection via Packed Prompts
 
-Exploits the ACP proxy's stateful sessions and last-user-message extraction
+Exploits the Meadow Bridge's stateful sessions and last-user-message extraction
 (ADR-004) to inject synthetic chain-of-thought reflections that measurably
 improve model output quality.
 
@@ -35,11 +35,11 @@ The model seamlessly continues from the truncation point with revised output.
 
 ## Running experiments
 
-All scripts talk to the ACP proxy's OpenAI-compatible endpoint. Start the
+All scripts talk to the Meadow Bridge's OpenAI-compatible endpoint. Start the
 proxy first:
 
 ```bash
-acp-proxy --system-prompt "You are a helpful assistant."
+meadow-bridge --system-prompt "You are a helpful assistant."
 ```
 
 Then run a probe with a config file:

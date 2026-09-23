@@ -11,12 +11,12 @@ from typing import Any
 
 import pytest
 
-from acp_proxy.client import (
+from meadow_bridge.client import (
     AcpClient,
     DirectModelBindingStrategy,
     ModelAcknowledgementError,
 )
-from acp_proxy.transport import AcpTransport
+from meadow_bridge.transport import AcpTransport
 from tests.test_transport import FakeProcess, FakeStdin
 
 

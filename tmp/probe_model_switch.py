@@ -12,17 +12,22 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from acp_proxy.transport import AcpTransport, AcpError
+from meadow_bridge.transport import AcpTransport, AcpError
 
 
-async def probe(transport, method, params, label=None):
+async def probe(
+    transport: AcpTransport,
+    method: str,
+    params: dict[str, object],
+    label: str | None = None,
+) -> dict[str, object] | None:
     """Try a method and report the result."""
     label = label or method
     print(f"\n--- {label} ---")
     print(f"  params: {json.dumps(params)[:200]}")
     try:
         r = await transport.send_request(method, params)
-        print(f"  SUCCESS")
+        print("  SUCCESS")
         # Print relevant fields
         if isinstance(r, dict):
             if "models" in r:
@@ -46,7 +51,8 @@ async def probe(transport, method, params, label=None):
         return None
 
 
-async def main():
+async def main() -> None:
+    """Report live model-selection responses from the installed ACP server."""
     binary = sys.argv[1] if len(sys.argv) > 1 else None
     if not binary:
         import subprocess
@@ -70,7 +76,7 @@ async def main():
         "initialize",
         {
             "protocolVersion": 1,
-            "clientInfo": {"name": "model-probe", "version": "0.1.0"},
+            "clientInfo": {"name": "meadow-bridge-model-probe", "version": "0.1.0"},
             "clientCapabilities": {
                 "fs": {"readTextFile": True, "writeTextFile": True},
                 "terminal": True,
@@ -268,7 +274,7 @@ async def main():
     print("BLOCK 4: session/new with model parameters")
     print(f"{'=' * 60}")
 
-    r = await probe(
+    await probe(
         transport,
         "session/new",
         {
@@ -279,7 +285,7 @@ async def main():
         "session/new with model param",
     )
 
-    r = await probe(
+    await probe(
         transport,
         "session/new",
         {
@@ -290,7 +296,7 @@ async def main():
         "session/new with modelId param",
     )
 
-    r = await probe(
+    await probe(
         transport,
         "session/new",
         {
@@ -301,7 +307,7 @@ async def main():
         "session/new with configOptions",
     )
 
-    r = await probe(
+    await probe(
         transport,
         "session/new",
         {

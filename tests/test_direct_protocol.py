@@ -9,7 +9,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 from pydantic import ValidationError
 
-from acp_proxy.direct_protocol import (
+from meadow_bridge.direct_protocol import (
     DIRECT_PROTOCOL_MAJOR,
     CreateSessionRequest,
     DirectLimits,
@@ -122,13 +122,13 @@ def test_prompt_phase_shapes_forbid_layer_retransmission(
         "output_contract_digest": hashlib.sha256(contract.encode()).hexdigest(),
         "execution_timeout_s": 30.0,
     }
-    initial = PromptRequest(
+    initial = PromptRequest.model_validate({
         **common,
-        phase="initial",
-        stable_instructions=stable,
-        prompt=prompt,
-        output_contract=contract,
-    )
+        "phase": "initial",
+        "stable_instructions": stable,
+        "prompt": prompt,
+        "output_contract": contract,
+    })
     assert initial.phase == "initial"
 
     correction_payload = {

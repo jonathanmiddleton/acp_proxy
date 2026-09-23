@@ -619,7 +619,7 @@ class AcpClient:
             "initialize",
             {
                 "protocolVersion": 1,
-                "clientInfo": {"name": "acp-proxy", "version": __version__},
+                "clientInfo": {"name": "meadow-bridge", "version": __version__},
                 "clientCapabilities": client_capabilities,
             },
         )

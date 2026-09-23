@@ -60,10 +60,10 @@ def find_binary(cli_binary: str | None) -> str:
             sys.exit(1)
         return cli_binary
 
-    # Try importing from the proxy's discovery module
+    # Try importing from Meadow Bridge's discovery module
     try:
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
-        from acp_proxy.discovery import find_binary as _find
+        from meadow_bridge.discovery import find_binary as _find
 
         binary = _find()
         if binary:

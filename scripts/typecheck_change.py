@@ -561,7 +561,7 @@ def _checker_cache_root(base: str) -> Path:
     git_directory = os.fsdecode(
         _run_git("rev-parse", "--absolute-git-dir").stdout.rstrip(b"\n")
     )
-    cache_root = Path(git_directory) / "acp-proxy-typecheck-cache" / base
+    cache_root = Path(git_directory) / "meadow-bridge-typecheck-cache" / base
     try:
         cache_root.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -1046,7 +1046,7 @@ def main() -> int:
         + ", ".join(scope.label for scope in scopes),
         flush=True,
     )
-    with tempfile.TemporaryDirectory(prefix="acp-proxy-typecheck-change-") as temp:
+    with tempfile.TemporaryDirectory(prefix="meadow-bridge-typecheck-change-") as temp:
         temp_root = Path(temp)
         base_root = temp_root / "base"
         try:

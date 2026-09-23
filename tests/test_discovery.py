@@ -10,9 +10,9 @@ from typing import Any
 
 import pytest
 
-from acp_proxy import discovery
-from acp_proxy.application_policy import MIN_COPILOT_LANGUAGE_SERVER_VERSION
-from acp_proxy.discovery import (
+from meadow_bridge import discovery
+from meadow_bridge.application_policy import MIN_COPILOT_LANGUAGE_SERVER_VERSION
+from meadow_bridge.discovery import (
     BinaryCompatibilityError,
     _candidate_paths_from_jetbrains,
     _candidate_paths_from_processes,

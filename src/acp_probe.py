@@ -6,7 +6,7 @@ Keeps the subprocess alive and sends a sequence of JSON-RPC messages
 to understand the auth + session flow.
 
 Usage:
-    python tmp/acp_probe.py
+    python src/acp_probe.py
 """
 
 import json
@@ -20,7 +20,7 @@ from collections.abc import Iterable, Mapping
 from pydantic import JsonValue
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
-from acp_proxy.discovery import find_binary
+from meadow_bridge.discovery import find_binary
 
 
 def read_ndjson(stream: Iterable[str], label: str = "stdout") -> None:
@@ -46,6 +46,7 @@ def send(proc: subprocess.Popen[str], msg: Mapping[str, JsonValue]) -> None:
 
 
 def main() -> None:
+    """Observe the installed ACP server's initialization and authentication flow."""
     cls_path = find_binary()
     if not cls_path:
         print("ERROR: No compatible copilot-language-server binary found.")
@@ -89,7 +90,7 @@ def main() -> None:
             "method": "initialize",
             "params": {
                 "protocolVersion": 1,
-                "clientInfo": {"name": "meadow", "version": "0.1.0"},
+                "clientInfo": {"name": "meadow-bridge-probe", "version": "0.1.0"},
                 "clientCapabilities": {
                     "fs": {"readTextFile": True, "writeTextFile": True},
                     "terminal": True,

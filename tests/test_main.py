@@ -1,4 +1,4 @@
-"""Tests for the acp-proxy command-line entry point and server wiring."""
+"""Tests for the meadow-bridge command-line entry point and server wiring."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,13 +16,13 @@ from typing import Any
 import pytest
 import uvicorn
 
-from acp_proxy import __main__ as cli
-from acp_proxy import discovery
-from acp_proxy.application_policy import MIN_COPILOT_LANGUAGE_SERVER_VERSION
-from acp_proxy.client import ModelAcknowledgementError
-from acp_proxy.copilot_auth import CopilotOAuthCredentialError
-from acp_proxy.direct_protocol import CreateSessionRequest, DirectLimits, PromptRequest, PromptPhase
-from acp_proxy.discovery import BinaryAdmission, BinaryCompatibilityError
+from meadow_bridge import __main__ as cli
+from meadow_bridge import discovery
+from meadow_bridge.application_policy import MIN_COPILOT_LANGUAGE_SERVER_VERSION
+from meadow_bridge.client import ModelAcknowledgementError
+from meadow_bridge.copilot_auth import CopilotOAuthCredentialError
+from meadow_bridge.direct_protocol import CreateSessionRequest, DirectLimits, PromptRequest, PromptPhase
+from meadow_bridge.discovery import BinaryAdmission, BinaryCompatibilityError
 
 
 def _version_text(version: tuple[int, int, int]) -> str:
@@ -115,25 +116,28 @@ def test_windows_shutdown_handles_ctrl_break(
     registered: dict[object, Any] = {}
     shutdowns: list[str] = []
 
-    class NoPosixSignalLoop:
-        def add_signal_handler(self, *_args: Any) -> None:
-            raise AssertionError("Windows must use synchronous signal handlers")
+    def forbidden_posix_handler(*_args: object) -> None:
+        raise AssertionError("Windows must use synchronous signal handlers")
 
     sigbreak = object()
-    monkeypatch.setattr(cli.sys, "platform", "win32")
-    monkeypatch.setattr(cli.signal, "SIGBREAK", sigbreak, raising=False)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(signal, "SIGBREAK", sigbreak, raising=False)
     monkeypatch.setattr(
-        cli.signal,
+        signal,
         "signal",
         lambda sig, callback: registered.setdefault(sig, callback),
     )
 
-    cli._install_shutdown_signal_handlers(
-        NoPosixSignalLoop(),
-        lambda: shutdowns.append("shutdown"),
-    )
+    loop = asyncio.new_event_loop()
+    monkeypatch.setattr(loop, "add_signal_handler", forbidden_posix_handler)
+    try:
+        cli._install_shutdown_signal_handlers(
+            loop, lambda: shutdowns.append("shutdown"),
+        )
+    finally:
+        loop.close()
 
-    assert set(registered) == {cli.signal.SIGINT, sigbreak}
+    assert set(registered) == {signal.SIGINT, sigbreak}
     registered[sigbreak](sigbreak, None)
     assert shutdowns == ["shutdown"]
 
@@ -194,7 +198,7 @@ def test_cli_explicit_old_binary_fails_before_client_start(
         sys,
         "argv",
         [
-            "acp-proxy",
+            "meadow-bridge",
             "--execution-authority",
             "trusted-host",
             "--binary",
@@ -243,7 +247,7 @@ def test_cli_direct_injects_prior_oauth_into_child_environment(
         sys,
         "argv",
         [
-            "acp-proxy",
+            "meadow-bridge",
             "--execution-authority",
             "trusted-host",
             "--binary",
@@ -283,7 +287,7 @@ def test_cli_direct_oauth_error_stops_before_child_start(
         sys,
         "argv",
         [
-            "acp-proxy",
+            "meadow-bridge",
             "--execution-authority",
             "trusted-host",
             "--binary",
@@ -587,7 +591,7 @@ def test_cli_invalid_direct_config_never_probes_auto_discovery(
         sys,
         "argv",
         [
-            "acp-proxy",
+            "meadow-bridge",
             "--execution-authority",
             "trusted-host",
         ],
@@ -621,7 +625,7 @@ def test_cli_auto_discovery_reports_old_only_environment_without_traceback(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["acp-proxy", "--execution-authority", "trusted-host"],
+        ["meadow-bridge", "--execution-authority", "trusted-host"],
     )
 
     with pytest.raises(SystemExit) as exc_info:
@@ -731,7 +735,7 @@ async def test_child_loss_during_startup_invalidates_direct_service_and_cleans_u
 ) -> None:
     """ADI-10/13: a dead ACP child cannot leave direct readiness or an orphan."""
     observed: dict[str, Any] = {}
-    caplog.set_level("INFO", logger="acp_proxy.direct_service")
+    caplog.set_level("INFO", logger="meadow_bridge.direct_service")
 
     class ChildLossClient:
         def __init__(self, _binary: str, **kwargs: Any) -> None:
@@ -814,7 +818,7 @@ async def test_child_loss_during_startup_invalidates_direct_service_and_cleans_u
     assert [
         (record.levelname, record.getMessage())
         for record in caplog.records
-        if record.name == "acp_proxy.direct_service"
+        if record.name == "meadow_bridge.direct_service"
     ] == [
         ("ERROR", "Quarantined ACP continuity generation: owned ACP child transport closed")
     ]
@@ -826,7 +830,7 @@ async def test_graceful_owner_shutdown_quarantines_active_direct_work_first(
 ) -> None:
     """ADI-10/13: normal shutdown marks active work in_doubt before child stop."""
     observed: dict[str, Any] = {}
-    caplog.set_level("INFO", logger="acp_proxy.direct_service")
+    caplog.set_level("INFO", logger="meadow_bridge.direct_service")
 
     class ActiveClient:
         def __init__(self, _binary: str, **kwargs: Any) -> None:
@@ -968,9 +972,9 @@ async def test_graceful_owner_shutdown_quarantines_active_direct_work_first(
     assert [
         (record.levelname, record.getMessage())
         for record in caplog.records
-        if record.name == "acp_proxy.direct_service"
+        if record.name == "meadow_bridge.direct_service"
     ] == [
-        ("INFO", "Closed ACP continuity generation for shutdown: owned proxy is shutting down")
+        ("INFO", "Closed ACP continuity generation for shutdown: owned Meadow Bridge is shutting down")
     ]
 
 

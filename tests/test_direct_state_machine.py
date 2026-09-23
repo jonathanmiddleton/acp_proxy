@@ -12,16 +12,17 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from acp_proxy.client import ModelInfo
-from acp_proxy.direct_protocol import (
+from meadow_bridge.client import ModelInfo
+from meadow_bridge.direct_protocol import (
     CancelRequest,
     CreateSessionRequest,
     DirectLimits,
     PromptRequest,
+    PromptPhase,
     RetireSessionRequest,
 )
-from acp_proxy.direct_service import DirectBusy, DirectGenerationMismatch, DirectService
-from acp_proxy.direct_state import (
+from meadow_bridge.direct_service import DirectBusy, DirectGenerationMismatch, DirectService
+from meadow_bridge.direct_state import (
     DirectConflict,
     DirectLimitExceeded,
     DirectStateError,
@@ -116,7 +117,7 @@ async def _exercise_trace(actions: list[Action]) -> None:
     limits = DirectLimits(max_sessions=2, max_operations=10)
     service = DirectService(
         fake,
-        cwd="/tmp/acp-proxy-direct-state-trace",
+        cwd="/tmp/meadow-bridge-direct-state-trace",
         launch_secret="t" * 48,
         execution_authority="trusted-host",
         limits=limits,
@@ -212,7 +213,7 @@ async def _exercise_trace(actions: list[Action]) -> None:
                 )
             else:
                 prompt_kwargs["delta"] = f"{phase} delta"
-            request = PromptRequest(**prompt_kwargs)
+            prompt_request = PromptRequest(**prompt_kwargs)
             phase_is_valid = bool(
                 state
                 and state["ready"]
@@ -228,16 +229,17 @@ async def _exercise_trace(actions: list[Action]) -> None:
             )
             if not phase_is_valid:
                 with pytest.raises(DirectStateError):
-                    await service.admit_prompt(logical_id, request)
+                    await service.admit_prompt(logical_id, prompt_request)
             elif admitted_operations >= limits.max_operations:
                 with pytest.raises(DirectLimitExceeded):
-                    await service.admit_prompt(logical_id, request)
+                    await service.admit_prompt(logical_id, prompt_request)
             else:
-                record, created = await service.admit_prompt(logical_id, request)
+                record, created = await service.admit_prompt(logical_id, prompt_request)
                 assert created
                 assert (await service.wait_for_operation(record)).state == "completed"
                 admitted_operations += 1
                 prompt_effects += 1
+                assert state is not None
                 state["initialized"] = True
                 state["invocation"] = invocation
                 last_prompt[slot] = operation_id
@@ -245,7 +247,7 @@ async def _exercise_trace(actions: list[Action]) -> None:
             target = last_prompt.get(slot)
             if target is None:
                 continue
-            request = CancelRequest(
+            cancel_request = CancelRequest(
                 protocol_major=1,
                 continuity_generation_id=service.continuity_generation_id,
                 operation_id=operation_id,
@@ -253,14 +255,14 @@ async def _exercise_trace(actions: list[Action]) -> None:
             )
             if admitted_operations >= limits.max_operations:
                 with pytest.raises(DirectLimitExceeded):
-                    await service.admit_cancel(request)
+                    await service.admit_cancel(cancel_request)
             else:
-                record, created = await service.admit_cancel(request)
+                record, created = await service.admit_cancel(cancel_request)
                 assert created
                 assert (await service.wait_for_operation(record)).state == "completed"
                 admitted_operations += 1
         else:
-            request = RetireSessionRequest(
+            retire_request = RetireSessionRequest(
                 protocol_major=1,
                 continuity_generation_id=service.continuity_generation_id,
                 operation_id=operation_id,
@@ -268,12 +270,12 @@ async def _exercise_trace(actions: list[Action]) -> None:
             )
             if not state or not state["ready"]:
                 with pytest.raises(DirectStateError):
-                    await service.admit_retire(request)
+                    await service.admit_retire(retire_request)
             elif admitted_operations >= limits.max_operations:
                 with pytest.raises(DirectLimitExceeded):
-                    await service.admit_retire(request)
+                    await service.admit_retire(retire_request)
             else:
-                record, created = await service.admit_retire(request)
+                record, created = await service.admit_retire(retire_request)
                 assert created
                 assert (await service.wait_for_operation(record)).state == "completed"
                 admitted_operations += 1
@@ -323,7 +325,7 @@ async def _exercise_concurrent_trace(
     fake.block_prompts = True
     service = DirectService(
         fake,
-        cwd="/tmp/acp-proxy-direct-concurrent-trace",
+        cwd="/tmp/meadow-bridge-direct-concurrent-trace",
         launch_secret="t" * 48,
         execution_authority="trusted-host",
         limits=DirectLimits(
@@ -358,7 +360,7 @@ async def _exercise_concurrent_trace(
             continuity_generation_id=service.continuity_generation_id,
             operation_id=op_id,
             invocation_id=invocation,
-            phase="initial",
+            phase=PromptPhase.INITIAL,
             stable_instruction_digest=stable_digest,
             output_contract_digest=contract_digest,
             execution_timeout_s=2,

@@ -1,4 +1,4 @@
-# ACP Proxy — Open Work Items
+# Meadow Bridge — Open Work Items
 
 - Qualify session load/list and backend cleanup before adding recovery or close
   capabilities to the direct contract.

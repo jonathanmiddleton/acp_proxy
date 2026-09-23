@@ -22,7 +22,7 @@ This repo connects Meadow to GitHub Copilot's `copilot-language-server` ACP
 interface through the authenticated `/meadow/v1` contract.
 
 ```
-Meadow → ACP Proxy `/meadow/v1` → copilot-language-server
+Meadow → Meadow Bridge `/meadow/v1` → copilot-language-server
 ```
 
 ## ACP Specification Reference
@@ -93,7 +93,7 @@ particularly the failure modes that motivated each decision.
 
 | ADR                                                 | Decision                                                                                                      |
 |-----------------------------------------------------|---------------------------------------------------------------------------------------------------------------|
-| [ADR-001](adrs/001-acp-proxy-architecture.md)       | Route OpenCode through ACP proxy (why this architecture, what was rejected)                                   |
+| [ADR-001](adrs/001-acp-proxy-architecture.md)       | Historical adapter architecture; removed by ADR-018                                   |
 | [ADR-002](adrs/002-session-per-conversation.md)     | Session-per-conversation via first-message hash (why sessions are keyed this way)                             |
 | [ADR-003](adrs/003-system-prompt-injection.md)      | System prompt injection as primary control surface (why and how it works)                                     |
 | [ADR-004](adrs/004-last-user-message-extraction.md) | Extract only the last user message (why full history replay causes duplication)                               |
@@ -102,7 +102,7 @@ particularly the failure modes that motivated each decision.
 | [ADR-007](adrs/007-tool-ownership.md)               | The ACP server owns tools — do not inject or override (protocol constraint, empirical evidence)               |
 | [ADR-008](adrs/008-proxy-as-substrate.md)           | Proxy as substrate — installable command, cwd as workspace                                                    |
 | [ADR-009](adrs/009-intra-process-session-scaling.md)| Retained scaling evidence; direct pool/affinity clauses superseded                                            |
-| [ADR-011](adrs/011-context-injection-boundary.md)   | Deprecated legacy context-injection boundary                                                                 |
+| [ADR-011](adrs/011-context-injection-boundary.md)   | Historical context-injection boundary; removed by ADR-018                                                                 |
 | [ADR-012](adrs/012-meadow-direct-consumer-protocol.md) | Authenticated direct protocol, migration, lifecycle, evidence, and authority policy                       |
 | [ADR-014](adrs/014-correlate-direct-session-state.md) | Correlate and validate direct session state without retaining unsupported payloads                         |
 | [ADR-015](adrs/015-order-direct-model-binding-transitions.md) | Bound prior/target model transitions until ordered RPC settlement; preserve exact acknowledgement and post-binding integrity |
@@ -110,6 +110,8 @@ particularly the failure modes that motivated each decision.
 | [ADR-017](adrs/017-change-relative-typing-and-checkout-gate.md) | Meadow-derived typing, complete checkout validation, snapshot isolation, and no-skips enforcement |
 
 | [ADR-018](adrs/018-remove-openai-compatible-adapter.md) | Remove the deprecated adapter and consumer-mode selector; retain direct ACP semantics |
+
+| [ADR-019](adrs/019-meadow-bridge-product-identity.md) | Meadow Bridge identity; direct ACP wire contract retained |
 
 The ADRs explain the *why* behind the module ownership rules in the table
 above. A change that contradicts an accepted ADR requires a new ADR

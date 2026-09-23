@@ -8,8 +8,8 @@ from collections.abc import Iterator
 
 import pytest
 
-from acp_proxy.direct_protocol import DirectLimits
-from acp_proxy.transport import (
+from meadow_bridge.direct_protocol import DirectLimits
+from meadow_bridge.transport import (
     MAX_ACP_STDOUT_LINE_BYTES,
     STDERR_DRAIN_CHUNK_BYTES,
     AcpError,
@@ -327,7 +327,7 @@ async def test_transport_debug_logs_never_persist_wire_payloads(
     transport.on_request(
         lambda _message: {"outcome": {"outcome": "cancelled"}}
     )
-    caplog.set_level("DEBUG", logger="acp_proxy.transport")
+    caplog.set_level("DEBUG", logger="meadow_bridge.transport")
 
     pending = asyncio.create_task(
         transport.send_request(
@@ -388,7 +388,7 @@ async def test_transport_debug_logs_never_persist_child_stderr(
     stderr_canary = "T122-CHILD-STDERR-CREDENTIAL-SECRET"
     fake = FakeProcess()
     transport = make_transport_with_fake(fake)
-    caplog.set_level("DEBUG", logger="acp_proxy.transport")
+    caplog.set_level("DEBUG", logger="meadow_bridge.transport")
 
     large_stderr = (stderr_canary.encode() + b"-") * 4_096
     assert len(large_stderr) > 65_536

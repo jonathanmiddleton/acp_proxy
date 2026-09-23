@@ -14,14 +14,14 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
-from acp_proxy.client import (
+from meadow_bridge.client import (
     AcpClient,
     DirectModelBindingStrategy,
     ModelAcknowledgementError,
     ModelInfo,
     SessionState,
 )
-from acp_proxy.transport import AcpTransport
+from meadow_bridge.transport import AcpTransport
 from tests.test_transport import FakeProcess
 
 class TestHandleNotification:
@@ -465,7 +465,7 @@ class TestHandleNotification:
             "sessionUpdate": update_kind,
             "currentModeId": sensitive_payload,
         }
-        caplog.set_level("DEBUG", logger="acp_proxy.client")
+        caplog.set_level("DEBUG", logger="meadow_bridge.client")
 
         client._handle_notification(
             {
@@ -499,7 +499,7 @@ class TestHandleNotification:
         client._transport = MagicMock()
         client._transport.pending_request_count.return_value = 1
         sensitive_value = "sensitive-current-value"
-        caplog.set_level("DEBUG", logger="acp_proxy.client")
+        caplog.set_level("DEBUG", logger="meadow_bridge.client")
 
         client._handle_notification(
             {
@@ -1125,7 +1125,7 @@ class TestDirectModelBindingNegotiation:
 
     @pytest.mark.asyncio
     async def test_method_not_found_selects_copilot_strategy(self) -> None:
-        from acp_proxy.transport import AcpError
+        from meadow_bridge.transport import AcpError
 
         client = self._client()
         assert isinstance(client._transport, AsyncMock)
@@ -1151,7 +1151,7 @@ class TestDirectModelBindingNegotiation:
 
     @pytest.mark.asyncio
     async def test_neither_strategy_fails_without_freezing_state(self) -> None:
-        from acp_proxy.transport import AcpError
+        from meadow_bridge.transport import AcpError
 
         client = self._client()
         assert isinstance(client._transport, AsyncMock)
@@ -1174,7 +1174,7 @@ class TestDirectModelBindingNegotiation:
     async def test_non_method_error_never_downgrades_to_copilot(
         self, error_code: object
     ) -> None:
-        from acp_proxy.transport import AcpError
+        from meadow_bridge.transport import AcpError
 
         client = self._client()
         assert isinstance(client._transport, AsyncMock)
@@ -1303,7 +1303,7 @@ class TestDirectAcpContract:
         ]
         transport.pending_request_count.return_value = 0
         client._transport = transport
-        caplog.set_level("DEBUG", logger="acp_proxy.client")
+        caplog.set_level("DEBUG", logger="meadow_bridge.client")
 
         await client._initialize()
         assert await client.create_session(cwd_canary) == session_canary
@@ -1334,7 +1334,7 @@ class TestDirectAcpContract:
             "agentCapabilities": {},
         }
         client._transport = transport
-        caplog.set_level("DEBUG", logger="acp_proxy.client")
+        caplog.set_level("DEBUG", logger="meadow_bridge.client")
 
         with pytest.raises(RuntimeError, match="direct ACP protocol version mismatch") as raised:
             await client._initialize()
@@ -1592,7 +1592,7 @@ class TestDirectAcpContract:
         setter_method: str,
     ) -> None:
         """A post-readiness method loss fails instead of switching strategies."""
-        from acp_proxy.transport import AcpError
+        from meadow_bridge.transport import AcpError
 
         client = AcpClient("unused")
         client._models = [ModelInfo("gpt-5.3-codex", "GPT-5.3 Codex")]
@@ -1680,7 +1680,7 @@ class TestDirectAcpContract:
     @pytest.mark.asyncio
     async def test_rejected_nondefault_binding_retains_observed_current_model(self) -> None:
         """A rejected setter cannot make the requested model appear bound."""
-        from acp_proxy.transport import AcpError
+        from meadow_bridge.transport import AcpError
 
         client = AcpClient("unused")
         client._models = [ModelInfo("gpt-5.3-codex", "GPT-5.3 Codex")]
@@ -1859,7 +1859,7 @@ class TestPromptTimeout:
     @pytest.mark.asyncio
     async def test_timeout_raises_prompt_timeout(self) -> None:
         """A prompt that exceeds the deadline raises PromptTimeout."""
-        from acp_proxy.client import PromptTimeout
+        from meadow_bridge.client import PromptTimeout
 
         client = AcpClient("unused")
         client._sessions = {"s1": SessionState(session_id="s1")}
@@ -1888,7 +1888,7 @@ class TestPromptTimeout:
     @pytest.mark.asyncio
     async def test_timeout_includes_partial_text(self) -> None:
         """Partial text collected before the timeout is preserved in the exception."""
-        from acp_proxy.client import PromptTimeout
+        from meadow_bridge.client import PromptTimeout
 
         client = AcpClient("unused")
         client._sessions = {"s1": SessionState(session_id="s1")}
@@ -1999,7 +1999,7 @@ class TestPromptTimeout:
     @pytest.mark.asyncio
     async def test_queue_cleanup_after_timeout(self) -> None:
         """The update queue is removed after a timeout to prevent leaks."""
-        from acp_proxy.client import PromptTimeout
+        from meadow_bridge.client import PromptTimeout
 
         client = AcpClient("unused")
         client._sessions = {"s1": SessionState(session_id="s1")}

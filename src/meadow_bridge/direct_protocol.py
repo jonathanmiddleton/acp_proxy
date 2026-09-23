@@ -9,15 +9,15 @@ from __future__ import annotations
 import hashlib
 import json
 from enum import StrEnum
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from . import __version__
 
-DIRECT_PROTOCOL_ID = "meadow-acp-direct"
-DIRECT_PROTOCOL_MAJOR = 1
-PROXY_VERSION = __version__
+DIRECT_PROTOCOL_ID: Final[Literal["meadow-acp-direct"]] = "meadow-acp-direct"
+DIRECT_PROTOCOL_MAJOR: Final[Literal[1]] = 1
+BRIDGE_VERSION = __version__
 
 PATH_SAFE_IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._~-]*$"
 Identifier = Annotated[
@@ -106,7 +106,7 @@ class DirectFeatures(StrictModel):
 class CapabilitiesResponse(StrictModel):
     protocol: Literal["meadow-acp-direct"] = DIRECT_PROTOCOL_ID
     protocol_major: Literal[1] = DIRECT_PROTOCOL_MAJOR
-    proxy_version: str = PROXY_VERSION
+    proxy_version: str = BRIDGE_VERSION
     continuity_generation_id: Identifier
     consumer_mode: Literal["meadow-direct"] = "meadow-direct"
     canonical_workspace: str
