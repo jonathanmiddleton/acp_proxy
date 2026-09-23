@@ -18,6 +18,7 @@ import platform
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterable
@@ -104,7 +105,7 @@ def _terminate_probe_process_group(process: subprocess.Popen[bytes]) -> None:
     leader termination as a fail-safe when that utility is unavailable.
     """
 
-    if os.name == "nt":
+    if sys.platform == "win32":
         try:
             subprocess.run(
                 ["taskkill", "/PID", str(process.pid), "/T", "/F"],

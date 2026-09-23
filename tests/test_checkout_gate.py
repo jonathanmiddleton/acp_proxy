@@ -108,7 +108,9 @@ def gate_checkout(tmp_path: Path) -> GateCheckout:
     _install_python_command(
         executables,
         "git",
-        f"import os\nimport sys\nos.execv({git!r}, [{git!r}, *sys.argv[1:]])\n",
+        "import subprocess\nimport sys\n"
+        f"result = subprocess.run([{git!r}, *sys.argv[1:]], check=False)\n"
+        "raise SystemExit(result.returncode)\n",
     )
     checkout = GateCheckout(root, executables, tmp_path / "calls.txt", git)
     checkout.git_command("init", "--initial-branch=main")

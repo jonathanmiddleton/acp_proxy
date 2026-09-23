@@ -245,7 +245,7 @@ def _terminate_process_tree(
 ) -> int:
     """Stop the owned bridge tree without leaving its ACP child behind."""
 
-    if os.name == "nt":
+    if sys.platform == "win32":
         if process.poll() is None and graceful:
             try:
                 # Windows process groups disable CTRL+C but accept CTRL+BREAK.
@@ -264,34 +264,34 @@ def _terminate_process_tree(
             )
             return process.wait(timeout=5.0)
         return process.wait()
+    else:
+        return_code = process.poll()
+        if return_code is None and graceful:
+            process.send_signal(signal.SIGTERM)
+            try:
+                return_code = process.wait(timeout=_BRIDGE_STOP_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                pass
+        elif return_code is None:
+            _signal_posix_group(process_group_id, signal.SIGTERM)
+            try:
+                return_code = process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                pass
 
-    return_code = process.poll()
-    if return_code is None and graceful:
-        process.send_signal(signal.SIGTERM)
-        try:
-            return_code = process.wait(timeout=_BRIDGE_STOP_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            pass
-    elif return_code is None:
-        _signal_posix_group(process_group_id, signal.SIGTERM)
-        try:
-            return_code = process.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            pass
-
-    if return_code is None:
-        _signal_posix_group(process_group_id, signal.SIGKILL)
-        return_code = process.wait(timeout=5.0)
-
-    if _posix_group_exists(process_group_id):
-        _signal_posix_group(process_group_id, signal.SIGTERM)
-        if not _wait_for_posix_group_exit(process_group_id, 5.0):
+        if return_code is None:
             _signal_posix_group(process_group_id, signal.SIGKILL)
+            return_code = process.wait(timeout=5.0)
+
+        if _posix_group_exists(process_group_id):
+            _signal_posix_group(process_group_id, signal.SIGTERM)
             if not _wait_for_posix_group_exit(process_group_id, 5.0):
-                raise RuntimeError(
-                    f"bridge process group {process_group_id} survived SIGKILL"
-                )
-    return return_code
+                _signal_posix_group(process_group_id, signal.SIGKILL)
+                if not _wait_for_posix_group_exit(process_group_id, 5.0):
+                    raise RuntimeError(
+                        f"bridge process group {process_group_id} survived SIGKILL"
+                    )
+        return return_code
 
 
 def _wait_for_readiness(
