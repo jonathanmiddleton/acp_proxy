@@ -4,8 +4,7 @@ Read this document before making any changes to the codebase. These standards
 are binding and reflect the realities of building on partially documented,
 externally controlled interfaces.
 
-The typing, checkout validation, semantic design, and test-retention rules are
-adapted from the sibling Meadow repository. ACP Proxy's own ADRs remain
+ACP Proxy's ADRs remain
 authoritative for its protocols, resource ownership, and failure policy.
 See [ADR-017](adrs/017-change-relative-typing-and-checkout-gate.md) for the
 adoption decision and migration boundary.

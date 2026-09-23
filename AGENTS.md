@@ -8,8 +8,7 @@ The user's name is Jonathan.
 contains the project's binding standards covering failure handling, error
 surfacing, resilience policy, and testing philosophy.
 
-It also owns the Meadow-derived strong typing, semantic design, and
-test-retention rules. Required completion validation is
+Required completion validation is
 `python3 scripts/checkout_gate.py`; `--list` prints its inventory. The gate
 synchronizes the locked development environment, runs Mypy/Pyrefly
 change-relative validation against `refs/heads/main`, all tests, and Ruff, and
