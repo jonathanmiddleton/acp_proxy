@@ -1,6 +1,6 @@
 # Native IDE first delivery
 
-Status: In Progress
+Status: Done
 
 Deliver one managed Meadow-to-Bridge-to-Copilot path using the installed
 language server over LSP-framed stdio. Preserve caller-owned logical session
@@ -79,3 +79,36 @@ repositories. Native transport/client, workspace tools, and Meadow adapter
 changes have separate writers. The coordinating writer owns Bridge HTTP/state
 integration, public documentation, assembled validation and delivery. Full
 gates run serially against a stable assembled candidate.
+
+## Qualified delivery
+
+The coordinated implementation was published on `codex/native-ide-bridge`:
+
+- Bridge `13a2894d23043587eca29930208276bc636f3b3a` provides version `0.4.0`.
+- Meadow `d781d4d0cd7ace27cb0f2e39b66eb899c78dabd1` pins that Bridge revision.
+- workflow-algebra `ff14037dd7961ed237b66a9f9671be4ea8d835a9` pins both revisions.
+
+Bridge's complete checkout gate exited zero on macOS and native Windows,
+with 300 tests on each platform, including real two-turn Copilot integration.
+The observed language-server versions were `1.545.1` and `1.537.5` respectively;
+Windows command tests used Windows PowerShell `5.1.26100.9457`.
+
+Managed Meadow acceptance passed on the macOS host and in the freshly built
+Linux container with language server `1.523.3`. Each run retained the same
+logical/native session across two turns, recalled distinct role/skill/support
+markers after their source files were removed, performed receipt-backed file
+creation/edit/command effects, and retired its conversation with settled
+resources. No correction or request replay was used. These local runs observed
+no confirmation callbacks; execution still checked the explicit session policy.
+
+Meadow's complete gate exited zero with nine successful checks, 6,906 root
+tests passed, two unchanged platform skips and 30 prototype tests passed.
+Its retained full-runtime experiments additionally prove allocated/null native
+identities become bound during prompting and retire those exact bindings,
+including a mixed OpenCode/Bridge run. workflow-algebra's complete gate exited
+zero with 26 successful checks and no failed or skipped steps.
+
+The Windows qualification covers Bridge; the complete Meadow and
+workflow-algebra gates ran on macOS. These observations do not expand the
+unsupported capabilities listed above. Final tracking-only commits do not
+change the implementation revisions pinned by consumers.
