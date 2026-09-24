@@ -1,6 +1,6 @@
-"""Versioned HTTP vocabulary for Meadow's strict direct ACP integration.
+"""Versioned HTTP vocabulary for Meadow's native IDE integration.
 
-This module contains wire shapes only.  ACP method names and transport details
+This module contains wire shapes only.  Native method names and transport details
 remain below the HTTP service boundary.
 """
 
@@ -9,14 +9,14 @@ from __future__ import annotations
 import hashlib
 import json
 from enum import StrEnum
-from typing import Annotated, Any, Final, Literal
+from typing import Annotated, Final, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from . import __version__
 
-DIRECT_PROTOCOL_ID: Final[Literal["meadow-acp-direct"]] = "meadow-acp-direct"
-DIRECT_PROTOCOL_MAJOR: Final[Literal[1]] = 1
+DIRECT_PROTOCOL_ID: Final[Literal["meadow-bridge-direct"]] = "meadow-bridge-direct"
+DIRECT_PROTOCOL_MAJOR: Final[Literal[2]] = 2
 BRIDGE_VERSION = __version__
 
 PATH_SAFE_IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._~-]*$"
@@ -38,7 +38,7 @@ class StrictModel(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def reject_ambiguous_protocol_major(cls, value: Any) -> Any:
+    def reject_ambiguous_protocol_major(cls, value: object) -> object:
         """Reject Python bool/float aliases for the JSON integer major."""
 
         if (
@@ -51,7 +51,7 @@ class StrictModel(BaseModel):
 
 
 class DirectLimits(StrictModel):
-    """Negotiated admission and evidence limits for one proxy generation."""
+    """Negotiated admission and evidence limits for one Bridge generation."""
 
     max_request_bytes: int = Field(default=1_000_000, ge=1)
     max_prompt_bytes: int = Field(default=500_000, ge=1)
@@ -77,15 +77,16 @@ class ExecutionAuthority(StrictModel):
     """Truthful process/callback authority advertised to Meadow."""
 
     profile: Literal["trusted-host", "confined-container"]
-    acp_agent_internal_tools: Literal["process-user", "container-boundary"]
-    filesystem_callbacks: bool = False
-    terminal_callbacks: bool = False
-    permission_callbacks: bool = False
-    permission_default: Literal["deny"] = "deny"
+    native_internal_tools: Literal["process-user", "container-boundary"]
+    filesystem_callbacks: Literal[True] = True
+    terminal_callbacks: Literal[True] = True
+    permission_callbacks: Literal[True] = True
+    permission_default: Literal["allow_all"] = "allow_all"
+    effect_observation_scope: Literal["bridge_callbacks"] = "bridge_callbacks"
 
 
 class DirectFeatures(StrictModel):
-    """Normalized direct features, independent of raw ACP capability names."""
+    """Normalized direct features, independent of raw native capability names."""
 
     request_status: bool = True
     request_cancellation: bool = True
@@ -99,28 +100,46 @@ class DirectFeatures(StrictModel):
     ordered_request_events: bool = True
     request_scoped_tool_activity: bool = True
     permission_activity_observation: bool = True
-    effect_observation: bool = False
+    effect_observation: bool = True
     usage_reporting: bool = False
 
 
+class NativeServerIdentity(StrictModel):
+    """Identity reported by native initialize, not an execution attestation."""
+
+    name: str = Field(min_length=1)
+    version: str = Field(min_length=1)
+
+
+class PermissionPolicy(StrictModel):
+    """Explicit first-version noninteractive policy, pinned per session."""
+
+    version: Literal[1]
+    mode: Literal["allow_all"]
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_ambiguous_version(cls, value: object) -> object:
+        if isinstance(value, dict) and type(value.get("version")) is not int:
+            raise ValueError("permission policy version must be an exact integer")
+        return value
+
+
 class CapabilitiesResponse(StrictModel):
-    protocol: Literal["meadow-acp-direct"] = DIRECT_PROTOCOL_ID
-    protocol_major: Literal[1] = DIRECT_PROTOCOL_MAJOR
-    proxy_version: str = BRIDGE_VERSION
+    protocol: Literal["meadow-bridge-direct"] = DIRECT_PROTOCOL_ID
+    protocol_major: Literal[2] = DIRECT_PROTOCOL_MAJOR
+    bridge_version: str = BRIDGE_VERSION
     continuity_generation_id: Identifier
-    consumer_mode: Literal["meadow-direct"] = "meadow-direct"
     canonical_workspace: str
     execution_authority: ExecutionAuthority
     limits: DirectLimits
     features: DirectFeatures = Field(default_factory=DirectFeatures)
     model_ids: list[str]
-    acp_protocol_version: int
-    acp_agent_info: dict[str, Any]
-    acp_agent_capabilities: dict[str, Any]
+    native_server_info: NativeServerIdentity
 
 
 class PinnedRequest(StrictModel):
-    protocol_major: Literal[1]
+    protocol_major: Literal[2]
     continuity_generation_id: Identifier = Field(min_length=1, max_length=256)
     operation_id: Identifier = Field(min_length=1, max_length=256)
 
@@ -132,6 +151,7 @@ class CreateSessionRequest(PinnedRequest):
     title: str = Field(min_length=1, max_length=1024)
     model_id: str = Field(min_length=1, max_length=256)
     stable_instruction_digest: Sha256Digest = Field(pattern=r"^[0-9a-f]{64}$")
+    permission_policy: PermissionPolicy
 
 
 class PromptPhase(StrEnum):
@@ -203,12 +223,22 @@ class EvidenceAvailability(StrEnum):
 class OrderedEvent(StrictModel):
     sequence: int = Field(ge=0)
     update_type: str
-    raw: dict[str, Any]
+    raw: dict[str, JsonValue]
+
+
+class ToolObservation(StrictModel):
+    """Native or Bridge tool observation with an explicit ownership scope."""
+
+    tool_call_id: str
+    name: str
+    status: str
+    scope: Literal["server", "bridge"]
 
 
 class ToolEvidence(StrictModel):
     availability: EvidenceAvailability = Field(strict=False)
     tool_call_ids: list[str]
+    calls: list[ToolObservation]
     events: list[OrderedEvent]
 
 
@@ -217,8 +247,22 @@ class UsageEvidence(StrictModel):
     values: dict[str, int] | None = None
 
 
+class PermissionObservation(StrictModel):
+    tool_call_id: str
+    allowed: bool
+    policy_digest: Sha256Digest = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class EffectObservation(StrictModel):
+    """A Bridge-owned receipt; server tools are outside this evidence scope."""
+
+    tool_call_id: str
+    receipt: dict[str, JsonValue]
+
+
 class PermissionEvidence(StrictModel):
     availability: EvidenceAvailability = Field(strict=False)
+    decisions: list[PermissionObservation]
     events: list[OrderedEvent]
 
 
@@ -230,11 +274,13 @@ class PromptResult(StrictModel):
     continuity_generation_id: Identifier
     model_id: str
     response_text: str
-    acp_stop_reason: str
+    stop_reason: str
     events: list[OrderedEvent]
     tool_evidence: ToolEvidence
     permission_evidence: PermissionEvidence
     effect_evidence: EvidenceAvailability = Field(strict=False)
+    effect_events: list[OrderedEvent]
+    effects: list[EffectObservation]
     usage: UsageEvidence
     instruction_submission: Literal[
         "submitted_once",
@@ -251,8 +297,8 @@ class OperationView(StrictModel):
     logical_session_id: Identifier | None = None
     invocation_id: Identifier | None = None
     target_operation_id: Identifier | None = None
-    result: dict[str, Any] | None = None
-    error: dict[str, Any] | None = None
+    result: dict[str, JsonValue] | None = None
+    error: dict[str, JsonValue] | None = None
 
 
 def sha256_text(value: str) -> Sha256Digest:

@@ -13,6 +13,7 @@ from meadow_bridge.direct_protocol import (
     DIRECT_PROTOCOL_MAJOR,
     CreateSessionRequest,
     DirectLimits,
+    PermissionPolicy,
     PromptRequest,
     PromptResult,
     canonical_request_digest,
@@ -52,6 +53,7 @@ def test_create_session_digest_is_stable_and_identity_sensitive(
         title="title",
         model_id=model_id,
         stable_instruction_digest=hashlib.sha256(instructions.encode()).hexdigest(),
+        permission_policy=PermissionPolicy(version=1, mode="allow_all"),
     )
 
     assert canonical_request_digest(request) == canonical_request_digest(request)
@@ -72,13 +74,14 @@ def test_direct_requests_reject_unknown_fields(extra_key: str) -> None:
         "title": "title",
         "model_id": "gpt-5.3-codex",
         "stable_instruction_digest": "0" * 64,
+        "permission_policy": {"version": 1, "mode": "allow_all"},
         extra_key: "ignored-by-an-old-proxy",
     }
     with pytest.raises(ValidationError):
         CreateSessionRequest.model_validate(payload)
 
 
-@pytest.mark.parametrize("invalid_major", [True, 1.0, "1"])
+@pytest.mark.parametrize("invalid_major", [True, 2.0, "2", 1])
 def test_direct_requests_reject_coerced_protocol_major(
     invalid_major: object,
 ) -> None:
@@ -94,6 +97,7 @@ def test_direct_requests_reject_coerced_protocol_major(
         "title": "title",
         "model_id": "gpt-5.3-codex",
         "stable_instruction_digest": "0" * 64,
+        "permission_policy": {"version": 1, "mode": "allow_all"},
     }
     with pytest.raises(ValidationError):
         CreateSessionRequest.model_validate(payload)
@@ -163,6 +167,7 @@ def test_wire_identifiers_reject_non_path_safe_values(unsafe_id: str) -> None:
         "title": "title",
         "model_id": "gpt-5.3-codex",
         "stable_instruction_digest": "0" * 64,
+        "permission_policy": {"version": 1, "mode": "allow_all"},
     }
     with pytest.raises(ValidationError):
         CreateSessionRequest.model_validate(payload)
@@ -179,20 +184,46 @@ def test_instruction_submission_reports_only_observed_submission_states() -> Non
         "continuity_generation_id": "generation",
         "model_id": "gpt-5.3-codex",
         "response_text": "result",
-        "acp_stop_reason": "end_turn",
+        "stop_reason": "completed",
         "events": [],
         "tool_evidence": {
             "availability": "observed",
             "tool_call_ids": [],
+            "calls": [],
             "events": [],
         },
-        "permission_evidence": {"availability": "observed", "events": []},
+        "permission_evidence": {"availability": "observed", "decisions": [], "events": []},
         "effect_evidence": "unavailable",
+        "effects": [],
+        "effect_events": [],
         "usage": {"availability": "unavailable", "values": None},
         "instruction_submission": "unavailable",
         "stable_instruction_digest": "0" * 64,
         "output_contract_digest": "1" * 64,
     }
 
+    valid = {**payload, "instruction_submission": "submitted_once"}
+    PromptResult.model_validate(valid)
     with pytest.raises(ValidationError):
         PromptResult.model_validate(payload)
+
+
+@pytest.mark.parametrize("policy", [None, {}, {"mode": "allow_all"},
+    {"version": True, "mode": "allow_all"}, {"version": 1.0, "mode": "allow_all"},
+    {"version": 1, "mode": "ask"}, {"version": 1, "mode": "allow_all", "fallback": True}])
+def test_session_admission_requires_an_explicit_supported_policy(policy: object) -> None:
+    """Omission and coercion cannot silently turn into permission to execute."""
+    payload = {
+        "protocol_major": 2, "continuity_generation_id": "generation",
+        "operation_id": "operation", "logical_session_id": "session",
+        "expected_canonical_workspace": "/workspace", "actor_ref": "actor",
+        "title": "title", "model_id": "model", "stable_instruction_digest": "0" * 64,
+        "permission_policy": {"version": 1, "mode": "allow_all"},
+    }
+    admitted = CreateSessionRequest.model_validate(payload)
+    assert admitted.permission_policy.mode == "allow_all"
+    with pytest.raises(ValidationError):
+        CreateSessionRequest.model_validate({**payload, "permission_policy": policy})
+    omitted = {key: value for key, value in payload.items() if key != "permission_policy"}
+    with pytest.raises(ValidationError):
+        CreateSessionRequest.model_validate(omitted)

@@ -1,5 +1,9 @@
 # ADR-014: Correlate Direct Session State Without Retaining Unsupported State
 
+> **Native backend supersession:** [ADR-020](020-native-ide-backend.md) replaces
+> the ACP-specific transport, callback, binding, and wire provisions below.
+> Historical evidence is retained; consult ADR-020 for current ownership.
+
 **Status:** Accepted; pending-model integrity partially superseded by
 [ADR-015](015-order-direct-model-binding-transitions.md)
 **Date:** 2026-08-11

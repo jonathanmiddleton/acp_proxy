@@ -4,23 +4,41 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import pytest
-from starlette.types import Message
+from starlette.types import Message, Scope, Receive, Send
 from httpx import ASGITransport, AsyncClient
+from fastapi import FastAPI
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from meadow_bridge.client import ModelAcknowledgementError, ModelInfo
+from meadow_bridge.native_types import (
+    AllocatedBinding,
+    ConversationBinding,
+    NativeBinding,
+    NativeCancelled,
+    NativeCompleted,
+    NativeEvent,
+    NativeEffectObservation,
+    NativePermissionObservation,
+    NativeFailed,
+    NativeModel,
+    NativeObservation,
+    NativeServerInfo,
+    NativeTerminal,
+    NativeToolObservation,
+    NativeUnsettledError,
+)
+from meadow_bridge.permission_policy import PermissionPolicy
+from meadow_bridge.json_types import JsonObject, json_text, json_object
+
 from meadow_bridge.direct_protocol import (
     CancelRequest,
     CreateSessionRequest,
     DirectLimits,
     PromptRequest,
+    PromptResult,
     RetireSessionRequest,
 )
 from meadow_bridge.direct_server import RequestBodyLimitMiddleware, create_direct_app
@@ -30,38 +48,25 @@ from meadow_bridge.direct_state import DirectConflict, DirectLimitExceeded
 TOKEN = "t" * 48
 
 
-@dataclass
-class FakeSessionDescriptor:
-    session_id: str
-    model_id: str
-
-
-class FakeDirectAcpClient:
-    """Observable ACP boundary double; protocol state remains real in the service."""
+class FakeNativeClient:
+    """Typed native boundary double; lifecycle and reconciliation remain production code."""
 
     def __init__(self) -> None:
-        self.models = [ModelInfo("gpt-5.3-codex", "GPT-5.3 Codex")]
-        self.protocol_version = 1
-        self.agent_info = {"name": "fake-copilot", "version": "1.0"}
-        self.agent_capabilities = {
-            "loadSession": True,
-            "sessionCapabilities": {"list": {}},
-        }
+        self.models = (NativeModel("gpt-5.3-codex", "GPT-5.3 Codex"),)
+        self.server_info = NativeServerInfo("fake-copilot", "1.0")
         self.created: list[tuple[str, str]] = []
-        self.prompts: list[tuple[str, list[dict[str, Any]]]] = []
+        self.bindings: dict[str, NativeBinding] = {}
+        self.prompts: list[tuple[str, str]] = []
         self.cancelled: list[str] = []
+        self.retired: list[str] = []
         self.release_prompt = asyncio.Event()
         self.block_prompts = False
-        self.block_create = False
-        self.release_create = asyncio.Event()
         self.create_error: Exception | None = None
-        self.updates: list[dict[str, Any]] = [
-            {
-                "sessionUpdate": "agent_message_chunk",
-                "content": {"type": "text", "text": '{"messages": []}'},
-            }
+        self.turn_error: Exception | None = None
+        self.updates: list[JsonObject] = [
+            {"kind": "native.progress.report", "reply": '{"messages": []}'}
         ]
-        self.stop_reason = "end_turn"
+        self.stop_reason = "completed"
         self.cancel_stop_reason = "cancelled"
         self.active_prompts = 0
         self.max_active_prompts = 0
@@ -71,58 +76,109 @@ class FakeDirectAcpClient:
         self.cancel_error: Exception | None = None
         self.cancel_hangs = False
         self.abort_count = 0
+        self.evidence_overflow = False
+        self.release_stop = asyncio.Event()
+        self.block_stop = False
+        self.stop_started = asyncio.Event()
 
-    async def create_session_exact(self, cwd: str, model_id: str) -> Any:
-        if self.block_create:
-            await self.release_create.wait()
+    def allocate_session(
+        self, logical_id: str, cwd: str, model_id: str, policy: PermissionPolicy
+    ) -> None:
         if self.create_error is not None:
             raise self.create_error
-        session_id = f"backend-{len(self.created) + 1}"
         self.created.append((cwd, model_id))
-        return FakeSessionDescriptor(session_id, model_id)
+        binding = AllocatedBinding(logical_id, model_id)
+        self.bindings[logical_id] = binding
 
-    async def prompt_blocks(
+    def binding(self, logical_id: str) -> NativeBinding:
+        return self.bindings[logical_id]
+
+    async def run_turn(
         self,
-        session_id: str,
-        blocks: list[dict[str, Any]],
+        logical_id: str,
+        text: str,
         *,
         timeout_s: float,
         event_byte_limit: int,
         event_count_limit: int,
-    ) -> AsyncIterator[dict[str, Any]]:
-        self.prompts.append((session_id, blocks))
+        response_byte_limit: int,
+    ) -> NativeTerminal:
+        binding = self.bindings[logical_id]
+        if isinstance(binding, AllocatedBinding):
+            bound = sum(
+                isinstance(item, ConversationBinding) for item in self.bindings.values()
+            )
+            binding = ConversationBinding(
+                logical_id, binding.model_id, f"backend-{bound + 1}", "turn-1"
+            )
+            self.bindings[logical_id] = binding
+        self.prompts.append((logical_id, text))
         self.active_prompts += 1
         self.max_active_prompts = max(self.max_active_prompts, self.active_prompts)
         try:
             if self.block_prompts:
                 await self.release_prompt.wait()
-            for update in self.updates:
-                yield update
+            events = tuple(
+                NativeEvent(str(update["kind"]), json_text(update))
+                for update in self.updates
+            )
+            tools = tuple(
+                NativeToolObservation(
+                    str(update["toolCallId"]), "test", "complete", "server"
+                )
+                for update in self.updates
+                if "toolCallId" in update
+            )
+            observation = NativeObservation(
+                binding,
+                "".join(str(update.get("reply", "")) for update in self.updates),
+                events,
+                tools,
+                (),
+                (),
+                not self.evidence_overflow,
+            )
             if self.lose_transport_after_updates:
                 self.is_alive = False
-                raise ConnectionError("private transport detail after accepted prompt")
-            stop_reason = (
+                raise NativeUnsettledError(
+                    "private transport detail after accepted prompt", observation
+                )
+            if self.turn_error is not None:
+                raise self.turn_error
+            reason = (
                 self.cancel_stop_reason
-                if session_id in self.cancelled
+                if logical_id in self.cancelled
                 else self.stop_reason
             )
-            yield {"done": True, "stopReason": stop_reason}
+            if self.evidence_overflow:
+                await self.cancel_session(logical_id)
+                return NativeCancelled(observation, "evidence_limit")
+            if reason == "completed":
+                return NativeCompleted(observation)
+            if reason == "cancelled":
+                return NativeCancelled(observation, "cancelled")
+            return NativeFailed(observation, "private native failure detail")
         finally:
             self.active_prompts -= 1
 
-    async def cancel_session(self, session_id: str) -> None:
+    async def cancel_session(self, logical_id: str) -> None:
         if self.cancel_hangs:
             await asyncio.Event().wait()
         if self.cancel_error is not None:
             raise self.cancel_error
-        self.cancelled.append(session_id)
+        self.cancelled.append(logical_id)
         if not self.ignore_cancel:
             self.release_prompt.set()
 
-    async def abort(self) -> None:
+    async def retire_session(self, logical_id: str) -> None:
+        self.retired.append(logical_id)
+
+    async def stop(self) -> None:
+        self.stop_started.set()
+        if self.block_stop:
+            await self.release_stop.wait()
         self.abort_count += 1
         self.is_alive = False
-        self.release_create.set()
         self.release_prompt.set()
 
 
@@ -130,10 +186,12 @@ def _auth() -> dict[str, str]:
     return {"Authorization": f"Bearer {TOKEN}"}
 
 
-def _create_body(service: DirectService, *, operation: str, session: str) -> dict:
+def _create_body(
+    service: DirectService, *, operation: str, session: str
+) -> dict[str, object]:
     stable = "stable Meadow instructions"
     return {
-        "protocol_major": 1,
+        "protocol_major": 2,
         "continuity_generation_id": service.continuity_generation_id,
         "operation_id": operation,
         "logical_session_id": session,
@@ -142,6 +200,7 @@ def _create_body(service: DirectService, *, operation: str, session: str) -> dic
         "title": "Developer",
         "model_id": "gpt-5.3-codex",
         "stable_instruction_digest": hashlib.sha256(stable.encode()).hexdigest(),
+        "permission_policy": {"version": 1, "mode": "allow_all"},
     }
 
 
@@ -151,10 +210,10 @@ def _prompt_body(
     operation: str,
     invocation: str,
     phase: str = "initial",
-) -> dict:
+) -> dict[str, object]:
     stable = "stable Meadow instructions"
-    body: dict[str, Any] = {
-        "protocol_major": 1,
+    body: dict[str, object] = {
+        "protocol_major": 2,
         "continuity_generation_id": service.continuity_generation_id,
         "operation_id": operation,
         "invocation_id": invocation,
@@ -197,8 +256,8 @@ async def _settle_creation(
 
 
 @pytest.fixture
-def direct_boundary(tmp_path: Path) -> tuple[DirectService, FakeDirectAcpClient, Any]:
-    fake = FakeDirectAcpClient()
+def direct_boundary(tmp_path: Path) -> tuple[DirectService, FakeNativeClient, FastAPI]:
+    fake = FakeNativeClient()
     service = DirectService(
         fake,
         cwd=str(tmp_path),
@@ -210,15 +269,13 @@ def direct_boundary(tmp_path: Path) -> tuple[DirectService, FakeDirectAcpClient,
     return service, fake, create_direct_app(service)
 
 
-
-
 @pytest.mark.asyncio
 async def test_session_mapping_capacity_retains_retired_tombstones(
     tmp_path: Path,
 ) -> None:
     """ADI-03/15: retirement never permits generation-local identity reuse."""
 
-    fake = FakeDirectAcpClient()
+    fake = FakeNativeClient()
     service = DirectService(
         fake,
         cwd=str(tmp_path),
@@ -229,7 +286,7 @@ async def test_session_mapping_capacity_retains_retired_tombstones(
     await _settle_creation(service, "create-one", "session-one")
     retire, _ = await service.admit_retire(
         RetireSessionRequest(
-            protocol_major=1,
+            protocol_major=2,
             continuity_generation_id=service.continuity_generation_id,
             operation_id="retire-one",
             logical_session_id="session-one",
@@ -250,37 +307,38 @@ async def test_session_mapping_capacity_retains_retired_tombstones(
 
 @pytest.mark.asyncio
 async def test_capability_handshake_is_authenticated_and_truthful(
-    direct_boundary: tuple[DirectService, FakeDirectAcpClient, Any],
+    direct_boundary: tuple[DirectService, FakeNativeClient, FastAPI],
 ) -> None:
     """ADI-02/08/15: capability evidence is exact and never public."""
     service, fake, app = direct_boundary
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://direct.test"
     ) as client:
-        denied = await client.get("/meadow/v1/capabilities")
-        accepted = await client.get("/meadow/v1/capabilities", headers=_auth())
-        repeated = await client.get("/meadow/v1/capabilities", headers=_auth())
+        denied = await client.get("/meadow/v2/capabilities")
+        accepted = await client.get("/meadow/v2/capabilities", headers=_auth())
+        repeated = await client.get("/meadow/v2/capabilities", headers=_auth())
 
     assert denied.status_code == 401
     assert accepted.status_code == 200
     assert repeated.json() == accepted.json()
     payload = accepted.json()
     assert payload["continuity_generation_id"] == service.continuity_generation_id
-    assert payload["consumer_mode"] == "meadow-direct"
+    assert payload["protocol"] == "meadow-bridge-direct"
+    assert "consumer_mode" not in payload
     assert payload["model_ids"] == ["gpt-5.3-codex"]
     assert payload["features"]["native_output_schema"] is False
     assert payload["features"]["request_scoped_tool_activity"] is True
-    assert payload["features"]["effect_observation"] is False
+    assert payload["features"]["effect_observation"] is True
     assert payload["features"]["usage_reporting"] is False
-    assert payload["execution_authority"]["terminal_callbacks"] is False
-    assert payload["execution_authority"]["permission_callbacks"] is False
+    assert payload["execution_authority"]["terminal_callbacks"] is True
+    assert payload["execution_authority"]["permission_callbacks"] is True
     assert fake.created == []
     assert fake.prompts == []
 
 
 @pytest.mark.asyncio
 async def test_session_identity_is_explicit_idempotent_and_isolated(
-    direct_boundary: tuple[DirectService, FakeDirectAcpClient, Any],
+    direct_boundary: tuple[DirectService, FakeNativeClient, FastAPI],
 ) -> None:
     """ADI-03/04: explicit IDs map once and identical prompts cannot collide."""
     service, fake, app = direct_boundary
@@ -288,26 +346,30 @@ async def test_session_identity_is_explicit_idempotent_and_isolated(
         transport=ASGITransport(app=app), base_url="http://direct.test"
     ) as client:
         first_body = _create_body(service, operation="create-one", session="one")
-        first = await client.post("/meadow/v1/sessions", json=first_body, headers=_auth())
+        first = await client.post(
+            "/meadow/v2/sessions", json=first_body, headers=_auth()
+        )
         duplicate = await client.post(
-            "/meadow/v1/sessions", json=first_body, headers=_auth()
+            "/meadow/v2/sessions", json=first_body, headers=_auth()
         )
         second = await client.post(
-            "/meadow/v1/sessions",
+            "/meadow/v2/sessions",
             json=_create_body(service, operation="create-two", session="two"),
             headers=_auth(),
         )
 
     assert first.status_code == duplicate.status_code == second.status_code == 200
-    assert first.json()["result"]["backend_session_id"] == "backend-1"
-    assert duplicate.json()["result"]["backend_session_id"] == "backend-1"
-    assert second.json()["result"]["backend_session_id"] == "backend-2"
+    assert first.json()["result"]["backend_session_id"] is None
+    assert first.json()["result"]["binding_state"] == "allocated"
+    assert duplicate.json() == first.json()
+    assert second.json()["result"]["backend_session_id"] is None
+    assert fake.prompts == []
     assert len(fake.created) == 2
 
 
 @pytest.mark.asyncio
 async def test_instruction_contract_layers_are_not_replayed_on_correction(
-    direct_boundary: tuple[DirectService, FakeDirectAcpClient, Any],
+    direct_boundary: tuple[DirectService, FakeNativeClient, FastAPI],
 ) -> None:
     """ADI-06/07/08: stable/current/schema layers occur once; repair is a delta."""
     service, fake, app = direct_boundary
@@ -315,19 +377,17 @@ async def test_instruction_contract_layers_are_not_replayed_on_correction(
         transport=ASGITransport(app=app), base_url="http://direct.test"
     ) as client:
         await client.post(
-            "/meadow/v1/sessions",
+            "/meadow/v2/sessions",
             json=_create_body(service, operation="create", session="session"),
             headers=_auth(),
         )
         initial = await client.post(
-            "/meadow/v1/sessions/session/requests",
-            json=_prompt_body(
-                service, operation="initial", invocation="invocation"
-            ),
+            "/meadow/v2/sessions/session/requests",
+            json=_prompt_body(service, operation="initial", invocation="invocation"),
             headers=_auth(),
         )
         correction = await client.post(
-            "/meadow/v1/sessions/session/requests",
+            "/meadow/v2/sessions/session/requests",
             json=_prompt_body(
                 service,
                 operation="correction",
@@ -338,8 +398,8 @@ async def test_instruction_contract_layers_are_not_replayed_on_correction(
         )
 
     assert initial.status_code == correction.status_code == 200
-    first_text = fake.prompts[0][1][0]["text"]
-    repair_text = fake.prompts[1][1][0]["text"]
+    first_text = fake.prompts[0][1]
+    repair_text = fake.prompts[1][1]
     assert first_text.count("stable Meadow instructions") == 1
     assert first_text.count("complete prose contract") == 1
     assert repair_text == "validation diagnostic only"
@@ -357,12 +417,12 @@ async def test_unproven_usage_and_session_info_remain_raw_diagnostics(
 ) -> None:
     """ADI-08: malformed or ambiguous counters never become usage evidence."""
 
-    fake = FakeDirectAcpClient()
+    fake = FakeNativeClient()
     fake.updates = [
-        {"sessionUpdate": "usage_update", "inputTokens": True},
-        {"sessionUpdate": "usage_update", "outputTokens": -1},
-        {"sessionUpdate": "usage_update", "totalTokens": "malformed"},
-        {"sessionUpdate": "session_info_update", "sessionInfo": [False, -2]},
+        {"kind": "native.progress.report", "inputTokens": True},
+        {"kind": "native.progress.report", "outputTokens": -1},
+        {"kind": "native.progress.report", "totalTokens": "malformed"},
+        {"kind": "native.progress.report", "sessionInfo": [False, -2]},
     ]
     service = DirectService(
         fake,
@@ -383,30 +443,30 @@ async def test_unproven_usage_and_session_info_remain_raw_diagnostics(
     assert view.state == "completed"
     assert view.result is not None
     assert view.result["usage"] == {"availability": "unavailable", "values": None}
-    assert [event["raw"] for event in view.result["events"]] == fake.updates
+    assert [
+        event.raw for event in PromptResult.model_validate(view.result).events
+    ] == fake.updates
 
 
 @pytest.mark.asyncio
 async def test_busy_session_rejects_second_prompt_before_dispatch(
-    direct_boundary: tuple[DirectService, FakeDirectAcpClient, Any],
+    direct_boundary: tuple[DirectService, FakeNativeClient, FastAPI],
 ) -> None:
-    """ADI-05: one session has one in-flight ACP prompt and one event owner."""
+    """ADI-05: one session has one in-flight native prompt and one event owner."""
     service, fake, app = direct_boundary
     fake.block_prompts = True
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://direct.test"
     ) as client:
         await client.post(
-            "/meadow/v1/sessions",
+            "/meadow/v2/sessions",
             json=_create_body(service, operation="create", session="session"),
             headers=_auth(),
         )
         first_task = asyncio.create_task(
             client.post(
-                "/meadow/v1/sessions/session/requests",
-                json=_prompt_body(
-                    service, operation="first", invocation="invocation"
-                ),
+                "/meadow/v2/sessions/session/requests",
+                json=_prompt_body(service, operation="first", invocation="invocation"),
                 headers=_auth(),
             )
         )
@@ -415,7 +475,7 @@ async def test_busy_session_rejects_second_prompt_before_dispatch(
                 break
             await asyncio.sleep(0.01)
         second = await client.post(
-            "/meadow/v1/sessions/session/requests",
+            "/meadow/v2/sessions/session/requests",
             json=_prompt_body(
                 service,
                 operation="second",
@@ -434,31 +494,31 @@ async def test_busy_session_rejects_second_prompt_before_dispatch(
 
 @pytest.mark.asyncio
 async def test_permission_outcome_is_request_scoped_ordered_evidence(
-    direct_boundary: tuple[DirectService, FakeDirectAcpClient, Any],
+    direct_boundary: tuple[DirectService, FakeNativeClient, FastAPI],
 ) -> None:
     """ADI-08/09: sanitized permission denial remains in the prompt envelope."""
     service, fake, app = direct_boundary
     fake.updates = [
         {
-            "sessionUpdate": "client_permission_request",
-            "outcome": "cancelled",
+            "kind": "native.client_tool.confirmation",
+            "outcome": "allowed",
             "offeredKinds": ["allow_once"],
         },
         {
-            "sessionUpdate": "agent_message_chunk",
-            "content": {"type": "text", "text": "done"},
+            "kind": "native.progress.report",
+            "reply": "done",
         },
     ]
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://direct.test"
     ) as client:
         await client.post(
-            "/meadow/v1/sessions",
+            "/meadow/v2/sessions",
             json=_create_body(service, operation="create", session="session"),
             headers=_auth(),
         )
         response = await client.post(
-            "/meadow/v1/sessions/session/requests",
+            "/meadow/v2/sessions/session/requests",
             json=_prompt_body(service, operation="prompt", invocation="invocation"),
             headers=_auth(),
         )
@@ -468,14 +528,15 @@ async def test_permission_outcome_is_request_scoped_ordered_evidence(
     assert result["permission_evidence"] == {
         "availability": "observed",
         "events": [result["events"][0]],
+        "decisions": [],
     }
 
 
 @pytest.mark.asyncio
 async def test_removed_adapter_has_no_route(
-    direct_boundary: tuple[DirectService, FakeDirectAcpClient, Any],
+    direct_boundary: tuple[DirectService, FakeNativeClient, FastAPI],
 ) -> None:
-    """Removed adapter requests cannot dispatch ACP work."""
+    """Removed adapter requests cannot dispatch native work."""
     _, _, app = direct_boundary
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://direct.test"
@@ -486,11 +547,9 @@ async def test_removed_adapter_has_no_route(
     assert response.status_code == 404
 
 
-
-
 @pytest.mark.asyncio
 async def test_output_contract_digest_and_active_invocation_are_fail_closed(
-    direct_boundary: tuple[DirectService, FakeDirectAcpClient, Any],
+    direct_boundary: tuple[DirectService, FakeNativeClient, FastAPI],
 ) -> None:
     """ADI-07: contract bytes bind work and only the active invocation accepts deltas."""
     service, fake, app = direct_boundary
@@ -498,22 +557,22 @@ async def test_output_contract_digest_and_active_invocation_are_fail_closed(
         transport=ASGITransport(app=app), base_url="http://direct.test"
     ) as client:
         await client.post(
-            "/meadow/v1/sessions",
+            "/meadow/v2/sessions",
             json=_create_body(service, operation="create", session="session"),
             headers=_auth(),
         )
         wrong = _prompt_body(service, operation="wrong", invocation="first")
         wrong["output_contract_digest"] = "0" * 64
         rejected = await client.post(
-            "/meadow/v1/sessions/session/requests", json=wrong, headers=_auth()
+            "/meadow/v2/sessions/session/requests", json=wrong, headers=_auth()
         )
         first = await client.post(
-            "/meadow/v1/sessions/session/requests",
+            "/meadow/v2/sessions/session/requests",
             json=_prompt_body(service, operation="first", invocation="first"),
             headers=_auth(),
         )
         second = await client.post(
-            "/meadow/v1/sessions/session/requests",
+            "/meadow/v2/sessions/session/requests",
             json=_prompt_body(
                 service,
                 operation="second",
@@ -532,7 +591,7 @@ async def test_output_contract_digest_and_active_invocation_are_fail_closed(
             b"complete prose contract"
         ).hexdigest()
         stale = await client.post(
-            "/meadow/v1/sessions/session/requests",
+            "/meadow/v2/sessions/session/requests",
             json=stale_delta,
             headers=_auth(),
         )
@@ -548,7 +607,7 @@ async def test_empty_stable_instruction_bytes_are_valid_and_submitted_once(
     tmp_path: Path,
 ) -> None:
     """ADI-06: submitted empty bytes are distinct from a missing stable layer."""
-    fake = FakeDirectAcpClient()
+    fake = FakeNativeClient()
     service = DirectService(
         fake,
         cwd=str(tmp_path),
@@ -566,16 +625,14 @@ async def test_empty_stable_instruction_bytes_are_valid_and_submitted_once(
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://direct.test"
     ) as client:
-        created = await client.post(
-            "/meadow/v1/sessions", json=create, headers=_auth()
-        )
+        created = await client.post("/meadow/v2/sessions", json=create, headers=_auth())
         completed = await client.post(
-            "/meadow/v1/sessions/session/requests", json=prompt, headers=_auth()
+            "/meadow/v2/sessions/session/requests", json=prompt, headers=_auth()
         )
 
     assert created.status_code == completed.status_code == 200
     assert completed.json()["result"]["instruction_submission"] == "submitted_once"
-    assert fake.prompts[0][1][0]["text"].startswith("\n\ncurrent prompt")
+    assert fake.prompts[0][1].startswith("\n\ncurrent prompt")
 
 
 @pytest.mark.parametrize(
@@ -591,7 +648,7 @@ def test_prompt_byte_limit_counts_exact_rendered_separators(
 ) -> None:
     """ADI-07/15: exact rendered initial/invocation/delta bytes admit at/+1."""
     service = DirectService(
-        FakeDirectAcpClient(),
+        FakeNativeClient(),
         cwd=str(tmp_path),
         launch_secret=TOKEN,
         execution_authority="trusted-host",
@@ -635,7 +692,7 @@ async def test_global_prompt_queue_has_exact_atomic_admission_edges(
     tmp_path: Path, max_queued: int
 ) -> None:
     """ADI-05/15: 0/at/max+1 queue edges serialize distinct sessions pre-dispatch."""
-    fake = FakeDirectAcpClient()
+    fake = FakeNativeClient()
     fake.block_prompts = True
     service = DirectService(
         fake,
@@ -684,11 +741,11 @@ async def test_global_prompt_queue_has_exact_atomic_admission_edges(
 
 
 @pytest.mark.asyncio
-async def test_queued_cancellation_settles_without_acp_dispatch_or_cancel(
+async def test_queued_cancellation_settles_without_native_dispatch_or_cancel(
     tmp_path: Path,
 ) -> None:
-    """ADI-05/10: queued cancellation is terminal before any ACP side effect."""
-    fake = FakeDirectAcpClient()
+    """ADI-05/10: queued cancellation is terminal before any native side effect."""
+    fake = FakeNativeClient()
     fake.block_prompts = True
     service = DirectService(
         fake,
@@ -717,7 +774,7 @@ async def test_queued_cancellation_settles_without_acp_dispatch_or_cancel(
     )
     cancel, _ = await service.admit_cancel(
         CancelRequest(
-            protocol_major=1,
+            protocol_major=2,
             continuity_generation_id=service.continuity_generation_id,
             operation_id="cancel-queued",
             target_operation_id="queued",
@@ -740,7 +797,7 @@ async def test_generation_rotation_quarantines_in_flight_ownership(
     tmp_path: Path,
 ) -> None:
     """ADI-10/11: in-flight tasks cannot mutate the next generation's ledger or slots."""
-    fake = FakeDirectAcpClient()
+    fake = FakeNativeClient()
     fake.block_prompts = True
     service = DirectService(
         fake,
@@ -773,11 +830,11 @@ async def test_generation_rotation_quarantines_in_flight_ownership(
         assert (await service.wait_for_operation(record)).state == "in_doubt"
     with pytest.raises(DirectGenerationMismatch, match="continuity generation changed"):
         service.operation(
-            "old-prompt-0", protocol_major=1, generation_id="old-generation"
+            "old-prompt-0", protocol_major=2, generation_id="old-generation"
         )
     with pytest.raises(DirectGenerationMismatch, match="managed restart is required"):
         service.operation(
-            "old-prompt-0", protocol_major=1, generation_id=new_generation
+            "old-prompt-0", protocol_major=2, generation_id=new_generation
         )
 
     replacement = CreateSessionRequest.model_validate(
@@ -795,7 +852,7 @@ async def test_generation_rotation_settles_owned_collector_tasks(
 ) -> None:
     """ADI-10/13: rotation returns only after collectors acknowledge cancel."""
 
-    fake = FakeDirectAcpClient()
+    fake = FakeNativeClient()
     service = DirectService(
         fake,
         cwd=str(tmp_path),
@@ -806,10 +863,11 @@ async def test_generation_rotation_settles_owned_collector_tasks(
     collector_started = asyncio.Event()
     collector_cancelled = asyncio.Event()
 
-    async def collector() -> None:
+    async def collector() -> NativeTerminal:
         collector_started.set()
         try:
             await asyncio.Event().wait()
+            raise AssertionError("unreachable collector release")
         except asyncio.CancelledError:
             collector_cancelled.set()
             await asyncio.sleep(0)
@@ -817,7 +875,6 @@ async def test_generation_rotation_settles_owned_collector_tasks(
 
     task = asyncio.create_task(collector())
     service._generation.collector_tasks["synthetic-operation"] = task
-    service._generation.execution_tasks.add(task)
     await asyncio.wait_for(collector_started.wait(), timeout=1.0)
 
     await service.mark_generation_lost("synthetic transport loss")
@@ -832,7 +889,7 @@ async def test_status_is_generation_pinned_and_duplicate_work_is_not_redispatche
     tmp_path: Path,
 ) -> None:
     """ADI-04/11: response reconciliation joins the recorded operation only."""
-    fake = FakeDirectAcpClient()
+    fake = FakeNativeClient()
     fake.block_prompts = True
     service = DirectService(
         fake,
@@ -849,11 +906,14 @@ async def test_status_is_generation_pinned_and_duplicate_work_is_not_redispatche
     assert first is duplicate
     assert first_created is True
     assert duplicate_created is False
-    assert service.operation(
-        "prompt",
-        protocol_major=1,
-        generation_id=service.continuity_generation_id,
-    ) is first
+    assert (
+        service.operation(
+            "prompt",
+            protocol_major=2,
+            generation_id=service.continuity_generation_id,
+        )
+        is first
+    )
     assert len(fake.prompts) <= 1
     fake.release_prompt.set()
     assert (await service.wait_for_operation(first)).state == "completed"
@@ -864,9 +924,10 @@ async def test_status_is_generation_pinned_and_duplicate_work_is_not_redispatche
 async def test_deadline_requires_cancelled_stop_reason_for_timed_out_state(
     tmp_path: Path,
 ) -> None:
-    """ADI-10: deadline settlement is timed_out only after ACP reports cancelled."""
+    """ADI-10: deadline settlement is timed_out only after native reports cancelled."""
+
     async def run_case(stop_after_cancel: str) -> str:
-        fake = FakeDirectAcpClient()
+        fake = FakeNativeClient()
         fake.block_prompts = True
         fake.cancel_stop_reason = stop_after_cancel
         service = DirectService(
@@ -889,15 +950,15 @@ async def test_deadline_requires_cancelled_stop_reason_for_timed_out_state(
         return (await service.wait_for_operation(record)).state
 
     assert await run_case("cancelled") == "timed_out"
-    assert await run_case("end_turn") == "in_doubt"
+    assert await run_case("completed") == "in_doubt"
 
 
 @pytest.mark.asyncio
 async def test_unsettled_deadline_quarantines_and_aborts_before_lock_release(
     tmp_path: Path,
 ) -> None:
-    """ADI-05/10: grace expiry kills residual ACP work before any later dispatch."""
-    fake = FakeDirectAcpClient()
+    """ADI-05/10: grace expiry kills residual native work before any later dispatch."""
+    fake = FakeNativeClient()
     fake.block_prompts = True
     fake.ignore_cancel = True
     service = DirectService(
@@ -918,7 +979,7 @@ async def test_unsettled_deadline_quarantines_and_aborts_before_lock_release(
     assert view.state == "in_doubt"
     assert view.error == {
         "code": "deadline_settlement_unknown",
-        "message": "ACP prompt did not settle after cancellation grace",
+        "message": "native prompt did not settle after cancellation grace",
     }
     assert fake.abort_count == 1
     assert len(fake.prompts) == 1
@@ -931,7 +992,7 @@ async def test_spontaneous_cancelled_stop_is_cancelled_and_session_is_not_reused
     tmp_path: Path,
 ) -> None:
     """ADI-10: spontaneous cancellation is truthful and poisons reuse."""
-    fake = FakeDirectAcpClient()
+    fake = FakeNativeClient()
     fake.stop_reason = "cancelled"
     service = DirectService(
         fake,
@@ -958,18 +1019,15 @@ async def test_spontaneous_cancelled_stop_is_cancelled_and_session_is_not_reused
 async def test_evidence_limit_cancels_and_settles_before_terminal_result(
     tmp_path: Path,
 ) -> None:
-    """ADI-08/10/15: retained evidence overflow cancels ACP and never truncates."""
-    fake = FakeDirectAcpClient()
+    """Incomplete native evidence cannot become a completed result or reusable session."""
+    fake = FakeNativeClient()
+    fake.evidence_overflow = True
     fake.updates = [
         {
-            "sessionUpdate": "tool_call",
+            "kind": "native.progress.report",
             "toolCallId": "tool-before-overflow",
             "title": "observed tool activity",
         },
-        {
-            "sessionUpdate": "agent_message_chunk",
-            "content": {"type": "text", "text": "response exceeds five bytes"},
-        }
     ]
     service = DirectService(
         fake,
@@ -990,127 +1048,114 @@ async def test_evidence_limit_cancels_and_settles_before_terminal_result(
     assert view.state == "failed"
     assert view.error == {
         "code": "evidence_limit",
-        "message": "ACP evidence exceeded a negotiated limit",
+        "message": "native evidence exceeded a negotiated limit",
     }
-    assert fake.cancelled == ["backend-1"]
+    assert fake.cancelled == ["session"]
     assert view.result is not None
-    retained = view.result["retained_evidence"]
+    retained = json_object(view.result["retained_evidence"])
     assert retained["observed_tool_call_ids"] == ["tool-before-overflow"]
-    assert retained["tool_activity_complete"] is True
+    assert retained["tool_activity_complete"] is False
     assert retained["effect_evidence"] == "unavailable"
-    assert [event["sequence"] for event in retained["ordered_events"]] == [0, 1]
-    bounded_chunk = retained["ordered_events"][1]["raw"]
-    assert len(bounded_chunk["content"]["text"].encode()) <= 5
-    assert bounded_chunk["retention"]["boundedPrefix"] is True
-    assert "response exceeds five bytes" not in repr(retained)
+    events = retained["ordered_events"]
+    assert isinstance(events, list)
+    assert [json_object(event)["sequence"] for event in events] == [0]
+    assert json_object(events[0])["raw"] == fake.updates[0]
+    assert retained["events_complete"] is False
+    with pytest.raises(DirectConflict, match="not reusable"):
+        await service.admit_prompt(
+            "session",
+            PromptRequest.model_validate(
+                _prompt_body(service, operation="later", invocation="later")
+            ),
+        )
 
 
 @pytest.mark.asyncio
-async def test_create_deadline_and_upstream_errors_are_bounded_and_sanitized(
+async def test_local_allocation_rejection_is_failed_without_quarantining_generation(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """ADI-03/08/10: session creation has a deadline and leaks no ACP error text."""
-    blocked = FakeDirectAcpClient()
-    blocked.block_create = True
+    """Deferred native creation makes allocation errors pre-inference and deterministic."""
+    fake = FakeNativeClient()
+    private_error = "PRIVATE-API-KEY-AND-TRANSPORT-DETAILS"
+    fake.create_error = ValueError(private_error)
     service = DirectService(
-        blocked,
-        cwd=str(tmp_path),
-        launch_secret=TOKEN,
-        execution_authority="trusted-host",
-        limits=DirectLimits(session_creation_timeout_s=0.01),
+        fake, cwd=str(tmp_path), launch_secret=TOKEN, execution_authority="trusted-host"
     )
     request = CreateSessionRequest.model_validate(
-        _create_body(service, operation="blocked-create", session="blocked")
+        _create_body(service, operation="create", session="session")
     )
-    record, _ = await service.admit_create(request)
-    timed = await service.wait_for_operation(record)
-    assert timed.state == "in_doubt"
-    assert "private" not in str(timed.error)
-
-    private_error = "T122-PRIVATE-API-KEY-AND-TRANSPORT-DETAILS"
-    failing = FakeDirectAcpClient()
-    failing.create_error = RuntimeError(private_error)
-    failed_service = DirectService(
-        failing,
-        cwd=str(tmp_path),
-        launch_secret=TOKEN,
-        execution_authority="trusted-host",
-    )
-    failed_request = CreateSessionRequest.model_validate(
-        _create_body(failed_service, operation="failed-create", session="failed")
-    )
-    failed_record, _ = await failed_service.admit_create(failed_request)
-    failed = await failed_service.wait_for_operation(failed_record)
-    assert failed.state == "in_doubt"
-    assert failed.error == {
-        "code": "session_creation_in_doubt",
-        "message": "ACP session creation outcome is uncertain",
-    }
-    assert failing.abort_count == 1
-    assert private_error not in caplog.text
-    with pytest.raises(
-        DirectGenerationMismatch,
-        match="managed restart is required",
-    ):
-        await failed_service.admit_create(
-            CreateSessionRequest.model_validate(
-                _create_body(
-                    failed_service,
-                    operation="later-create",
-                    session="later",
-                )
-            )
-        )
-
-
-@pytest.mark.asyncio
-async def test_known_model_binding_rejection_fails_without_quarantining_generation(
-    tmp_path: Path,
-) -> None:
-    """A settled selector rejection is failed, not uncertain or reusable."""
-
-    fake = FakeDirectAcpClient()
-    fake.create_error = ModelAcknowledgementError("private selector detail")
-    service = DirectService(
-        fake,
-        cwd=str(tmp_path),
-        launch_secret=TOKEN,
-        execution_authority="trusted-host",
-    )
-    request = CreateSessionRequest.model_validate(
-        _create_body(service, operation="rejected-create", session="rejected")
-    )
-
     record, _ = await service.admit_create(request)
     failed = await service.wait_for_operation(record)
-
     assert failed.state == "failed"
     assert failed.error == {
-        "code": "session_configuration_failed",
-        "message": "ACP did not settle the requested session configuration",
+        "code": "session_allocation_failed",
+        "message": "native session allocation failed",
     }
-    assert service._generation.sessions["rejected"].state == "non_reusable"
-    prompt = PromptRequest.model_validate(
-        _prompt_body(
-            service,
-            operation="rejected-prompt",
-            invocation="rejected-invocation",
-        )
-    )
-    with pytest.raises(DirectConflict, match="not reusable"):
-        await service.admit_prompt("rejected", prompt)
-    assert fake.abort_count == 0
+    assert private_error not in caplog.text
     assert fake.prompts == []
-    assert service.capabilities.continuity_generation_id == service.continuity_generation_id
+    assert fake.abort_count == 0
+    assert (
+        service.capabilities.continuity_generation_id
+        == service.continuity_generation_id
+    )
 
 
 @pytest.mark.asyncio
-async def test_actual_chunked_request_bytes_are_bounded_without_content_length() -> None:
+async def test_failed_first_turn_preserves_binding_without_claiming_instruction_submission(
+    tmp_path: Path,
+) -> None:
+    """Native creation is observed independently of successful initial instructions."""
+    fake = FakeNativeClient()
+    fake.stop_reason = "failed"
+    service = DirectService(
+        fake, cwd=str(tmp_path), launch_secret=TOKEN, execution_authority="trusted-host"
+    )
+    await _settle_creation(service, "create", "session")
+    record, _ = await service.admit_prompt(
+        "session",
+        PromptRequest.model_validate(
+            _prompt_body(service, operation="first", invocation="invocation")
+        ),
+    )
+    view = await service.wait_for_operation(record)
+    assert view.state == "failed"
+    assert view.result is not None
+    assert view.result["backend_session_id"] == "backend-1"
+    assert "instruction_submission" not in view.result
+    assert fake.abort_count == 0
+    with pytest.raises(DirectConflict, match="not reusable"):
+        await service.admit_prompt(
+            "session",
+            PromptRequest.model_validate(
+                _prompt_body(service, operation="second", invocation="other")
+            ),
+        )
+    retire, _ = await service.admit_retire(
+        RetireSessionRequest(
+            protocol_major=2,
+            continuity_generation_id=service.continuity_generation_id,
+            operation_id="retire",
+            logical_session_id="session",
+        )
+    )
+    retired = await service.wait_for_operation(retire)
+    assert retired.result == {
+        "logical_session_id": "session",
+        "backend_session_id": "backend-1",
+        "backend_close": "destroyed",
+    }
+    assert fake.retired == ["session"]
+
+
+@pytest.mark.asyncio
+async def test_actual_chunked_request_bytes_are_bounded_without_content_length() -> (
+    None
+):
     """ADI-15: missing or lying Content-Length cannot bypass actual byte limits."""
     reached_downstream = False
 
-    async def downstream(scope: Any, receive: Any, send: Any) -> None:
+    async def downstream(scope: Scope, receive: Receive, send: Send) -> None:
         nonlocal reached_downstream
         reached_downstream = True
 
@@ -1123,7 +1168,7 @@ async def test_actual_chunked_request_bytes_are_bounded_without_content_length()
     )
     sent: list[Message] = []
 
-    async def receive() -> dict[str, Any]:
+    async def receive() -> Message:
         return next(chunks)
 
     async def send(message: Message) -> None:
@@ -1150,14 +1195,14 @@ async def test_far_over_limit_first_chunk_is_rejected_before_retention() -> None
 
     reached_downstream = False
 
-    async def downstream(scope: Any, receive: Any, send: Any) -> None:
+    async def downstream(scope: Scope, receive: Receive, send: Send) -> None:
         nonlocal reached_downstream
         reached_downstream = True
 
     middleware = RequestBodyLimitMiddleware(downstream, max_bytes=8)
     calls = 0
 
-    async def receive() -> dict[str, Any]:
+    async def receive() -> Message:
         nonlocal calls
         calls += 1
         return {
@@ -1187,7 +1232,7 @@ async def test_after_effect_transport_loss_is_in_doubt_and_quarantines_generatio
     tmp_path: Path,
 ) -> None:
     """ADI-10/11: accepted prompt loss is never failed/retried or left reusable."""
-    fake = FakeDirectAcpClient()
+    fake = FakeNativeClient()
     fake.lose_transport_after_updates = True
     service = DirectService(
         fake,
@@ -1207,8 +1252,8 @@ async def test_after_effect_transport_loss_is_in_doubt_and_quarantines_generatio
 
     assert view.state == "in_doubt"
     assert view.error == {
-        "code": "continuity_lost",
-        "message": "ACP continuity generation was lost",
+        "code": "prompt_in_doubt",
+        "message": "native prompt outcome is uncertain",
     }
     assert "private" not in str(view.error)
     with pytest.raises(DirectGenerationMismatch, match="managed restart is required"):
@@ -1221,7 +1266,7 @@ async def test_cancel_send_failure_quarantines_before_any_later_dispatch(
 ) -> None:
     """ADI-05/10: nominally-live uncertain cancellation revokes the generation."""
 
-    fake = FakeDirectAcpClient()
+    fake = FakeNativeClient()
     fake.block_prompts = True
     fake.cancel_error = ConnectionError("private cancel-send detail")
     service = DirectService(
@@ -1247,7 +1292,7 @@ async def test_cancel_send_failure_quarantines_before_any_later_dispatch(
     assert view.state == "in_doubt"
     assert view.error == {
         "code": "prompt_in_doubt",
-        "message": "ACP prompt outcome is uncertain",
+        "message": "native prompt outcome is uncertain",
     }
     assert "private" not in repr(view.error)
     assert fake.abort_count == 1
@@ -1270,7 +1315,7 @@ async def test_hanging_manual_cancel_send_is_bounded_and_quarantines(
 ) -> None:
     """ADI-10/15: notification drain cannot hang cancellation or prompt lock."""
 
-    fake = FakeDirectAcpClient()
+    fake = FakeNativeClient()
     fake.block_prompts = True
     fake.cancel_hangs = True
     service = DirectService(
@@ -1296,7 +1341,7 @@ async def test_hanging_manual_cancel_send_is_bounded_and_quarantines(
         await asyncio.sleep(0)
     cancel, _ = await service.admit_cancel(
         CancelRequest(
-            protocol_major=1,
+            protocol_major=2,
             continuity_generation_id=service.continuity_generation_id,
             operation_id="cancel",
             target_operation_id=prompt.operation_id,
@@ -1313,3 +1358,464 @@ async def test_hanging_manual_cancel_send_is_bounded_and_quarantines(
     assert fake.abort_count == 1
     with pytest.raises(DirectGenerationMismatch):
         _ = service.capabilities
+
+
+@pytest.mark.asyncio
+async def test_allocated_retirement_is_local_and_replayed_once(tmp_path: Path) -> None:
+    """Retirement before any prompt must never create a native conversation."""
+    fake = FakeNativeClient()
+    service = DirectService(
+        fake, cwd=str(tmp_path), launch_secret=TOKEN, execution_authority="trusted-host"
+    )
+    await _settle_creation(service, "create", "session")
+    request = RetireSessionRequest(
+        protocol_major=2,
+        continuity_generation_id=service.continuity_generation_id,
+        operation_id="retire",
+        logical_session_id="session",
+    )
+    first, _ = await service.admit_retire(request)
+    duplicate, created = await service.admit_retire(request)
+    assert first is duplicate
+    assert not created
+    result = await service.wait_for_operation(first)
+    assert result.result == {
+        "logical_session_id": "session",
+        "backend_session_id": None,
+        "backend_close": "not_created",
+    }
+    assert fake.prompts == []
+    assert fake.retired == ["session"]
+    with pytest.raises(DirectConflict, match="not reusable"):
+        await service.admit_prompt(
+            "session",
+            PromptRequest.model_validate(
+                _prompt_body(service, operation="prompt", invocation="invocation")
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_queued_cancel_remains_reusable_after_cancelled_worker_drains(
+    tmp_path: Path,
+) -> None:
+    """Cancelling work before dispatch cannot poison an uninitialized session."""
+    fake = FakeNativeClient()
+    fake.block_prompts = True
+    service = DirectService(
+        fake, cwd=str(tmp_path), launch_secret=TOKEN, execution_authority="trusted-host"
+    )
+    await _settle_creation(service, "create-a", "a")
+    await _settle_creation(service, "create-b", "b")
+    first, _ = await service.admit_prompt(
+        "a",
+        PromptRequest.model_validate(
+            _prompt_body(service, operation="first", invocation="a")
+        ),
+    )
+    while not fake.prompts:
+        await asyncio.sleep(0)
+    queued, _ = await service.admit_prompt(
+        "b",
+        PromptRequest.model_validate(
+            _prompt_body(service, operation="queued", invocation="b")
+        ),
+    )
+    cancelled, _ = await service.admit_cancel(
+        CancelRequest(
+            protocol_major=2,
+            continuity_generation_id=service.continuity_generation_id,
+            operation_id="cancel",
+            target_operation_id="queued",
+        )
+    )
+    assert (await service.wait_for_operation(cancelled)).state == "completed"
+    assert (await service.wait_for_operation(queued)).state == "cancelled"
+    fake.release_prompt.set()
+    await service.wait_for_operation(first)
+    await asyncio.gather(*tuple(service._generation.execution_tasks))
+    retry, _ = await service.admit_prompt(
+        "b",
+        PromptRequest.model_validate(
+            _prompt_body(service, operation="fresh", invocation="fresh")
+        ),
+    )
+    assert (await service.wait_for_operation(retry)).state == "completed"
+    assert [logical_id for logical_id, _ in fake.prompts] == ["a", "b"]
+    assert fake.cancelled == []
+
+
+@pytest.mark.asyncio
+async def test_generation_loss_does_not_publish_terminal_before_owned_cleanup(
+    tmp_path: Path,
+) -> None:
+    """A lost child does not settle the operation while effect cleanup is pending."""
+    fake = FakeNativeClient()
+    fake.block_prompts = True
+    fake.block_stop = True
+    service = DirectService(
+        fake, cwd=str(tmp_path), launch_secret=TOKEN, execution_authority="trusted-host"
+    )
+    await _settle_creation(service, "create", "session")
+    prompt, _ = await service.admit_prompt(
+        "session",
+        PromptRequest.model_validate(
+            _prompt_body(service, operation="prompt", invocation="invocation")
+        ),
+    )
+    while not fake.prompts:
+        await asyncio.sleep(0)
+    shutdown = asyncio.create_task(service.mark_generation_lost("test loss"))
+    await asyncio.wait_for(fake.stop_started.wait(), timeout=1)
+    assert not prompt.done.is_set()
+    assert fake.active_prompts == 0
+    with pytest.raises(DirectGenerationMismatch):
+        _ = service.capabilities
+    fake.release_stop.set()
+    await shutdown
+    assert (await service.wait_for_operation(prompt)).state == "in_doubt"
+    assert fake.abort_count == 1
+
+
+@pytest.mark.asyncio
+async def test_two_invocations_bind_once_and_submit_stable_instructions_once(
+    tmp_path: Path,
+) -> None:
+    """Stable logical identity survives deferred creation and later invocation layers."""
+    fake = FakeNativeClient()
+    service = DirectService(
+        fake, cwd=str(tmp_path), launch_secret=TOKEN, execution_authority="trusted-host"
+    )
+    create = CreateSessionRequest.model_validate(
+        _create_body(service, operation="create", session="session")
+    )
+    allocation, _ = await service.admit_create(create)
+    assert allocation.result is not None
+    assert (
+        allocation.result["permission_policy_digest"]
+        == PermissionPolicy(version=1, mode="allow_all").digest
+    )
+    assert allocation.result["backend_session_id"] is None
+    results: list[PromptResult] = []
+    for index, phase in enumerate(("initial", "invocation")):
+        request = PromptRequest.model_validate(
+            _prompt_body(
+                service,
+                operation=f"prompt-{index}",
+                invocation=f"invocation-{index}",
+                phase=phase,
+            )
+        )
+        record, _ = await service.admit_prompt("session", request)
+        view = await service.wait_for_operation(record)
+        assert view.state == "completed"
+        results.append(PromptResult.model_validate(view.result))
+    assert [result.backend_session_id for result in results] == [
+        "backend-1",
+        "backend-1",
+    ]
+    assert [result.instruction_submission for result in results] == [
+        "submitted_once",
+        "not_resubmitted_same_session",
+    ]
+    assert fake.prompts[0][1].count("stable Meadow instructions") == 1
+    assert "stable Meadow instructions" not in fake.prompts[1][1]
+    assert (
+        fake.prompts[1][1]
+        == "next prompt\n\n## Legal Typed Routes\nnext route body\n\nnext complete prose contract"
+    )
+
+
+@pytest.mark.asyncio
+async def test_first_turn_cancellation_before_binding_uses_logical_identity(
+    tmp_path: Path,
+) -> None:
+    """The cancellation route must work before a conversation ID exists."""
+
+    class PreBindingClient(FakeNativeClient):
+        async def run_turn(
+            self,
+            logical_id: str,
+            text: str,
+            *,
+            timeout_s: float,
+            event_byte_limit: int,
+            event_count_limit: int,
+            response_byte_limit: int,
+        ) -> NativeTerminal:
+            self.prompts.append((logical_id, text))
+            await self.release_prompt.wait()
+            return NativeCancelled(
+                NativeObservation(self.binding(logical_id), "", (), (), (), (), True),
+                "cancelled before begin",
+            )
+
+    fake = PreBindingClient()
+    service = DirectService(
+        fake, cwd=str(tmp_path), launch_secret=TOKEN, execution_authority="trusted-host"
+    )
+    await _settle_creation(service, "create", "session")
+    prompt, _ = await service.admit_prompt(
+        "session",
+        PromptRequest.model_validate(
+            _prompt_body(service, operation="prompt", invocation="invocation")
+        ),
+    )
+    while not fake.prompts:
+        await asyncio.sleep(0)
+    cancel, _ = await service.admit_cancel(
+        CancelRequest(
+            protocol_major=2,
+            continuity_generation_id=service.continuity_generation_id,
+            operation_id="cancel",
+            target_operation_id="prompt",
+        )
+    )
+    assert (await service.wait_for_operation(cancel)).state == "completed"
+    result = await service.wait_for_operation(prompt)
+    assert result.state == "cancelled"
+    assert result.result is not None
+    assert result.result["backend_session_id"] is None
+    assert fake.cancelled == ["session"]
+    assert fake.abort_count == 0
+
+
+@pytest.mark.asyncio
+async def test_retirement_remains_exclusive_until_destroy_settles(
+    tmp_path: Path,
+) -> None:
+    """A pending destroy joins only its original operation and rejects new work."""
+
+    class DelayedRetirementClient(FakeNativeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.retirement_started = asyncio.Event()
+            self.retirement_release = asyncio.Event()
+
+        async def retire_session(self, logical_id: str) -> None:
+            self.retirement_started.set()
+            await self.retirement_release.wait()
+            await super().retire_session(logical_id)
+
+    fake = DelayedRetirementClient()
+    service = DirectService(
+        fake, cwd=str(tmp_path), launch_secret=TOKEN, execution_authority="trusted-host"
+    )
+    await _settle_creation(service, "create", "session")
+    request = RetireSessionRequest(
+        protocol_major=2,
+        continuity_generation_id=service.continuity_generation_id,
+        operation_id="retire",
+        logical_session_id="session",
+    )
+    record, _ = await service.admit_retire(request)
+    await fake.retirement_started.wait()
+    assert not record.done.is_set()
+    duplicate, created = await service.admit_retire(request)
+    assert duplicate is record and not created
+    with pytest.raises(DirectConflict, match="active work"):
+        await service.admit_retire(
+            request.model_copy(update={"operation_id": "other-retire"})
+        )
+    with pytest.raises(DirectConflict):
+        await service.admit_prompt(
+            "session",
+            PromptRequest.model_validate(
+                _prompt_body(service, operation="prompt", invocation="invocation")
+            ),
+        )
+    fake.retirement_release.set()
+    assert (await service.wait_for_operation(record)).state == "completed"
+    assert fake.retired == ["session"]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failure_cannot_be_reported_as_successful_cancellation(
+    tmp_path: Path,
+) -> None:
+    """Failure to settle effects stays uncertain and is repeated to shutdown callers."""
+
+    class FailedCleanupClient(FakeNativeClient):
+        async def stop(self) -> None:
+            self.abort_count += 1
+            raise RuntimeError("private cleanup detail")
+
+    fake = FailedCleanupClient()
+    fake.block_prompts = True
+    fake.ignore_cancel = True
+    service = DirectService(
+        fake,
+        cwd=str(tmp_path),
+        launch_secret=TOKEN,
+        execution_authority="trusted-host",
+        limits=DirectLimits(cancellation_grace_s=0.01),
+    )
+    await _settle_creation(service, "create", "session")
+    prompt, _ = await service.admit_prompt(
+        "session",
+        PromptRequest.model_validate(
+            _prompt_body(service, operation="prompt", invocation="invocation")
+        ),
+    )
+    while not fake.prompts:
+        await asyncio.sleep(0)
+    cancel, _ = await service.admit_cancel(
+        CancelRequest(
+            protocol_major=2,
+            continuity_generation_id=service.continuity_generation_id,
+            operation_id="cancel",
+            target_operation_id="prompt",
+        )
+    )
+    cancel_result = await asyncio.wait_for(
+        service.wait_for_operation(cancel), timeout=1
+    )
+    assert cancel_result.state == "in_doubt"
+    assert cancel_result.error == {
+        "code": "cleanup_settlement_unknown",
+        "message": "native owned cleanup did not settle",
+    }
+    assert (await service.wait_for_operation(prompt)).state == "in_doubt"
+    with pytest.raises(RuntimeError, match="native owned cleanup did not settle"):
+        await service.mark_generation_lost("second shutdown")
+    assert fake.abort_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_route", "error_code"),
+    [
+        ("transport_close", "continuity_lost"),
+        ("manual_send_timeout", "cancel_transport_failed"),
+        ("manual_grace_timeout", "cancellation_settlement_unknown"),
+        ("deadline_send_timeout", "prompt_in_doubt"),
+        ("deadline_grace_timeout", "deadline_settlement_unknown"),
+    ],
+)
+async def test_uncertain_turn_preserves_native_observations(
+    tmp_path: Path,
+    failure_route: str,
+    error_code: str,
+) -> None:
+    """Loss and uncertain cancellation retain evidence after the collector settles."""
+
+    class ObservedFailureClient(FakeNativeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.observed = asyncio.Event()
+
+        async def run_turn(
+            self,
+            logical_id: str,
+            text: str,
+            *,
+            timeout_s: float,
+            event_byte_limit: int,
+            event_count_limit: int,
+            response_byte_limit: int,
+        ) -> NativeTerminal:
+            prior = self.binding(logical_id)
+            binding = ConversationBinding(
+                logical_id,
+                prior.model_id,
+                "conversation-before-loss",
+                "turn-before-loss",
+            )
+            self.bindings[logical_id] = binding
+            policy = PermissionPolicy(version=1, mode="allow_all")
+            receipt: JsonObject = {"stdout": "observed output", "returncode": 0}
+            observation = NativeObservation(
+                binding,
+                "observed text",
+                (
+                    NativeEvent(
+                        "native.client_tool.result",
+                        json_text(
+                            {"toolCallId": "call-before-loss", "result": receipt}
+                        ),
+                    ),
+                ),
+                (
+                    NativeToolObservation(
+                        "call-before-loss", "run_in_terminal", "complete", "bridge"
+                    ),
+                ),
+                (NativePermissionObservation("call-before-loss", True, policy.digest),),
+                (NativeEffectObservation("call-before-loss", json_text(receipt)),),
+                False,
+            )
+            self.observed.set()
+            try:
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable turn release")
+            except asyncio.CancelledError as exc:
+                # Cleanup starts before the collector reports its retained evidence.
+                await asyncio.sleep(0)
+                raise NativeUnsettledError(
+                    "private upstream detail", observation
+                ) from exc
+
+    fake = ObservedFailureClient()
+    fake.cancel_hangs = failure_route.endswith("send_timeout")
+    fake.ignore_cancel = True
+    service = DirectService(
+        fake,
+        cwd=str(tmp_path),
+        launch_secret=TOKEN,
+        execution_authority="trusted-host",
+        limits=DirectLimits(cancellation_grace_s=0.01),
+    )
+    await _settle_creation(service, "create", "session")
+    body = _prompt_body(service, operation="prompt", invocation="invocation")
+    if failure_route.startswith("deadline_"):
+        body["execution_timeout_s"] = 0.01
+    prompt, _ = await service.admit_prompt(
+        "session", PromptRequest.model_validate(body)
+    )
+    await fake.observed.wait()
+    if failure_route == "transport_close":
+        await service.mark_generation_lost("transport closure callback")
+    elif failure_route.startswith("manual_"):
+        cancel, _ = await service.admit_cancel(
+            CancelRequest(
+                protocol_major=2,
+                continuity_generation_id=service.continuity_generation_id,
+                operation_id="cancel",
+                target_operation_id=prompt.operation_id,
+            )
+        )
+        cancellation = await asyncio.wait_for(service.wait_for_operation(cancel), 1)
+        assert cancellation.state == (
+            "failed" if failure_route.endswith("send_timeout") else "completed"
+        )
+    result = await asyncio.wait_for(service.wait_for_operation(prompt), 1)
+    assert result.state == "in_doubt"
+    assert result.error is not None
+    assert result.error["code"] == error_code
+    assert result.result is not None
+    assert result.result["backend_session_id"] == "conversation-before-loss"
+    assert "instruction_submission" not in result.result
+    retained = json_object(result.result["retained_evidence"])
+    assert retained["events_complete"] is False
+    assert retained["calls"] == [
+        {
+            "tool_call_id": "call-before-loss",
+            "name": "run_in_terminal",
+            "status": "complete",
+            "scope": "bridge",
+        }
+    ]
+    assert retained["decisions"] == [
+        {
+            "tool_call_id": "call-before-loss",
+            "allowed": True,
+            "policy_digest": PermissionPolicy(version=1, mode="allow_all").digest,
+        }
+    ]
+    assert retained["effects"] == [
+        {
+            "tool_call_id": "call-before-loss",
+            "receipt": {"stdout": "observed output", "returncode": 0},
+        }
+    ]
+    assert fake.abort_count == 1

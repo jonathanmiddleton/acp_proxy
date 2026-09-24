@@ -98,7 +98,8 @@ Keep a functional semantic core and thin imperative shells for I/O and resource
 ownership. Mutable process handles, queues, task registries, and lifecycle
 resources belong to their explicit owners; they are not mutable semantic
 payloads shared across modules. [ADR-018](adrs/018-remove-openai-compatible-adapter.md)
-removes the deprecated OpenCode adapter; the direct ACP contract remains binding.
+removes the deprecated OpenCode adapter; [ADR-020](adrs/020-native-ide-backend.md)
+owns the native IDE backend and direct v2 contract.
 
 ## Module and Code Organisation
 
@@ -107,8 +108,6 @@ removes the deprecated OpenCode adapter; the direct ACP contract remains binding
   packages with a deliberate public surface.
 - Production package code lives in `src/meadow_bridge/`; maintained tests live in
   `tests/`, validation tools in `scripts/`, and experiments in `experiments/`.
-  The standalone `src/acp_probe.py` and `src/acp_validate.py` diagnostics are
-  not production imports.
 - Follow the module ownership table in `AGENTS.md`. Consumers call the owner's
   supported API rather than reconstructing its decisions or reading internals.
 - Read relevant ADRs before design changes. A contradictory decision requires
@@ -223,7 +222,7 @@ Never truncate, slice, or summarize LLM responses in logs, stored results,
 or experiment output. Every response must be preserved verbatim and in full.
 
 This project is in an exploratory phase where every response is potential
-evidence for understanding ACP behavior, debugging protocol issues, or
+evidence for understanding native protocol behavior, debugging protocol issues, or
 performing later analysis (token throughput, content verification, CoT
 detection). Truncated data cannot be recovered — the cost of re-running an
 experiment to get the data you threw away is always higher than the cost of

@@ -1,5 +1,9 @@
 # ADR-016: Opt-In Raw ACP Event Capture
 
+> **Native backend supersession:** [ADR-020](020-native-ide-backend.md) replaces
+> the ACP-specific transport, callback, binding, and wire provisions below.
+> Historical evidence is retained; consult ADR-020 for current ownership.
+
 **Status:** Accepted
 **Date:** 2026-09-22
 **Related ADRs:** [ADR-012](012-meadow-direct-consumer-protocol.md),

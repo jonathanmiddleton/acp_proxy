@@ -1,5 +1,9 @@
 # ADR-007: The ACP Server Owns Tools — Do Not Inject or Override
 
+> **Native backend supersession:** [ADR-020](020-native-ide-backend.md) replaces
+> the ACP-specific transport, callback, binding, and wire provisions below.
+> Historical evidence is retained; consult ADR-020 for current ownership.
+
 **Status:** Accepted; direct callback policy amended by [ADR-012](012-meadow-direct-consumer-protocol.md)
 **Date:** 2026-04-03  
 

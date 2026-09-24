@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
@@ -21,8 +22,8 @@ logger = logging.getLogger(__name__)
 _CONFIG_DIR = ".meadow_bridge"
 _CONFIG_FILE = "config.json"
 
-# Proxy-related environment variable names.  Both upper and lowercase
-# forms are checked (Node.js and curl respect both).
+# POSIX consumers use both proxy spellings; Windows composition emits one
+# canonical key because its environment names are case-insensitive.
 _PROXY_ENV_VARS = (
     "HTTP_PROXY",
     "http_proxy",
@@ -112,8 +113,16 @@ def build_subprocess_env(cfg: Mapping[str, object] | None = None) -> dict[str, s
 
     Returns a new dict suitable for passing as ``env`` to subprocess
     creation.  The original ``os.environ`` is not modified.
+    Windows keys are canonicalized to uppercase before config composition;
+    POSIX keeps its case-sensitive environment names.
     """
-    env = dict(os.environ)
+    windows = sys.platform == "win32"
+    env: dict[str, str] = {}
+    for key, inherited_value in os.environ.items():
+        name = key.upper() if windows else key
+        if name in env and env[name] != inherited_value:
+            raise ValueError("Environment contains conflicting case-insensitive keys")
+        env[name] = inherited_value
 
     if cfg is None:
         cfg = load_config()
@@ -122,6 +131,8 @@ def build_subprocess_env(cfg: Mapping[str, object] | None = None) -> dict[str, s
     cfg_lower = {k.lower(): v for k, v in cfg.items() if isinstance(v, str)}
 
     for var in _PROXY_ENV_VARS:
+        if windows:
+            var = var.upper()
         # Skip if already set in the environment
         if var in env:
             logger.debug(

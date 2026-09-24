@@ -1,5 +1,9 @@
 # ADR-015: Order Direct Model Binding at RPC Settlement
 
+> **Native backend supersession:** [ADR-020](020-native-ide-backend.md) replaces
+> the ACP-specific transport, callback, binding, and wire provisions below.
+> Historical evidence is retained; consult ADR-020 for current ownership.
+
 **Status:** Accepted
 **Date:** 2026-09-22
 **Supersedes:** ADR-012 and ADR-014's requirement that configuration updates

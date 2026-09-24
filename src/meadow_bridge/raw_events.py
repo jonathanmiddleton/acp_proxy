@@ -9,8 +9,13 @@ import stat
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TextIO
+from typing import ParamSpec, TextIO, TypeVar
 from uuid import uuid4
+
+from .json_types import JsonObject, JsonValue
+
+_Parameters = ParamSpec("_Parameters")
+_Result = TypeVar("_Result")
 
 
 class RawEventCaptureError(RuntimeError):
@@ -40,7 +45,7 @@ class RawEventCapture:
         self._failed = False
         self._closed = False
 
-    def _serialize(self, kind: str, fields: dict[str, Any]) -> tuple[str, int]:
+    def _serialize(self, kind: str, fields: JsonObject) -> tuple[str, int]:
         record = {
             "version": 1,
             "capture_id": self._capture_id,
@@ -71,8 +76,12 @@ class RawEventCapture:
             raise
 
     @staticmethod
-    async def _io(function: Callable[..., Any], *args: Any) -> Any:
-        work = asyncio.create_task(asyncio.to_thread(function, *args))
+    async def _io(
+        function: Callable[_Parameters, _Result],
+        *args: _Parameters.args,
+        **kwargs: _Parameters.kwargs,
+    ) -> _Result:
+        work = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
         try:
             return await asyncio.shield(work)
         except asyncio.CancelledError:
@@ -101,21 +110,21 @@ class RawEventCapture:
             if isinstance(error, OSError):
                 self._fail()
                 raise RawEventCaptureError(
-                    "Raw ACP event capture could not start"
+                    "Raw native event capture could not start"
                 ) from None
             raise
         self._task = asyncio.create_task(self._run())
 
-    def record(self, kind: str, **fields: Any) -> None:
+    def record(self, kind: str, **fields: JsonValue) -> None:
         if self._failed or self._closed:
-            raise RawEventCaptureError("Raw ACP event capture is unavailable")
+            raise RawEventCaptureError("Raw native event capture is unavailable")
         line, size = self._serialize(kind, fields)
         if (
             self._pending_bytes + size > self.MAX_PENDING_BYTES
             or self._pending_records >= self.MAX_PENDING_RECORDS
         ):
             self._fail()
-            raise RawEventCaptureError("Raw ACP event capture queue limit exceeded")
+            raise RawEventCaptureError("Raw native event capture queue limit exceeded")
         self._pending_bytes += size
         self._pending_records += 1
         self._queue.put_nowait((line, size))
@@ -162,4 +171,4 @@ class RawEventCapture:
                 await self._task
                 raise
         if self._failed:
-            raise RawEventCaptureError("Raw ACP event capture is incomplete")
+            raise RawEventCaptureError("Raw native event capture is incomplete")

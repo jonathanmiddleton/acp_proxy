@@ -1,18 +1,18 @@
 """
-Entry point for the authenticated direct ACP service.
+Entry point for the authenticated native Copilot IDE service.
 
 Usage:
     meadow-bridge [OPTIONS]
 
     Start the proxy from your project directory. The current working directory
-    becomes the ACP workspace — the copilot-language-server scans it and scopes
+    becomes the native workspace — the copilot-language-server scans it and scopes
     file operations to it.
 
     --binary PATH       Path to copilot-language-server binary.
                         Auto-discovers named JetBrains plugin binaries.
     --host HOST         Address to bind (default: 127.0.0.1).
     --port PORT         Port to listen on (default: 8765). Use 0 for ephemeral.
-    --cwd PATH          Working directory for ACP sessions (default: current dir)
+    --cwd PATH          Working directory for native sessions (default: current dir)
     --log-level LEVEL   Console logging level (default: WARNING)
     --log-file PATH     Log file path (default: logs/meadow-bridge.log)
     --metadata-file     Write JSON metadata (port, pid, status) after startup.
@@ -31,11 +31,11 @@ import signal
 import sys
 import tempfile
 from collections.abc import Callable
+from pathlib import Path
 
 import uvicorn
 
 from .application_policy import MIN_COPILOT_LANGUAGE_SERVER_VERSION
-from .client import AcpClient, ModelAcknowledgementError
 from .config import (
     build_subprocess_env,
     config_path,
@@ -45,7 +45,7 @@ from .copilot_auth import (
     CopilotOAuthCredentialError,
     inject_prior_copilot_oauth,
 )
-from .direct_protocol import DirectLimits
+from .direct_protocol import DIRECT_PROTOCOL_MAJOR, DirectLimits
 from .direct_server import create_direct_app
 from .direct_service import DirectService
 from .discovery import (
@@ -54,6 +54,9 @@ from .discovery import (
     admit_compatible_binary,
     find_binary,
 )
+from .native_client import NativeClient
+from .native_transport import NativeRpcError, NativeTransportError
+from .owned_commands import ShellSpec
 from .raw_events import RawEventCaptureError
 
 logger = logging.getLogger(__name__)
@@ -135,7 +138,7 @@ def _has_observable_container_boundary() -> bool:
 
 
 def _direct_child_env(source: dict[str, str]) -> dict[str, str]:
-    """Build the allowlisted environment for the admitted direct ACP child."""
+    """Build the allowlisted environment for the admitted language server."""
 
     return {
         key: value
@@ -198,8 +201,7 @@ def _write_metadata_file(
     port: int,
     host: str = "127.0.0.1",
     *,
-    consumer_mode: str | None = None,
-    protocol_major: int | None = None,
+    protocol_major: int = DIRECT_PROTOCOL_MAJOR,
     continuity_generation_id: str | None = None,
 ) -> None:
     """Write a JSON metadata file with process info and readiness status.
@@ -210,16 +212,13 @@ def _write_metadata_file(
     Uses write-to-temp + rename for atomic creation so consumers never
     observe a partially-written file.
     """
-    metadata = {
+    metadata: dict[str, int | str] = {
         "pid": os.getpid(),
         "port": port,
         "host": host,
         "status": "ready",
+        "protocol_major": protocol_major,
     }
-    if consumer_mode is not None:
-        metadata["consumer_mode"] = consumer_mode
-    if protocol_major is not None:
-        metadata["protocol_major"] = protocol_major
     if continuity_generation_id is not None:
         metadata["continuity_generation_id"] = continuity_generation_id
     metadata_dir = os.path.dirname(path) or "."
@@ -253,7 +252,7 @@ def _validate_startup(
     launch_secret: str | None,
     execution_authority: str | None,
 ) -> None:
-    """Validate every entry point before the owned ACP child can start."""
+    """Validate every entry point before the owned native child can start."""
 
     if launch_secret is None or len(launch_secret.encode("utf-8")) < 32:
         raise ValueError("meadow-direct mode requires a launch secret of 32 bytes")
@@ -284,40 +283,46 @@ async def run(
     cwd: str,
     *,
     subprocess_env: dict[str, str] | None = None,
+    command_env: dict[str, str] | None = None,
     metadata_file: str | None = None,
     host: str = "127.0.0.1",
     launch_secret: str | None = None,
     execution_authority: str | None = None,
     direct_limits: DirectLimits | None = None,
     raw_event_file: str | None = None,
+    shell: ShellSpec | None = None,
 ) -> None:
-    """Start the ACP client and HTTP server."""
+    """Admit native capabilities before HTTP readiness and settle every owner."""
     _validate_startup(
         host=host,
         launch_secret=launch_secret,
         execution_authority=execution_authority,
     )
-    effective_direct_limits = direct_limits or DirectLimits()
+    limits = direct_limits or DirectLimits()
     admission = await asyncio.to_thread(admit_compatible_binary, binary)
-    binary = admission.path
-
-    client = AcpClient(
-        binary, raw_event_file=raw_event_file
+    client = NativeClient(
+        admission.path, cwd=Path(cwd), raw_event_file=raw_event_file, shell=shell,
+        command_env=command_env,
     )
     child_lost_event = asyncio.Event()
     server: uvicorn.Server | None = None
     server_start_attempted = False
+    server_task: asyncio.Task[None] | None = None
+    watchers: list[asyncio.Task[bool]] = []
     metadata_written = False
     direct_service: DirectService | None = None
     generation_loss_task: asyncio.Task[None] | None = None
+    shutting_down = False
 
-    def _owned_child_closed() -> None:
+    def _owned_child_closed(_reason: str) -> None:
         nonlocal generation_loss_task
+        if shutting_down:
+            return
         child_lost_event.set()
         if direct_service is not None and generation_loss_task is None:
             generation_loss_task = asyncio.create_task(
                 direct_service.mark_generation_lost(
-                    "owned ACP child transport closed"
+                    "owned native child transport closed"
                 )
             )
 
@@ -326,177 +331,138 @@ async def run(
         child_env = _direct_child_env(
             dict(subprocess_env) if subprocess_env is not None else dict(os.environ)
         )
-        await client.start(env=child_env)
-
-        # ACP initialize has no model catalog. Create exactly one non-prompted,
-        # non-Meadow catalog-probe session at startup. HTTP capability requests
-        # are read-only and never create additional ACP sessions.
-        assert effective_direct_limits is not None
+        child_env["GITHUB_COPILOT_ACP_USE_CLI"] = "0"
         try:
-            async with asyncio.timeout(
-                effective_direct_limits.session_creation_timeout_s
-            ):
-                catalog_session_id = await client.create_session(cwd)
-                default_model = client.default_model
-                advertised_models = {model.model_id for model in client.models}
-                if (
-                    not isinstance(default_model, str)
-                    or not default_model
-                    or default_model not in advertised_models
-                ):
-                    raise _direct_binary_capability_error(
-                        admission,
-                        "startup model catalog with an advertised usable default model",
-                    )
-                await client.negotiate_direct_model_binding(
-                    catalog_session_id,
-                    default_model,
-                )
+            async with asyncio.timeout(limits.session_creation_timeout_s):
+                await client.start(env=child_env)
         except TimeoutError:
             raise _direct_binary_capability_error(
-                admission,
-                "bounded startup model catalog and binding negotiation",
+                admission, "bounded native initialization and model catalog"
             ) from None
-        except ModelAcknowledgementError:
+        except (NativeRpcError, NativeTransportError):
             raise _direct_binary_capability_error(
-                admission,
-                "a supported session model binding strategy",
+                admission, "native initialization and model catalog"
             ) from None
-        logger.info(
-            "Created and model-bound non-prompted catalog-probe ACP session; "
-            "backend close is unsupported"
-        )
-        if child_lost_event.is_set():
-            raise ConnectionError("ACP child closed during startup")
-
-        logger.info("Available models: %s", [m.model_id for m in client.models])
-        logger.info("Default model: %s", client.default_model)
+        if not client.models:
+            raise _direct_binary_capability_error(
+                admission, "nonempty native model catalog"
+            )
+        if child_lost_event.is_set() or not client.is_alive:
+            raise ConnectionError("Native child closed during startup")
+        logger.info("Available models: %s", [model.id for model in client.models])
 
         direct_service = DirectService(
             client,
             cwd=cwd,
             launch_secret=launch_secret or "",
             execution_authority=execution_authority or "",
-            limits=effective_direct_limits,
+            limits=limits,
         )
         app = create_direct_app(direct_service)
-
-        config = uvicorn.Config(
-            app,
-            host=host,
-            port=port,
-            log_level="warning",
-        )
+        config = uvicorn.Config(app, host=host, port=port, log_level="warning")
         server = uvicorn.Server(config)
-
-        loop = asyncio.get_event_loop()
         shutdown_event = asyncio.Event()
 
         def _signal_handler() -> None:
             logger.info("Shutdown signal received")
             shutdown_event.set()
 
-        _install_shutdown_signal_handlers(loop, _signal_handler)
+        _install_shutdown_signal_handlers(asyncio.get_running_loop(), _signal_handler)
 
-        # This reproduces uvicorn 0.44's internal setup so port 0 can be
-        # reported atomically in the readiness metadata.
+        # Uvicorn 0.44 binds sockets during startup; publish the actual port only
+        # after native admission and HTTP binding have both completed.
         if not config.loaded:
             config.load()
         server.lifespan = config.lifespan_class(config)
         server_start_attempted = True
         await server.startup()
-        if child_lost_event.is_set():
-            raise ConnectionError("ACP child closed during HTTP startup")
-
-        if server.servers and server.servers[0].sockets:
-            actual_port = server.servers[0].sockets[0].getsockname()[1]
-        else:
-            logger.error(
-                "Server started but no listening sockets found. server.servers=%r",
-                getattr(server, "servers", None),
-            )
+        if child_lost_event.is_set() or not client.is_alive:
+            raise ConnectionError("Native child closed during HTTP startup")
+        if not server.servers or not server.servers[0].sockets:
             raise RuntimeError("Server startup produced no listening sockets")
-
-        # --- Phase 1b: write metadata file before main_loop (readiness signal) ---
+        socket_address: object = server.servers[0].sockets[0].getsockname()
+        if (
+            not isinstance(socket_address, tuple)
+            or len(socket_address) < 2
+            or not isinstance(socket_address[1], int)
+            or isinstance(socket_address[1], bool)
+            or not 0 < socket_address[1] < 65536
+        ):
+            raise RuntimeError("Server startup produced no usable TCP port")
+        actual_port = socket_address[1]
         if metadata_file is not None:
             _write_metadata_file(
                 metadata_file,
                 actual_port,
                 host=host,
-                consumer_mode="meadow-direct",
-                protocol_major=1,
-                continuity_generation_id=(
-                    direct_service.continuity_generation_id
-                    if direct_service is not None
-                    else None
-                ),
+                continuity_generation_id=direct_service.continuity_generation_id,
             )
             metadata_written = True
 
-        # Run the server main loop in a background task
         server_task = asyncio.create_task(server.main_loop())
-
         logger.info("Meadow Bridge listening on http://%s:%d", host, actual_port)
         logger.info(
-            "Direct capabilities endpoint: http://%s:%d/meadow/v1/capabilities",
-            host,
-            actual_port,
+            "Direct capabilities endpoint: http://%s:%d/meadow/v%d/capabilities",
+            host, actual_port, DIRECT_PROTOCOL_MAJOR,
         )
-
-        # Wait for shutdown signal or server to stop
         signal_task = asyncio.create_task(shutdown_event.wait())
         child_task = asyncio.create_task(child_lost_event.wait())
+        watchers.extend((signal_task, child_task))
         done, _pending = await asyncio.wait(
             [server_task, signal_task, child_task],
             return_when=asyncio.FIRST_COMPLETED,
         )
-        for watcher in (signal_task, child_task):
-            if not watcher.done():
-                watcher.cancel()
-        await asyncio.gather(signal_task, child_task, return_exceptions=True)
-
         if child_task in done and child_lost_event.is_set():
-            logger.error("Owned ACP child transport closed; stopping Meadow Bridge")
+            logger.error("Owned native child transport closed; stopping Meadow Bridge")
             if generation_loss_task is not None:
                 await generation_loss_task
-            elif direct_service is not None:
-                await direct_service.mark_generation_lost(
-                    "owned ACP child transport closed"
-                )
-
-        if server_task not in done:
-            server.should_exit = True
-            await server_task
-        else:
-            await server_task
+        server.should_exit = True
+        await server_task
     finally:
-        if generation_loss_task is not None and not generation_loss_task.done():
-            await generation_loss_task
+        shutting_down = True
+        for watcher in watchers:
+            if not watcher.done():
+                watcher.cancel()
+        if watchers:
+            await asyncio.gather(*watchers, return_exceptions=True)
+        if server_task is not None and not server_task.done():
+            server_task.cancel()
+            await asyncio.gather(server_task, return_exceptions=True)
+        cleanup_errors: list[Exception] = []
+        if generation_loss_task is not None:
+            try:
+                await generation_loss_task
+            except Exception as error:
+                cleanup_errors.append(error)
         if direct_service is not None:
-            await direct_service.mark_generation_lost(
-                "owned Meadow Bridge is shutting down", expected_shutdown=True
-            )
+            try:
+                await direct_service.mark_generation_lost(
+                    "owned Meadow Bridge is shutting down", expected_shutdown=True
+                )
+            except Exception as error:
+                cleanup_errors.append(error)
         if server is not None and server_start_attempted:
             try:
                 await server.shutdown()
-            except Exception:
-                logger.exception("HTTP server cleanup failed")
+            except Exception as error:
+                cleanup_errors.append(error)
         if metadata_file is not None and metadata_written:
             _remove_metadata_file(metadata_file)
         try:
             await client.stop()
-        except RawEventCaptureError:
-            # Opted-in capture is part of this run's diagnostic contract.
-            raise
-        except Exception:
-            logger.exception("ACP child cleanup failed")
+        except Exception as error:
+            cleanup_errors.append(error)
+        if len(cleanup_errors) == 1:
+            raise cleanup_errors[0]
+        if cleanup_errors:
+            raise ExceptionGroup("Meadow Bridge cleanup did not settle", cleanup_errors)
         logger.info("Meadow Bridge stopped.")
 
 
 def _build_parser() -> argparse.ArgumentParser:
     """Build the command-line parser without starting external services."""
     parser = argparse.ArgumentParser(
-        description="Authenticated Meadow integration with Copilot over ACP"
+        description="Authenticated Meadow integration with the native Copilot IDE interface"
     )
     parser.add_argument(
         "--binary",
@@ -519,7 +485,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cwd",
         default=os.getcwd(),
-        help="Working directory for ACP sessions (default: current dir)",
+        help="Working directory for native sessions (default: current dir)",
     )
     parser.add_argument(
         "--log-level",
@@ -528,13 +494,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "File always logs DEBUG.",
     )
     parser.add_argument(
+        "--shell",
+        type=ShellSpec,
+        help=(
+            "Command shell executable (default: Windows PowerShell 5.1 or /bin/sh). "
+            "Select pwsh explicitly for PowerShell 7."
+        ),
+    )
+    parser.add_argument(
         "--log-file",
         default="logs/meadow-bridge.log",
         help="Log file path (default: logs/meadow-bridge.log). DEBUG level always.",
     )
     parser.add_argument(
         "--raw-event-file",
-        help="Opt-in NDJSON capture of full ACP updates and prompt boundaries.",
+        help="Opt-in NDJSON capture of full native protocol events and turn boundaries.",
     )
     parser.add_argument(
         "--metadata-file",
@@ -543,7 +517,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--execution-authority",
         choices=["trusted-host", "confined-container"],
-        help="Truthfully describes ACP tool authority",
+        help="Truthfully describes native and Bridge tool authority",
     )
     return parser
 
@@ -598,6 +572,9 @@ def main() -> None:
     # The proxy launch credential authenticates inbound Meadow traffic only.
     # Never expose it to the separately controlled language-server subprocess.
     subprocess_env.pop(DIRECT_SECRET_ENV, None)
+    # Copilot authentication discovered for the language server is not an
+    # inherited command credential. Preserve the configured environment first.
+    command_env = dict(subprocess_env)
     try:
         subprocess_env = inject_prior_copilot_oauth(subprocess_env)
     except CopilotOAuthCredentialError as exc:
@@ -612,11 +589,13 @@ def main() -> None:
                 args.port,
                 args.cwd,
                 subprocess_env=subprocess_env,
+                command_env=command_env,
                 metadata_file=args.metadata_file,
                 host=args.host,
                 launch_secret=launch_secret,
                 execution_authority=args.execution_authority,
                 raw_event_file=args.raw_event_file,
+                shell=args.shell,
             )
         )
     except BinaryCompatibilityError as exc:

@@ -2,7 +2,7 @@
 
 The tests launch the real CLI and observe only process exit, readiness
 metadata, and TCP HTTP.  Meadow startup owns credential setup, binary
-admission, ACP startup, model negotiation, service construction, and wiring.
+admission, native startup, model catalog admission, service construction, and wiring.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import signal
 import subprocess
 import sys
@@ -22,14 +23,16 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import BinaryIO
 
 import httpx
 import pytest
 
 from meadow_bridge.discovery import BinaryCompatibilityError, find_binary
+from meadow_bridge.direct_protocol import CapabilitiesResponse, OperationView, PromptResult
+from meadow_bridge.json_types import JsonObject, json_object, parse_json
 
-REQUIRED_LIVE_MODEL = "gpt-5.3-codex"
+REQUIRED_LIVE_MODEL = "gpt-5.6-sol"
 UNADVERTISED_LIVE_MODEL = "meadow-bridge-negative-control-model"
 _DIRECT_SECRET_ENV = "MEADOW_BRIDGE_MEADOW_SECRET"
 _COPILOT_TOKEN_ENV_NAMES = frozenset(
@@ -65,12 +68,20 @@ _AUTH_GATE_RUNTIME_ENV_NAMES = frozenset(
 
 
 @dataclass(frozen=True)
+class _Redactions:
+    """Keep inherited credentials out of pytest argument representations."""
+
+    values: tuple[str, ...] = field(repr=False)
+
+
+@dataclass(frozen=True)
 class LiveBridge:
     """One ready bridge process exposed only through its public boundary."""
 
     base_url: str
-    metadata: dict[str, Any]
+    metadata: JsonObject
     debug_log_path: Path
+    workspace: Path
     launch_secret: str = field(repr=False)
 
     @property
@@ -110,19 +121,19 @@ def _copilot_credential_values(environment: Mapping[str, str]) -> tuple[str, ...
     )
 
 
-def _redact(text: str, sensitive_values: tuple[str, ...]) -> str:
+def _redact(text: str, sensitive_values: _Redactions) -> str:
     redacted = text
-    for value in sensitive_values:
+    for value in sensitive_values.values:
         redacted = redacted.replace(value, "<redacted>")
     return redacted
 
 
 def _files_contain_sensitive_value(
-    log_path: Path, sensitive_values: tuple[str, ...]
+    log_path: Path, sensitive_values: _Redactions
 ) -> bool:
     """Scan a bounded rotating-log set without loading it into memory."""
 
-    needles = tuple(value.encode("utf-8") for value in sensitive_values if value)
+    needles = tuple(value.encode("utf-8") for value in sensitive_values.values if value)
     if not needles:
         return False
     overlap_size = max(len(needle) for needle in needles) - 1
@@ -141,12 +152,12 @@ def _files_contain_sensitive_value(
 class _ConsoleCapture:
     """Continuously drain a child pipe while retaining only a bounded tail."""
 
-    def __init__(self, sensitive_values: tuple[str, ...]) -> None:
+    def __init__(self, sensitive_values: _Redactions) -> None:
         self._chunks: deque[bytes] = deque()
         self._size = 0
         self._lock = threading.Lock()
         self._needles = tuple(
-            value.encode("utf-8") for value in sensitive_values if value
+            value.encode("utf-8") for value in sensitive_values.values if value
         )
         self._overlap = b""
         self._sensitive_value_seen = False
@@ -200,7 +211,7 @@ def _process_diagnostic(
     process: subprocess.Popen[bytes],
     console: _ConsoleCapture,
     debug_log_path: Path,
-    sensitive_values: tuple[str, ...],
+    sensitive_values: _Redactions,
 ) -> str:
     return (
         f"bridge return code: {process.poll()}\n"
@@ -243,7 +254,7 @@ def _terminate_process_tree(
     graceful: bool,
     process_group_id: int,
 ) -> int:
-    """Stop the owned bridge tree without leaving its ACP child behind."""
+    """Stop the owned bridge tree without leaving its native child behind."""
 
     if sys.platform == "win32":
         if process.poll() is None and graceful:
@@ -299,8 +310,8 @@ def _wait_for_readiness(
     metadata_path: Path,
     console: _ConsoleCapture,
     debug_log_path: Path,
-    sensitive_values: tuple[str, ...],
-) -> dict[str, Any]:
+    sensitive_values: _Redactions,
+) -> JsonObject:
     deadline = time.monotonic() + _BRIDGE_START_TIMEOUT_S
     while time.monotonic() < deadline:
         if process.poll() is not None:
@@ -312,8 +323,8 @@ def _wait_for_readiness(
             )
         if metadata_path.is_file():
             try:
-                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
+                metadata = json_object(parse_json(metadata_path.read_bytes()))
+            except (OSError, ValueError) as exc:
                 raise AssertionError(
                     f"bridge readiness metadata is unreadable: {exc}"
                 ) from exc
@@ -343,8 +354,7 @@ def _wait_for_health(base_url: str) -> None:
         assert response.status_code == 200, response.text
         health = response.json()
         assert health["status"] == "ok"
-        assert health["consumer_mode"] == "meadow-direct"
-        assert health["protocol_major"] == 1
+        assert health["protocol_major"] == 2
         return
     raise AssertionError(f"bridge health endpoint did not become ready: {last_error}")
 
@@ -361,6 +371,8 @@ def _running_bridge(
 
     metadata_path = runtime_dir / "ready.json"
     debug_log_path = runtime_dir / "bridge.log"
+    workspace = runtime_dir / "workspace"
+    workspace.mkdir(parents=True)
     command = [
         sys.executable,
         "-m",
@@ -370,13 +382,15 @@ def _running_bridge(
         "--port",
         "0",
         "--cwd",
-        str(_REPOSITORY_ROOT),
+        str(workspace),
         "--binary",
         binary,
         "--metadata-file",
         str(metadata_path),
         "--log-file",
         str(debug_log_path),
+        "--raw-event-file",
+        str(runtime_dir / "native-events.jsonl"),
         "--log-level",
         "INFO",
     ]
@@ -384,12 +398,9 @@ def _running_bridge(
 
     process_env = _source_environment(environment)
     process_env[_DIRECT_SECRET_ENV] = launch_secret
-    sensitive_values = tuple(
-        dict.fromkeys(
-            (*_copilot_credential_values(process_env), launch_secret)
-        )
-    )
-    sensitive_values = tuple(value for value in sensitive_values if value)
+    sensitive_values = _Redactions(tuple(
+        dict.fromkeys((*_copilot_credential_values(process_env), launch_secret))
+    ))
 
     creation_flag = 0
     if os.name == "nt":
@@ -445,11 +456,10 @@ def _running_bridge(
             assert metadata_pid == process.pid
         assert metadata["status"] == "ready"
         assert metadata["host"] == "127.0.0.1"
-        assert metadata["consumer_mode"] == "meadow-direct"
         port = metadata["port"]
         assert type(port) is int and 1 <= port <= 65535
         protocol_major = metadata["protocol_major"]
-        assert type(protocol_major) is int and protocol_major == 1
+        assert type(protocol_major) is int and protocol_major == 2
         generation_id = metadata["continuity_generation_id"]
         assert isinstance(generation_id, str)
         assert _PATH_SAFE_GENERATION.fullmatch(generation_id) is not None
@@ -461,6 +471,7 @@ def _running_bridge(
             metadata=metadata,
             launch_secret=launch_secret,
             debug_log_path=debug_log_path,
+            workspace=workspace,
         )
     finally:
         active_exception = sys.exc_info()[1]
@@ -608,7 +619,7 @@ def test_meadow_direct_cli_rejects_missing_oauth_before_child_start(
     assert "Incompatible copilot-language-server:" not in output
     assert "Traceback (most recent call last):" not in output
     if launch_secret in output or _files_contain_sensitive_value(
-        log_path, (launch_secret,)
+        log_path, _Redactions((launch_secret,))
     ):
         raise AssertionError("launch credential leaked into bridge diagnostics")
     assert not metadata_path.exists()
@@ -617,171 +628,171 @@ def test_meadow_direct_cli_rejects_missing_oauth_before_child_start(
 def test_meadow_direct_bridge_model_binding_and_continuity(
     meadow_bridge: LiveBridge,
 ) -> None:
-    """The real direct bridge binds the requested model and preserves continuity."""
+    """Two real turns preserve context and settle create/edit/command callbacks."""
 
     with httpx.Client(
         base_url=meadow_bridge.base_url,
-        timeout=_HTTP_TIMEOUT,
+        headers=meadow_bridge.authorization_headers,
+        timeout=httpx.Timeout(360.0, connect=5.0),
         trust_env=False,
     ) as http:
-        unauthorized = http.get("/meadow/v1/capabilities")
+        unauthorized = http.get("/meadow/v2/capabilities", headers={"Authorization": ""})
         assert unauthorized.status_code == 401, unauthorized.text
-        assert unauthorized.json()["error"]["code"] == "unauthorized"
-
-        capability_response = http.get(
-            "/meadow/v1/capabilities",
-            headers=meadow_bridge.authorization_headers,
-        )
-        assert capability_response.status_code == 200, capability_response.text
-        capabilities = capability_response.json()
-        assert capabilities["protocol"] == "meadow-acp-direct"
-        assert capabilities["protocol_major"] == 1
-        assert capabilities["consumer_mode"] == "meadow-direct"
-        assert capabilities["continuity_generation_id"] == meadow_bridge.metadata[
+        capability_response = http.get("/meadow/v2/capabilities")
+        capability_response.raise_for_status()
+        capabilities = CapabilitiesResponse.model_validate_json(capability_response.content)
+        assert capabilities.protocol == "meadow-bridge-direct"
+        assert capabilities.protocol_major == 2
+        assert capabilities.continuity_generation_id == meadow_bridge.metadata[
             "continuity_generation_id"
         ]
-        assert capabilities["canonical_workspace"] == os.path.realpath(
-            _REPOSITORY_ROOT
+        assert capabilities.canonical_workspace == str(meadow_bridge.workspace.resolve())
+        assert capabilities.execution_authority.profile == "trusted-host"
+        assert capabilities.execution_authority.effect_observation_scope == "bridge_callbacks"
+        assert REQUIRED_LIVE_MODEL in capabilities.model_ids
+        assert UNADVERTISED_LIVE_MODEL not in capabilities.model_ids
+        assert http.get("/meadow/v1/capabilities").status_code == 404
+        assert http.get("/v1/models").status_code == 404
+
+        marker = "continuity-" + secrets.token_hex(16)
+        nonce = "execution-" + secrets.token_hex(16)
+        stable_instructions = (
+            f"Remember the private continuity marker {marker}. "
+            "Use the registered workspace tools for requested file and command effects. "
+            "Report only actual execution results."
         )
-        assert capabilities["execution_authority"]["profile"] == "trusted-host"
-        assert REQUIRED_LIVE_MODEL in capabilities["model_ids"]
-        assert UNADVERTISED_LIVE_MODEL not in capabilities["model_ids"]
-
-        legacy_route = http.get("/v1/models")
-        assert legacy_route.status_code == 404, legacy_route.text
-
-        stable_instructions = ""
-        stable_digest = hashlib.sha256(stable_instructions.encode("utf-8")).hexdigest()
-        generation_id = capabilities["continuity_generation_id"]
-        workspace = capabilities["canonical_workspace"]
-        negative_create = http.post(
-            "/meadow/v1/sessions",
-            headers=meadow_bridge.authorization_headers,
-            json={
-                "protocol_major": 1,
-                "continuity_generation_id": generation_id,
-                "operation_id": "negative-model-create",
-                "logical_session_id": "negative-model-session",
-                "expected_canonical_workspace": workspace,
-                "actor_ref": "integration-probe",
-                "title": "Negative model probe",
-                "model_id": UNADVERTISED_LIVE_MODEL,
-                "stable_instruction_digest": stable_digest,
-            },
-        )
-        assert negative_create.status_code == 409, negative_create.text
-        assert negative_create.json()["error"]["code"] == "conflict"
-
-        logical_session_id = "live-session"
-        create_response = http.post(
-            "/meadow/v1/sessions",
-            headers=meadow_bridge.authorization_headers,
-            json={
-                "protocol_major": 1,
-                "continuity_generation_id": generation_id,
-                "operation_id": "live-create",
-                "logical_session_id": logical_session_id,
-                "expected_canonical_workspace": workspace,
-                "actor_ref": "integration-probe",
-                "title": "Live continuity probe",
-                "model_id": REQUIRED_LIVE_MODEL,
-                "stable_instruction_digest": stable_digest,
-            },
-        )
-        assert create_response.status_code == 200, create_response.text
-        created = create_response.json()
-        assert created["kind"] == "create_session"
-        assert created["state"] == "completed", (created, meadow_bridge.debug_log_path)
-        assert created["error"] is None
-        assert created["result"]["logical_session_id"] == logical_session_id
-        assert created["result"]["model_id"] == REQUIRED_LIVE_MODEL
-        assert created["result"]["continuity_generation_id"] == generation_id
-        backend_session_id = created["result"]["backend_session_id"]
-        assert isinstance(backend_session_id, str) and backend_session_id
-
-        output_contract = "Return only the requested value as plain text."
-        output_contract_digest = hashlib.sha256(
-            output_contract.encode("utf-8")
+        stable_digest = hashlib.sha256(stable_instructions.encode()).hexdigest()
+        generation_id = capabilities.continuity_generation_id
+        policy = {"version": 1, "mode": "allow_all"}
+        policy_digest = hashlib.sha256(
+            json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
+        common_create = {
+            "protocol_major": 2,
+            "continuity_generation_id": generation_id,
+            "expected_canonical_workspace": capabilities.canonical_workspace,
+            "actor_ref": "integration-probe",
+            "title": "Native continuity and effects probe",
+            "stable_instruction_digest": stable_digest,
+            "permission_policy": policy,
+        }
+        negative = http.post(
+            "/meadow/v2/sessions",
+            json={**common_create, "operation_id": "negative-model-create",
+                  "logical_session_id": "negative-model-session",
+                  "model_id": UNADVERTISED_LIVE_MODEL},
+        )
+        assert negative.status_code == 409, negative.text
+        create_response = http.post(
+            "/meadow/v2/sessions",
+            json={**common_create, "operation_id": "live-create",
+                  "logical_session_id": "live-session", "model_id": REQUIRED_LIVE_MODEL},
+        )
+        create_response.raise_for_status()
+        created = OperationView.model_validate_json(create_response.content)
+        assert created.state == "completed", (created, meadow_bridge.debug_log_path)
+        assert created.error is None
+        assert created.result is not None
+        assert created.result["logical_session_id"] == "live-session"
+        assert created.result["backend_session_id"] is None
+        assert created.result["binding_state"] == "allocated"
+        assert created.result["permission_policy_digest"] == policy_digest
+        assert not tuple(meadow_bridge.workspace.iterdir())
+
+        initial_source = "print('initial')\n"
+        final_source = f"print('{nonce}')\n"
+        script = meadow_bridge.workspace / "hello_world.py"
+        output_contract = "Return a brief plain-text result and any requested continuity marker."
+        output_digest = hashlib.sha256(output_contract.encode()).hexdigest()
+        common_prompt = {
+            "protocol_major": 2, "continuity_generation_id": generation_id,
+            "stable_instruction_digest": stable_digest,
+            "output_contract_digest": output_digest,
+            "execution_timeout_s": 300,
+            "output_contract": output_contract,
+        }
         initial_response = http.post(
-            f"/meadow/v1/sessions/{logical_session_id}/requests",
-            headers=meadow_bridge.authorization_headers,
-            json={
-                "protocol_major": 1,
-                "continuity_generation_id": generation_id,
-                "operation_id": "live-initial",
-                "invocation_id": "live-invocation-one",
-                "phase": "initial",
-                "stable_instruction_digest": stable_digest,
-                "output_contract_digest": output_contract_digest,
-                "execution_timeout_s": 120,
-                "stable_instructions": stable_instructions,
-                "prompt": (
-                    "Remember the continuity marker DIRECT_CONTINUITY_OK. "
-                    "Reply with exactly: DIRECT_INITIAL_OK.\n\n"
-                    "## Legal Typed Routes\nNo routes are available."
-                ),
-                "output_contract": output_contract,
-            },
+            "/meadow/v2/sessions/live-session/requests",
+            json={**common_prompt, "operation_id": "live-initial",
+                  "invocation_id": "live-invocation-one", "phase": "initial",
+                  "stable_instructions": stable_instructions,
+                  "prompt": f"Create hello_world.py with exactly this UTF-8 content: {initial_source!r}. Do not edit or run it yet."},
         )
-        assert initial_response.status_code == 200, initial_response.text
-        initial = initial_response.json()
-        assert initial["kind"] == "prompt"
-        assert initial["state"] == "completed", (initial, meadow_bridge.debug_log_path)
-        assert initial["error"] is None
-        initial_result = initial["result"]
-        assert initial_result["logical_session_id"] == logical_session_id
-        assert initial_result["backend_session_id"] == backend_session_id
-        assert initial_result["model_id"] == REQUIRED_LIVE_MODEL
-        assert initial_result["continuity_generation_id"] == generation_id
-        assert "DIRECT_INITIAL_OK" in initial_result["response_text"]
-        assert initial_result["acp_stop_reason"] == "end_turn"
-        assert initial_result["instruction_submission"] == "submitted_once"
-        assert initial_result["stable_instruction_digest"] == stable_digest
-        assert initial_result["output_contract_digest"] == output_contract_digest
+        initial_response.raise_for_status()
+        initial = OperationView.model_validate_json(initial_response.content)
+        assert initial.state == "completed", (initial, meadow_bridge.debug_log_path)
+        assert initial.error is None and initial.result is not None
+        initial_result = PromptResult.model_validate(initial.result)
+        assert initial_result.stop_reason == "completed"
+        assert initial_result.instruction_submission == "submitted_once"
+        assert initial_result.stable_instruction_digest == stable_digest
+        assert initial_result.output_contract_digest == output_digest
+        assert script.read_bytes() == initial_source.encode()
+        assert initial_result.effect_evidence == "observed"
+        assert initial_result.effect_events
+        backend_id = initial_result.backend_session_id
 
+        if os.name == "nt":
+            command = "& '" + sys.executable.replace("'", "''") + "' '" + str(script).replace("'", "''") + "'"
+        else:
+            command = shlex.join([sys.executable, str(script)])
         later_response = http.post(
-            f"/meadow/v1/sessions/{logical_session_id}/requests",
-            headers=meadow_bridge.authorization_headers,
-            json={
-                "protocol_major": 1,
-                "continuity_generation_id": generation_id,
-                "operation_id": "live-later",
-                "invocation_id": "live-invocation-two",
-                "phase": "invocation",
-                "stable_instruction_digest": stable_digest,
-                "output_contract_digest": output_contract_digest,
-                "execution_timeout_s": 120,
-                "prompt": (
-                    "Reply with exactly the continuity marker from the preceding "
-                    "request.\n\n## Legal Typed Routes\nNo routes are available."
-                ),
-                "output_contract": output_contract,
-            },
+            "/meadow/v2/sessions/live-session/requests",
+            json={**common_prompt, "operation_id": "live-later",
+                  "invocation_id": "live-invocation-two", "phase": "invocation",
+                  "prompt": (
+                      f"Edit hello_world.py to exactly {final_source!r}. Then execute exactly "
+                      f"this shell command once: {command}. Report its actual stdout and exit code, "
+                      "and the private continuity marker from the initial instructions."
+                  )},
         )
-        assert later_response.status_code == 200, later_response.text
-        later = later_response.json()
-        assert later["kind"] == "prompt"
-        assert later["state"] == "completed", (later, meadow_bridge.debug_log_path)
-        assert later["error"] is None
-        later_result = later["result"]
-        assert later_result["logical_session_id"] == logical_session_id
-        assert later_result["backend_session_id"] == backend_session_id
-        assert later_result["model_id"] == REQUIRED_LIVE_MODEL
-        assert later_result["continuity_generation_id"] == generation_id
-        assert "DIRECT_CONTINUITY_OK" in later_result["response_text"]
-        assert later_result["acp_stop_reason"] == "end_turn"
-        assert later_result["instruction_submission"] == (
-            "not_resubmitted_same_session"
-        )
-
+        later_response.raise_for_status()
+        later = OperationView.model_validate_json(later_response.content)
+        assert later.state == "completed", (later, meadow_bridge.debug_log_path)
+        assert later.error is None and later.result is not None
+        result = PromptResult.model_validate(later.result)
+        assert result.logical_session_id == "live-session"
+        assert result.backend_session_id == backend_id
+        assert result.model_id == REQUIRED_LIVE_MODEL
+        assert result.continuity_generation_id == generation_id
+        assert result.stop_reason == "completed"
+        assert result.instruction_submission == "not_resubmitted_same_session"
+        assert marker in result.response_text
+        assert nonce in result.response_text
+        assert script.read_bytes() == final_source.encode()
+        assert result.effect_evidence == "observed"
+        assert len(result.effect_events) >= 2
+        commands = [effect.receipt["command"] for effect in result.effects
+                    if "command" in effect.receipt]
+        assert len(commands) == 1
+        command_receipt = commands[0]
+        assert isinstance(command_receipt, dict)
+        assert command_receipt["stdout"] in {nonce + "\n", nonce + "\r\n"}
+        assert command_receipt["stderr"] == ""
+        assert command_receipt["exit_code"] == 0
+        assert command_receipt["stdout_truncated"] is False
+        assert command_receipt["stderr_truncated"] is False
+        assert command_receipt["timed_out"] is False
+        assert result.permission_evidence.availability == "observed"
+        assert result.permission_evidence.events == [
+            event for event in result.events
+            if event.update_type == "native.client_tool.confirmation"
+        ]
+        assert all(decision.allowed and decision.policy_digest == policy_digest
+                   for decision in result.permission_evidence.decisions)
         status_response = http.get(
-            "/meadow/v1/operations/live-later",
-            headers=meadow_bridge.authorization_headers,
-            params={
-                "protocol_major": 1,
-                "continuity_generation_id": generation_id,
-            },
+            "/meadow/v2/operations/live-later",
+            params={"protocol_major": 2, "continuity_generation_id": generation_id},
         )
-        assert status_response.status_code == 200, status_response.text
-        assert status_response.json() == later
+        status_response.raise_for_status()
+        assert OperationView.model_validate_json(status_response.content) == later
+        retired_response = http.post(
+            "/meadow/v2/sessions/live-session/retire",
+            json={"protocol_major": 2, "continuity_generation_id": generation_id,
+                  "operation_id": "live-retire", "logical_session_id": "live-session"},
+        )
+        retired_response.raise_for_status()
+        retired = OperationView.model_validate_json(retired_response.content)
+        assert retired.state == "completed", retired
+        assert retired.result is not None
+        assert retired.result["backend_close"] == "destroyed"

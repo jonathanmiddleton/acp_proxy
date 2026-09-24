@@ -1,146 +1,85 @@
-"""Opt-in diagnostics retain wire evidence without changing dispatch order."""
+"""Lossless capture owns bounded, ordered file writes and explicit failure."""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import threading
 from pathlib import Path
-from typing import Any
 
 import pytest
 
+from meadow_bridge.json_types import JsonObject, json_object, parse_json
 from meadow_bridge.raw_events import RawEventCapture, RawEventCaptureError
-from meadow_bridge.transport import AcpError, AcpTransport
-from tests.test_transport import FakeProcess
+
+
+def _records(path: Path) -> list[JsonObject]:
+    return [json_object(parse_json(line)) for line in path.read_text().splitlines()]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("terminal_error", [False, True])
-async def test_capture_preserves_envelopes_and_prompt_correlation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    terminal_error: bool,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    capture_path = tmp_path / "events.jsonl"
-    fake = FakeProcess()
-    caplog.set_level("DEBUG")
-
-    async def spawn(*args: Any, **kwargs: Any) -> FakeProcess:
-        return fake
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
-    transport = AcpTransport(raw_event_file=str(capture_path))
-    observed: list[dict[str, Any]] = []
-    transport.on_notification(observed.append)
-    await transport.start("synthetic-acp")
-    pending = asyncio.create_task(
-        transport.send_request(
-            "session/prompt",
-            {
-                "sessionId": "session-one",
-                "prompt": [{"type": "text", "text": "PROMPT-NOT-CAPTURED"}],
-            },
-        )
-    )
-    while not fake.stdin.written:
-        await asyncio.sleep(0)
-    request_id = json.loads(fake.stdin.written[0])["id"]
-    updates = [
-        {
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": "session-one",
-                "_meta": {"outer": ["untouched"]},
-                "update": {
-                    "sessionUpdate": kind,
-                    "messageId": message_id,
-                    "_meta": {"vendor/phase": phase},
-                    "content": {
-                        "type": "text",
-                        "text": text,
-                        "_meta": {"nested": True},
-                    },
-                },
-            },
-        }
-        for kind, message_id, phase, text in [
-            ("agent_message_chunk", "intro", "commentary", "Checking…\n"),
-            ("agent_thought_chunk", "thought", "reasoning", "Separate thought"),
-            ("agent_message_chunk", "answer", "final", '{"answer":"✓"}'),
-        ]
-    ]
-    for update in updates:
-        fake.stdout.feed(json.dumps(update))
-    terminal: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id}
-    if terminal_error:
-        terminal["error"] = {"code": -32000, "message": "failure", "data": {"extra": 1}}
-    else:
-        terminal["result"] = {"stopReason": "end_turn", "_meta": {"terminal": True}}
-    fake.stdout.feed(json.dumps(terminal))
-    if terminal_error:
-        with pytest.raises(AcpError):
-            await pending
-    else:
-        assert await pending == terminal["result"]
-    await transport.stop()
-
-    records = [json.loads(line) for line in capture_path.read_text().splitlines()]
-    assert [record["sequence"] for record in records] == list(range(len(records)))
-    assert all(record["timestamp"] and record["capture_id"] for record in records)
-    assert [record["kind"] for record in records] == [
-        "capture_start",
-        "prompt_request",
-        "session_update",
-        "session_update",
-        "session_update",
-        "prompt_response",
-        "capture_end",
-    ]
-    assert [
-        record["message"] for record in records if record["kind"] == "session_update"
-    ] == updates
-    assert observed == updates
-    for record in (records[1], records[-2]):
-        assert record["request_id"] == request_id
-        assert record["session_id"] == "session-one"
-    assert records[-2]["message"] == terminal
-    assert "PROMPT-NOT-CAPTURED" not in capture_path.read_text()
-    assert "Checking" not in caplog.text
-    assert "Separate thought" not in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_capture_failure_prevents_child_start(tmp_path: Path) -> None:
-    transport = AcpTransport(raw_event_file=str(tmp_path))
-    with pytest.raises(RuntimeError, match="Raw ACP event capture"):
-        await transport.start("must-not-be-started")
-    assert transport._process is None
-    with pytest.raises(RawEventCaptureError, match="incomplete"):
-        await transport.stop()
-
-
-@pytest.mark.asyncio
-async def test_capture_appends_distinct_lifetimes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "text", ["Checking…\n✓", "x" * 65_536, "\ud800"],
+    ids=["unicode", "large-payload", "unpaired-surrogate"],
+)
+async def test_capture_preserves_complete_ordered_records(
+    tmp_path: Path, text: str,
 ) -> None:
     path = tmp_path / "events.jsonl"
+    failures: list[None] = []
+    capture = RawEventCapture(str(path), lambda: failures.append(None))
+    envelope: JsonObject = {
+        "jsonrpc": "2.0",
+        "method": "$/progress",
+        "params": {
+            "token": "turn-one",
+            "value": {"reply": text, "metadata": {"nested": [True, None, 3]}},
+        },
+    }
+    await capture.start()
+    capture.record("native_notification", message=envelope)
+    capture.record("native_response", request_id=7, message={"result": {}})
+    await capture.close()
 
-    async def spawn(*args: Any, **kwargs: Any) -> FakeProcess:
-        return FakeProcess()
+    records = _records(path)
+    assert [record["sequence"] for record in records] == [0, 1, 2, 3]
+    assert [record["kind"] for record in records] == [
+        "capture_start", "native_notification", "native_response", "capture_end",
+    ]
+    assert all(record["timestamp"] and record["capture_id"] for record in records)
+    assert records[1]["message"] == envelope
+    assert records[2]["request_id"] == 7
+    assert records[2]["message"] == {"result": {}}
+    assert failures == []
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+
+@pytest.mark.asyncio
+async def test_capture_start_failure_reports_owner_once(tmp_path: Path) -> None:
+    failures: list[None] = []
+    capture = RawEventCapture(str(tmp_path), lambda: failures.append(None))
+    with pytest.raises(RawEventCaptureError, match="could not start"):
+        await capture.start()
+    assert failures == [None]
+    with pytest.raises(RawEventCaptureError, match="incomplete"):
+        await capture.close()
+    assert failures == [None]
+
+
+@pytest.mark.asyncio
+async def test_capture_appends_distinct_lifetimes(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    failures: list[None] = []
     for _ in range(2):
-        transport = AcpTransport(raw_event_file=str(path))
-        await transport.start("synthetic-acp")
-        await transport.stop()
-    records = [json.loads(line) for line in path.read_text().splitlines()]
-    assert [r["kind"] for r in records] == ["capture_start", "capture_end"] * 2
+        capture = RawEventCapture(str(path), lambda: failures.append(None))
+        await capture.start()
+        await capture.close()
+
+    records = _records(path)
+    assert [record["kind"] for record in records] == ["capture_start", "capture_end"] * 2
+    assert [record["sequence"] for record in records] == [0, 1, 0, 1]
     assert records[0]["capture_id"] == records[1]["capture_id"]
     assert records[2]["capture_id"] == records[3]["capture_id"]
     assert records[0]["capture_id"] != records[2]["capture_id"]
+    assert failures == []
 
 
 @pytest.mark.asyncio
@@ -150,15 +89,19 @@ async def test_unterminated_capture_is_rejected_without_modifying_it(
     path = tmp_path / "events.jsonl"
     partial = b'{"sequence":0'
     path.write_bytes(partial)
-    transport = AcpTransport(raw_event_file=str(path))
+    failures: list[None] = []
+    capture = RawEventCapture(str(path), lambda: failures.append(None))
     with pytest.raises(RawEventCaptureError, match="could not start"):
-        await transport.start("must-not-start")
+        await capture.start()
     assert path.read_bytes() == partial
+    assert failures == [None]
+    with pytest.raises(RawEventCaptureError, match="incomplete"):
+        await capture.close()
 
 
 @pytest.mark.asyncio
 async def test_start_cancellation_joins_file_creation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     opened = threading.Event()
     release = threading.Event()
@@ -171,7 +114,8 @@ async def test_start_cancellation_joins_file_creation(
             raise OSError("test opener was not released")
 
     monkeypatch.setattr(RawEventCapture, "_open", delayed_open)
-    capture = RawEventCapture(str(tmp_path / "cancelled.jsonl"), lambda: None)
+    failures: list[None] = []
+    capture = RawEventCapture(str(tmp_path / "cancelled.jsonl"), lambda: failures.append(None))
     starting = asyncio.create_task(capture.start())
     try:
         assert await asyncio.to_thread(opened.wait, 1)
@@ -184,104 +128,97 @@ async def test_start_cancellation_joins_file_creation(
         await starting
     assert capture._file is not None and capture._file.closed
     await capture.close()
+    assert failures == []
 
 
 @pytest.mark.asyncio
-async def test_slow_capture_does_not_delay_observers_and_shutdown_joins_writer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("cancel_close", [False, True])
+async def test_slow_writer_does_not_block_recording_and_close_joins_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_close: bool,
 ) -> None:
     path = tmp_path / "slow.jsonl"
-    fake = FakeProcess()
     release = threading.Event()
     writing = threading.Event()
     original_write = RawEventCapture._write
 
     def delayed_write(self: RawEventCapture, line: str) -> None:
-        if '"kind":"session_update"' in line:
+        if '"kind":"native_notification"' in line:
             writing.set()
             if not release.wait(timeout=5):
                 raise OSError("test writer was not released")
         original_write(self, line)
 
-    async def spawn(*args: Any, **kwargs: Any) -> FakeProcess:
-        return fake
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
     monkeypatch.setattr(RawEventCapture, "_write", delayed_write)
-    transport = AcpTransport(raw_event_file=str(path))
-    observed: list[str] = []
-    transport.on_request_sent(lambda *_args: observed.append("sent"))
-    transport.on_notification(lambda _message: observed.append("update"))
-    transport.on_response_observed(lambda *_args: observed.append("response"))
-    await transport.start("synthetic-acp")
-    pending = asyncio.create_task(
-        transport.send_request("session/prompt", {"sessionId": "s"})
-    )
-    while not fake.stdin.written:
-        await asyncio.sleep(0)
-    request_id = json.loads(fake.stdin.written[0])["id"]
-    fake.stdout.feed(
-        json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": {
-                    "sessionId": "s",
-                    "update": {
-                        "sessionUpdate": "agent_message_chunk",
-                        "content": {"type": "text", "text": "answer"},
-                    },
-                },
-            }
-        )
-    )
-    fake.stdout.feed(
-        json.dumps(
-            {"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}}
-        )
-    )
+    failures: list[None] = []
+    capture = RawEventCapture(str(path), lambda: failures.append(None))
+    await capture.start()
+    capture.record("native_notification", message={"text": "first"})
+    closing: asyncio.Task[None] | None = None
+    cancelled = False
     try:
-        await asyncio.wait_for(pending, timeout=1)
-        assert observed == ["sent", "update", "response"]
         assert await asyncio.to_thread(writing.wait, 1)
-        stopping = asyncio.create_task(transport.stop())
+        capture.record("native_response", message={"text": "second"})
+        closing = asyncio.create_task(capture.close())
         await asyncio.sleep(0)
-        assert not stopping.done()
+        assert not closing.done()
+        if cancel_close:
+            closing.cancel()
+            cancelled = True
+            await asyncio.sleep(0)
+            assert not closing.done()
     finally:
         release.set()
-    await stopping
-    assert json.loads(path.read_text().splitlines()[-1])["kind"] == "capture_end"
+        if closing is None:
+            await capture.close()
+        elif cancelled:
+            with pytest.raises(asyncio.CancelledError):
+                await closing
+        else:
+            await closing
+
+    records = _records(path)
+    assert [record["kind"] for record in records] == [
+        "capture_start", "native_notification", "native_response", "capture_end",
+    ]
+    assert records[1]["message"] == {"text": "first"}
+    assert records[2]["message"] == {"text": "second"}
+    assert capture._file is not None and capture._file.closed
+    assert failures == []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["write", "capacity"])
-async def test_capture_failure_revokes_transport(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+@pytest.mark.parametrize("failure", ["write", "byte_capacity", "record_capacity"])
+async def test_capture_failure_reports_owner_and_remains_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
 ) -> None:
-    fake = FakeProcess()
+    failures: list[None] = []
+    failed = asyncio.Event()
 
-    async def spawn(*args: Any, **kwargs: Any) -> FakeProcess:
-        return fake
+    def report_failure() -> None:
+        failures.append(None)
+        failed.set()
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
-    transport = AcpTransport(raw_event_file=str(tmp_path / "failed.jsonl"))
-    closed = asyncio.Event()
-    transport.on_close(closed.set)
-    await transport.start("synthetic-acp")
-    if failure == "capacity":
-        monkeypatch.setattr(RawEventCapture, "MAX_PENDING_BYTES", 1)
-    else:
+    path = tmp_path / "failed.jsonl"
+    capture = RawEventCapture(str(path), report_failure)
+    await capture.start()
+    if failure == "write":
 
         def broken_write(self: RawEventCapture, line: str) -> None:
             raise OSError("synthetic disk failure")
 
         monkeypatch.setattr(RawEventCapture, "_write", broken_write)
-    pending = asyncio.create_task(
-        transport.send_request("session/prompt", {"sessionId": "s"})
-    )
-    with pytest.raises((ConnectionError, RawEventCaptureError)):
-        await asyncio.wait_for(pending, timeout=1)
-    await asyncio.wait_for(closed.wait(), timeout=1)
-    assert not transport.is_open
+        capture.record("native_notification", message={"text": "unwritten"})
+    else:
+        limit = "MAX_PENDING_BYTES" if failure == "byte_capacity" else "MAX_PENDING_RECORDS"
+        monkeypatch.setattr(RawEventCapture, limit, 0)
+        with pytest.raises(RawEventCaptureError, match="queue limit exceeded"):
+            capture.record("native_notification", message={"text": "unwritten"})
+
+    await asyncio.wait_for(failed.wait(), timeout=1)
+    with pytest.raises(RawEventCaptureError, match="unavailable"):
+        capture.record("native_notification", message={"text": "later"})
     with pytest.raises(RawEventCaptureError, match="incomplete"):
-        await transport.stop()
+        await capture.close()
+    assert failures == [None]
+    assert capture._file is not None and capture._file.closed
+    assert [record["kind"] for record in _records(path)] == ["capture_start"]

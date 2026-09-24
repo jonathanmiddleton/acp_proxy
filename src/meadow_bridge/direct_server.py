@@ -33,7 +33,7 @@ def _error(status: int, code: str, message: str) -> JSONResponse:
 
 
 def create_direct_app(service: DirectService) -> FastAPI:
-    """Create an app that exposes only the direct Meadow consumer mode."""
+    """Create an app that exposes only the native Meadow direct protocol."""
 
     app = FastAPI(
         title="Meadow Bridge Meadow Direct API",
@@ -84,23 +84,22 @@ def create_direct_app(service: DirectService) -> FastAPI:
         return JSONResponse(
             {
                 "status": "ok",
-                "consumer_mode": "meadow-direct",
-                "protocol_major": 1,
+                "protocol_major": 2,
             }
         )
 
-    @app.get("/meadow/v1/capabilities", dependencies=[Depends(authenticate)])
+    @app.get("/meadow/v2/capabilities", dependencies=[Depends(authenticate)])
     async def capabilities() -> JSONResponse:
         return JSONResponse(service.capabilities.model_dump(mode="json"))
 
-    @app.post("/meadow/v1/sessions", dependencies=[Depends(authenticate)])
+    @app.post("/meadow/v2/sessions", dependencies=[Depends(authenticate)])
     async def create_session(request: CreateSessionRequest) -> JSONResponse:
         record, _ = await service.admit_create(request)
         view = await service.wait_for_operation(record)
         return JSONResponse(view.model_dump(mode="json"))
 
     @app.post(
-        "/meadow/v1/sessions/{logical_session_id}/requests",
+        "/meadow/v2/sessions/{logical_session_id}/requests",
         dependencies=[Depends(authenticate)],
     )
     async def submit_prompt(
@@ -116,7 +115,7 @@ def create_direct_app(service: DirectService) -> FastAPI:
         return JSONResponse(view.model_dump(mode="json"))
 
     @app.get(
-        "/meadow/v1/operations/{operation_id}",
+        "/meadow/v2/operations/{operation_id}",
         dependencies=[Depends(authenticate)],
     )
     async def operation_status(
@@ -142,7 +141,7 @@ def create_direct_app(service: DirectService) -> FastAPI:
         return JSONResponse(view.model_dump(mode="json"))
 
     @app.post(
-        "/meadow/v1/operations/{target_operation_id}/cancel",
+        "/meadow/v2/operations/{target_operation_id}/cancel",
         dependencies=[Depends(authenticate)],
     )
     async def cancel_operation(
@@ -160,7 +159,7 @@ def create_direct_app(service: DirectService) -> FastAPI:
         return JSONResponse(view.model_dump(mode="json"))
 
     @app.post(
-        "/meadow/v1/sessions/{logical_session_id}/retire",
+        "/meadow/v2/sessions/{logical_session_id}/retire",
         dependencies=[Depends(authenticate)],
     )
     async def retire_session(

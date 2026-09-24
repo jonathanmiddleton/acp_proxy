@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from .json_types import JsonObject
 
 
 class DirectStateError(RuntimeError):
@@ -59,7 +59,43 @@ class SessionState(StrEnum):
     BUSY = "busy"
     NON_REUSABLE = "non_reusable"
     LOST = "lost"
+    RETIRING = "retiring"
     RETIRED = "retired"
+
+
+@dataclass(frozen=True)
+class InstructionsPending:
+    """No initial prompt has completed successfully in this logical session."""
+
+
+@dataclass(frozen=True)
+class InstructionsSubmitted:
+    """Settled instruction lifetime, independently of native conversation binding."""
+
+    active_invocation_id: str
+    contract_digests: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        identities = tuple(identity for identity, _ in self.contract_digests)
+        if len(set(identities)) != len(identities):
+            raise ValueError("invocation contract identities must be unique")
+        if self.active_invocation_id not in identities:
+            raise ValueError("active invocation must have a submitted contract")
+
+    def contract_for(self, invocation_id: str) -> str | None:
+        """Return the settled contract digest for a prior invocation."""
+
+        return next(
+            (
+                digest
+                for identity, digest in self.contract_digests
+                if identity == invocation_id
+            ),
+            None,
+        )
+
+
+InstructionState = InstructionsPending | InstructionsSubmitted
 
 
 @dataclass
@@ -71,16 +107,16 @@ class OperationRecord:
     invocation_id: str | None = None
     target_operation_id: str | None = None
     state: OperationState = OperationState.ACCEPTED
-    result: dict[str, Any] | None = None
-    error: dict[str, Any] | None = None
+    result: JsonObject | None = None
+    error: JsonObject | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     def set_terminal(
         self,
         state: OperationState,
         *,
-        result: dict[str, Any] | None = None,
-        error: dict[str, Any] | None = None,
+        result: JsonObject | None = None,
+        error: JsonObject | None = None,
     ) -> None:
         if not state.terminal:
             raise ValueError(f"not a terminal operation state: {state}")
@@ -97,15 +133,12 @@ class DirectSession:
     logical_session_id: str
     actor_ref: str
     title: str
-    backend_session_id: str | None
     model_id: str
     stable_instruction_digest: str
+    permission_policy_digest: str
     state: SessionState = SessionState.CREATING
     active_operation_id: str | None = None
-    stable_submitted: bool = False
-    active_invocation_id: str | None = None
-    invocation_contract_digests: dict[str, str] = field(default_factory=dict)
-    backend_close: str = "unsupported"
+    instructions: InstructionState = field(default_factory=InstructionsPending)
 
 
 class DirectLedger:

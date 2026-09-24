@@ -1,26 +1,43 @@
-"""Strict direct-mode orchestration over one stateful ACP client."""
+"""Strict direct orchestration over one owned native IDE client."""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import uuid
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Literal, Protocol, assert_never
 
-from .client import DIRECT_STOP_REASONS, ModelAcknowledgementError
+from .json_types import JsonObject, checked_json, json_object, parse_json
+from .native_types import (
+    NativeBinding,
+    NativeCancelled,
+    NativeCompleted,
+    NativeFailed,
+    NativeModel,
+    NativeObservation,
+    NativeServerInfo,
+    NativeTerminal,
+    NativeUnsettledError,
+    ConversationBinding,
+)
+from .permission_policy import PermissionPolicy
+
 from .direct_protocol import (
     DIRECT_PROTOCOL_MAJOR,
     BRIDGE_VERSION,
     CancelRequest,
     CapabilitiesResponse,
+    NativeServerIdentity,
+    ToolObservation,
     CreateSessionRequest,
     DirectFeatures,
     DirectLimits,
     EvidenceAvailability,
+    EffectObservation,
+    PermissionObservation,
     ExecutionAuthority,
     OperationView,
     OrderedEvent,
@@ -40,6 +57,8 @@ from .direct_state import (
     DirectLimitExceeded,
     DirectNotFound,
     DirectSession,
+    InstructionsPending,
+    InstructionsSubmitted,
     OperationKind,
     OperationRecord,
     OperationState,
@@ -49,9 +68,37 @@ from .direct_state import (
 logger = logging.getLogger(__name__)
 
 
+class NativeSessionClient(Protocol):
+    """Owned native operations; successful terminals imply effect settlement."""
+
+    @property
+    def models(self) -> tuple[NativeModel, ...]: ...
+    @property
+    def server_info(self) -> NativeServerInfo: ...
+    @property
+    def is_alive(self) -> bool: ...
+    def allocate_session(
+        self, logical_id: str, cwd: str, model_id: str, policy: PermissionPolicy
+    ) -> None: ...
+    def binding(self, logical_id: str) -> NativeBinding: ...
+    async def run_turn(
+        self,
+        logical_id: str,
+        text: str,
+        *,
+        timeout_s: float,
+        event_byte_limit: int,
+        event_count_limit: int,
+        response_byte_limit: int,
+    ) -> NativeTerminal: ...
+    async def cancel_session(self, logical_id: str) -> None: ...
+    async def retire_session(self, logical_id: str) -> None: ...
+    async def stop(self) -> None: ...
+
+
 @dataclass
 class _GenerationState:
-    """All mutable ownership that must rotate as one continuity generation."""
+    """Mutable resources owned together for one continuity generation."""
 
     generation_id: str
     ledger: DirectLedger
@@ -59,10 +106,10 @@ class _GenerationState:
     prompt_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     prompt_reservations: int = 0
     released_reservations: set[str] = field(default_factory=set)
-    collector_tasks: dict[
-        str, asyncio.Task[tuple[list[dict[str, Any]], str]]
-    ] = field(default_factory=dict)
-    execution_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
+    collector_tasks: dict[str, asyncio.Task[NativeTerminal]] = field(
+        default_factory=dict
+    )
+    execution_tasks: set[asyncio.Task[None]] = field(default_factory=set)
     quarantined: bool = False
 
 
@@ -72,8 +119,8 @@ class _DeferredSettlement:
 
     record: OperationRecord
     state: OperationState
-    result: dict[str, Any] | None = None
-    error: dict[str, Any] | None = None
+    result: JsonObject | None = None
+    error: JsonObject | None = None
 
 
 class DirectGenerationMismatch(DirectConflict):
@@ -88,34 +135,12 @@ class DirectBusy(DirectConflict):
     """The logical session already owns an unsettled prompt."""
 
 
-class EvidenceLimitExceeded(DirectLimitExceeded):
-    """A response exceeded a negotiated evidence bound after dispatch."""
-
-    def __init__(
-        self,
-        *,
-        settled_cancelled: bool,
-        retained_updates: list[dict[str, Any]],
-        event_bytes: int,
-        response_bytes: int,
-        event_limit_exceeded: bool,
-        response_limit_exceeded: bool,
-    ) -> None:
-        super().__init__("ACP evidence exceeded a negotiated limit")
-        self.settled_cancelled = settled_cancelled
-        self.retained_updates = retained_updates
-        self.event_bytes = event_bytes
-        self.response_bytes = response_bytes
-        self.event_limit_exceeded = event_limit_exceeded
-        self.response_limit_exceeded = response_limit_exceeded
-
-
 class DirectService:
     """Own direct protocol identity, sessions, operation ledger, and settlement."""
 
     def __init__(
         self,
-        acp_client: Any,
+        native_client: NativeSessionClient,
         *,
         cwd: str,
         launch_secret: str,
@@ -127,17 +152,22 @@ class DirectService:
             raise ValueError("direct launch secret must contain at least 32 bytes")
         if execution_authority not in {"trusted-host", "confined-container"}:
             raise ValueError(f"unsupported execution authority: {execution_authority}")
-        self.acp_client = acp_client
+        self.native_client = native_client
         self.canonical_workspace = os.path.realpath(cwd)
         self.launch_secret = launch_secret
         self.limits = limits or DirectLimits()
         if execution_authority == "trusted-host":
-            self.execution_authority_name: Literal["trusted-host", "confined-container"] = "trusted-host"
+            self.execution_authority_name: Literal[
+                "trusted-host", "confined-container"
+            ] = "trusted-host"
         else:
             self.execution_authority_name = "confined-container"
         self._state_lock = asyncio.Lock()
         self._generation = self._new_generation(continuity_generation_id)
         self._available = True
+        self._shutdown_done = asyncio.Event()
+        self._shutdown_owner: asyncio.Task[object] | None = None
+        self._shutdown_error: RuntimeError | None = None
 
     def _new_generation(self, generation_id: str | None = None) -> _GenerationState:
         return _GenerationState(
@@ -154,28 +184,27 @@ class DirectService:
         self._ensure_available()
         authority = ExecutionAuthority(
             profile=self.execution_authority_name,
-            acp_agent_internal_tools=(
+            native_internal_tools=(
                 "container-boundary"
                 if self.execution_authority_name == "confined-container"
                 else "process-user"
             ),
         )
         return CapabilitiesResponse(
-            proxy_version=BRIDGE_VERSION,
+            bridge_version=BRIDGE_VERSION,
             continuity_generation_id=self.continuity_generation_id,
             canonical_workspace=self.canonical_workspace,
             execution_authority=authority,
             limits=self.limits,
             features=DirectFeatures(),
-            model_ids=[model.model_id for model in self.acp_client.models],
-            acp_protocol_version=self.acp_client.protocol_version,
-            acp_agent_info=self.acp_client.agent_info,
-            acp_agent_capabilities=self.acp_client.agent_capabilities,
+            model_ids=[model.id for model in self.native_client.models],
+            native_server_info=NativeServerIdentity(
+                name=self.native_client.server_info.name,
+                version=self.native_client.server_info.version,
+            ),
         )
 
-    def _check_pin(
-        self, protocol_major: int, generation_id: str
-    ) -> _GenerationState:
+    def _check_pin(self, protocol_major: int, generation_id: str) -> _GenerationState:
         if protocol_major != DIRECT_PROTOCOL_MAJOR:
             raise DirectGenerationMismatch(
                 f"unsupported direct protocol major: {protocol_major}"
@@ -183,7 +212,7 @@ class DirectService:
         if generation_id != self.continuity_generation_id:
             raise DirectGenerationMismatch(
                 "continuity generation changed; the prior operation outcome is not "
-                "recoverable from this proxy generation"
+                "recoverable from this Bridge generation"
             )
         self._ensure_available()
         return self._generation
@@ -191,17 +220,17 @@ class DirectService:
     def _ensure_available(self) -> None:
         if not self._available or not self._transport_alive():
             raise DirectGenerationMismatch(
-                "ACP child continuity is unavailable; managed restart is required"
+                "native child continuity is unavailable; managed restart is required"
             )
 
     def _transport_alive(self) -> bool:
-        return bool(getattr(self.acp_client, "is_alive", True))
+        return self.native_client.is_alive
 
     def _schedule(
         self,
-        coroutine: Coroutine[Any, Any, Any],
+        coroutine: Coroutine[object, object, None],
         generation: _GenerationState,
-    ) -> asyncio.Task[Any]:
+    ) -> asyncio.Task[None]:
         task = asyncio.create_task(coroutine)
         generation.execution_tasks.add(task)
         task.add_done_callback(generation.execution_tasks.discard)
@@ -219,11 +248,14 @@ class DirectService:
         generation = self._check_pin(
             request.protocol_major, request.continuity_generation_id
         )
-        if os.path.realpath(request.expected_canonical_workspace) != self.canonical_workspace:
+        if (
+            os.path.realpath(request.expected_canonical_workspace)
+            != self.canonical_workspace
+        ):
             raise DirectWorkspaceMismatch(
-                "requested workspace does not match the proxy-visible canonical workspace"
+                "requested workspace does not match the Bridge-visible canonical workspace"
             )
-        available = {model.model_id for model in self.acp_client.models}
+        available = {model.id for model in self.native_client.models}
         if request.model_id not in available:
             raise DirectConflict(
                 f"requested model {request.model_id!r} is not advertised: {sorted(available)}"
@@ -257,96 +289,50 @@ class DirectService:
                 logical_session_id=request.logical_session_id,
                 actor_ref=request.actor_ref,
                 title=request.title,
-                backend_session_id=None,
                 model_id=request.model_id,
                 stable_instruction_digest=request.stable_instruction_digest,
+                permission_policy_digest=canonical_request_digest(
+                    request.permission_policy
+                ),
             )
             generation.sessions[request.logical_session_id] = session
-            self._schedule(
-                self._execute_create(record, session, generation), generation
-            )
-            return record, True
-
-    async def _execute_create(
-        self,
-        record: OperationRecord,
-        session: DirectSession,
-        generation: _GenerationState,
-    ) -> None:
-        record.state = OperationState.RUNNING
-        try:
-            descriptor = await asyncio.wait_for(
-                self.acp_client.create_session_exact(
-                    self.canonical_workspace, session.model_id
-                ),
-                timeout=self.limits.session_creation_timeout_s,
-            )
-            backend_session_id = descriptor.session_id
-            bound_model = descriptor.model_id
-            if bound_model != session.model_id:
-                raise DirectConflict(
-                    f"ACP bound model {bound_model!r}, expected {session.model_id!r}"
+            try:
+                self.native_client.allocate_session(
+                    session.logical_session_id,
+                    self.canonical_workspace,
+                    session.model_id,
+                    PermissionPolicy.from_json(
+                        request.permission_policy.model_dump(mode="json")
+                    ),
                 )
-            async with self._state_lock:
-                session.backend_session_id = backend_session_id
+            except Exception as exc:
+                # Allocation is explicitly local; there is no inferred backend effect.
+                logger.error(
+                    "Native allocation rejected: error_type=%s", type(exc).__name__
+                )
+                session.state = SessionState.NON_REUSABLE
+                record.set_terminal(
+                    OperationState.FAILED,
+                    error={
+                        "code": "session_allocation_failed",
+                        "message": "native session allocation failed",
+                    },
+                )
+            else:
                 session.state = SessionState.READY
                 record.set_terminal(
                     OperationState.COMPLETED,
                     result={
                         "logical_session_id": session.logical_session_id,
-                        "backend_session_id": backend_session_id,
-                        "model_id": bound_model,
+                        "backend_session_id": None,
+                        "binding_state": "allocated",
+                        "model_id": session.model_id,
                         "stable_instruction_digest": session.stable_instruction_digest,
+                        "permission_policy_digest": session.permission_policy_digest,
                         "continuity_generation_id": generation.generation_id,
                     },
                 )
-        except TimeoutError:
-            logger.error("Direct ACP session creation timed out")
-            async with self._state_lock:
-                session.state = SessionState.NON_REUSABLE
-            await self._quarantine_uncertain(
-                "ACP session creation did not settle before its deadline",
-                _DeferredSettlement(
-                    record,
-                    OperationState.IN_DOUBT,
-                    error={
-                        "code": "session_creation_in_doubt",
-                        "message": "ACP session creation did not settle before its deadline",
-                    },
-                ),
-            )
-        except (DirectConflict, ModelAcknowledgementError):
-            logger.error("Direct ACP session configuration was rejected")
-            async with self._state_lock:
-                session.state = SessionState.NON_REUSABLE
-                record.set_terminal(
-                    OperationState.FAILED,
-                    error={
-                        "code": "session_configuration_failed",
-                        "message": "ACP did not settle the requested session configuration",
-                    },
-                )
-        except Exception as exc:  # noqa: BLE001 - ambiguous create must quarantine
-            logger.error(
-                "Direct ACP session creation became uncertain: error_type=%s",
-                type(exc).__name__,
-            )
-            if not self._transport_alive():
-                await self.mark_generation_lost("ACP transport failed during session creation")
-                return
-            async with self._state_lock:
-                session.state = SessionState.NON_REUSABLE
-            await self._quarantine_uncertain(
-                "ACP session creation outcome is uncertain",
-                _DeferredSettlement(
-                    record,
-                    OperationState.IN_DOUBT,
-                    error={
-                        "code": "session_creation_in_doubt",
-                        "message": "ACP session creation outcome is uncertain",
-                    },
-                ),
-            )
+            return record, True
 
     async def admit_prompt(
         self, logical_session_id: str, request: PromptRequest
@@ -375,9 +361,7 @@ class DirectService:
             try:
                 candidate_session = generation.sessions[logical_session_id]
             except KeyError as exc:
-                raise DirectNotFound(
-                    f"unknown session: {logical_session_id}"
-                ) from exc
+                raise DirectNotFound(f"unknown session: {logical_session_id}") from exc
             if (
                 candidate_session.active_operation_id is not None
                 or candidate_session.state is SessionState.BUSY
@@ -423,47 +407,74 @@ class DirectService:
 
     def _check_prompt_limits(self, request: PromptRequest) -> None:
         if request.execution_timeout_s > self.limits.max_execution_timeout_s:
-            raise DirectLimitExceeded("requested execution timeout exceeds negotiated limit")
-        text_bytes = len(self._render_blocks(request)[0]["text"].encode("utf-8"))
+            raise DirectLimitExceeded(
+                "requested execution timeout exceeds negotiated limit"
+            )
+        text_bytes = len(self._render_prompt(request).encode("utf-8"))
         if text_bytes > self.limits.max_prompt_bytes:
-            raise DirectLimitExceeded("model-facing prompt layers exceed negotiated limit")
+            raise DirectLimitExceeded(
+                "model-facing prompt layers exceed negotiated limit"
+            )
 
     def _validate_prompt_lifetime(
         self, session: DirectSession, request: PromptRequest
     ) -> None:
         if request.stable_instruction_digest != session.stable_instruction_digest:
             raise DirectConflict("stable instruction digest changed within the session")
+        submitted = session.instructions
         if request.phase is PromptPhase.INITIAL:
-            if session.stable_submitted:
+            if isinstance(submitted, InstructionsSubmitted):
                 raise DirectConflict("stable instructions were already submitted")
             assert request.stable_instructions is not None
-            if sha256_text(request.stable_instructions) != session.stable_instruction_digest:
-                raise DirectConflict("stable instruction bytes do not match their digest")
-            assert request.output_contract is not None
-            if sha256_text(request.output_contract) != request.output_contract_digest:
-                raise DirectConflict("output contract bytes do not match their digest")
-            if session.active_invocation_id is not None:
-                raise DirectConflict("initial phase already has an invocation")
-        elif request.phase is PromptPhase.INVOCATION:
-            if not session.stable_submitted:
-                raise DirectConflict("first settled invocation must submit stable instructions")
-            if request.invocation_id in session.invocation_contract_digests:
-                raise DirectConflict("an existing invocation requires a delta phase")
-            assert request.output_contract is not None
-            if sha256_text(request.output_contract) != request.output_contract_digest:
-                raise DirectConflict("output contract bytes do not match their digest")
-        else:
-            if not session.stable_submitted:
-                raise DirectConflict("cannot continue an uninitialized session")
-            if request.invocation_id not in session.invocation_contract_digests:
-                raise DirectConflict("delta phase names an unknown invocation")
-            if request.invocation_id != session.active_invocation_id:
-                raise DirectConflict("delta phase may target only the active invocation")
             if (
-                session.invocation_contract_digests[request.invocation_id]
+                sha256_text(request.stable_instructions)
+                != session.stable_instruction_digest
+            ):
+                raise DirectConflict(
+                    "stable instruction bytes do not match their digest"
+                )
+        elif isinstance(submitted, InstructionsPending):
+            raise DirectConflict(
+                "first settled invocation must submit stable instructions"
+            )
+        elif request.phase is PromptPhase.INVOCATION:
+            if submitted.contract_for(request.invocation_id) is not None:
+                raise DirectConflict("an existing invocation requires a delta phase")
+        else:
+            if submitted.contract_for(request.invocation_id) is None:
+                raise DirectConflict("delta phase names an unknown invocation")
+            if request.invocation_id != submitted.active_invocation_id:
+                raise DirectConflict(
+                    "delta phase may target only the active invocation"
+                )
+            if (
+                submitted.contract_for(request.invocation_id)
                 != request.output_contract_digest
             ):
                 raise DirectConflict("delta phase output contract digest changed")
+        if request.output_contract is not None:
+            if sha256_text(request.output_contract) != request.output_contract_digest:
+                raise DirectConflict("output contract bytes do not match their digest")
+
+    @staticmethod
+    def _record_instruction_submission(
+        session: DirectSession, request: PromptRequest
+    ) -> None:
+        submitted = session.instructions
+        if request.phase is PromptPhase.INITIAL:
+            session.instructions = InstructionsSubmitted(
+                request.invocation_id,
+                ((request.invocation_id, request.output_contract_digest),),
+            )
+        elif request.phase is PromptPhase.INVOCATION:
+            assert isinstance(submitted, InstructionsSubmitted)
+            session.instructions = InstructionsSubmitted(
+                request.invocation_id,
+                (
+                    *submitted.contract_digests,
+                    (request.invocation_id, request.output_contract_digest),
+                ),
+            )
 
     async def _execute_prompt(
         self,
@@ -472,119 +483,74 @@ class DirectService:
         request: PromptRequest,
         generation: _GenerationState,
     ) -> None:
+        dispatched = False
         try:
             async with generation.prompt_lock:
                 if record.state.terminal:
                     return
-                if record.state is not OperationState.CANCELLING:
-                    record.state = OperationState.RUNNING
-                blocks = self._render_blocks(request)
+                self._require_current_generation(generation)
+                record.state = OperationState.RUNNING
+                dispatched = True
                 collector = asyncio.create_task(
-                    self._collect_prompt(
-                        session.backend_session_id or "",
-                        blocks,
-                        request.execution_timeout_s + self.limits.cancellation_grace_s + 1,
+                    self.native_client.run_turn(
+                        session.logical_session_id,
+                        self._render_prompt(request),
+                        timeout_s=request.execution_timeout_s
+                        + self.limits.cancellation_grace_s
+                        + 1,
+                        event_byte_limit=self.limits.max_event_bytes,
+                        event_count_limit=self.limits.max_event_count,
+                        response_byte_limit=self.limits.max_response_bytes,
                     )
                 )
                 generation.collector_tasks[record.operation_id] = collector
                 try:
-                    updates, stop_reason = await asyncio.wait_for(
+                    terminal = await asyncio.wait_for(
                         asyncio.shield(collector), request.execution_timeout_s
                     )
                 except TimeoutError:
                     await self._settle_deadline(
-                        record, session, collector, generation
+                        record, session, request, collector, generation
                     )
                     return
                 finally:
                     if collector.done():
                         generation.collector_tasks.pop(record.operation_id, None)
-
-                result = self._normalize_result(
-                    record, session, request, updates, stop_reason, generation
+                self._require_current_generation(generation)
+                await self._settle_terminal(
+                    record, session, request, terminal, generation
                 )
-                async with self._state_lock:
-                    if record.state is OperationState.CANCELLING:
-                        if stop_reason == "cancelled":
-                            record.set_terminal(
-                                OperationState.CANCELLED,
-                                result=result.model_dump(mode="json"),
-                            )
-                        else:
-                            record.set_terminal(
-                                OperationState.IN_DOUBT,
-                                error={
-                                    "code": "cancellation_stop_mismatch",
-                                    "message": "ACP cancellation did not settle as cancelled",
-                                },
-                            )
-                        session.state = SessionState.NON_REUSABLE
-                    elif stop_reason == "cancelled":
-                        record.set_terminal(
-                            OperationState.CANCELLED,
-                            result=result.model_dump(mode="json"),
-                        )
-                        session.state = SessionState.NON_REUSABLE
-                    else:
-                        record.set_terminal(
-                            OperationState.COMPLETED,
-                            result=result.model_dump(mode="json"),
-                        )
-                        if request.phase is PromptPhase.INITIAL:
-                            session.stable_submitted = True
-                        if request.output_contract is not None:
-                            session.invocation_contract_digests[request.invocation_id] = (
-                                sha256_text(request.output_contract)
-                            )
-                        session.active_invocation_id = request.invocation_id
-                        session.state = SessionState.READY
-        except EvidenceLimitExceeded as exc:
-            logger.error("Direct ACP evidence limit exceeded")
-            async with self._state_lock:
-                retained_evidence = self._overflow_evidence(
-                    session, request, generation, exc
-                )
-                if exc.settled_cancelled:
-                    record.set_terminal(
-                        OperationState.FAILED,
-                        result=retained_evidence,
-                        error={
-                            "code": "evidence_limit",
-                            "message": "ACP evidence exceeded a negotiated limit",
-                        },
-                    )
-                session.state = SessionState.NON_REUSABLE
-            if not exc.settled_cancelled:
-                await self._quarantine_uncertain(
-                    "ACP evidence-limit cancellation did not settle",
-                    _DeferredSettlement(
-                        record,
-                        OperationState.IN_DOUBT,
-                        result=retained_evidence,
-                        error={
-                            "code": "evidence_limit_in_doubt",
-                            "message": "ACP evidence limit cancellation did not settle",
-                        },
-                    ),
-                )
-        except Exception as exc:  # noqa: BLE001 - ambiguous prompt must quarantine
+        except NativeUnsettledError as exc:
             logger.error(
-                "Direct ACP prompt outcome became uncertain: error_type=%s",
+                "Native prompt did not settle: error_type=%s", type(exc).__name__
+            )
+            await self._quarantine_uncertain(
+                "native prompt outcome is uncertain",
+                _DeferredSettlement(
+                    record,
+                    OperationState.IN_DOUBT,
+                    result=self._retained_evidence(
+                        session, request.invocation_id, generation, exc.observation
+                    ),
+                    error={
+                        "code": "prompt_in_doubt",
+                        "message": "native prompt outcome is uncertain",
+                    },
+                ),
+            )
+        except Exception as exc:
+            logger.error(
+                "Native prompt outcome became uncertain: error_type=%s",
                 type(exc).__name__,
             )
-            if not self._transport_alive():
-                await self.mark_generation_lost("ACP transport failed during prompt")
-                return
-            async with self._state_lock:
-                session.state = SessionState.NON_REUSABLE
             await self._quarantine_uncertain(
-                "ACP prompt outcome is uncertain",
+                "native prompt outcome is uncertain",
                 _DeferredSettlement(
                     record,
                     OperationState.IN_DOUBT,
                     error={
                         "code": "prompt_in_doubt",
-                        "message": "ACP prompt outcome is uncertain",
+                        "message": "native prompt outcome is uncertain",
                     },
                 ),
             )
@@ -594,13 +560,85 @@ class DirectService:
                     session.active_operation_id = None
                 if generation.quarantined:
                     session.state = SessionState.LOST
-                elif record.state in {
+                elif dispatched and record.state in {
                     OperationState.CANCELLED,
                     OperationState.TIMED_OUT,
                     OperationState.IN_DOUBT,
                 }:
                     session.state = SessionState.NON_REUSABLE
                 self._release_prompt_reservation(generation, record.operation_id)
+
+    async def _settle_terminal(
+        self,
+        record: OperationRecord,
+        session: DirectSession,
+        request: PromptRequest,
+        terminal: NativeTerminal,
+        generation: _GenerationState,
+    ) -> None:
+        observation = terminal.observation
+        session.active_operation_id = None
+        if not observation.complete:
+            session.state = SessionState.NON_REUSABLE
+            record.set_terminal(
+                OperationState.FAILED,
+                result=self._retained_evidence(
+                    session, request.invocation_id, generation, observation
+                ),
+                error={
+                    "code": "evidence_limit",
+                    "message": "native evidence exceeded a negotiated limit",
+                },
+            )
+            return
+        if isinstance(terminal, NativeFailed):
+            session.state = SessionState.NON_REUSABLE
+            record.set_terminal(
+                OperationState.FAILED,
+                result=self._retained_evidence(
+                    session, request.invocation_id, generation, observation
+                ),
+                error={
+                    "code": "native_turn_failed",
+                    "message": "native turn failed after settlement",
+                },
+            )
+        elif isinstance(terminal, NativeCancelled):
+            session.state = SessionState.NON_REUSABLE
+            record.set_terminal(
+                OperationState.CANCELLED,
+                result=self._retained_evidence(
+                    session, request.invocation_id, generation, observation
+                ),
+            )
+        elif isinstance(terminal, NativeCompleted):
+            if record.state is OperationState.CANCELLING:
+                await self._quarantine_uncertain(
+                    "native cancellation returned a mismatched terminal",
+                    _DeferredSettlement(
+                        record,
+                        OperationState.IN_DOUBT,
+                        result=self._retained_evidence(
+                            session, request.invocation_id, generation, observation
+                        ),
+                        error={
+                            "code": "cancellation_stop_mismatch",
+                            "message": "native cancellation did not settle as cancelled",
+                        },
+                    ),
+                )
+                return
+            result = self._normalize_result(
+                record, session, request, terminal, generation
+            )
+            self._record_instruction_submission(session, request)
+            session.state = SessionState.READY
+            record.set_terminal(
+                OperationState.COMPLETED,
+                result=json_object(checked_json(result.model_dump(mode="json"))),
+            )
+        else:
+            assert_never(terminal)
 
     def _release_prompt_reservation(
         self, generation: _GenerationState, operation_id: str
@@ -612,7 +650,7 @@ class DirectService:
         if generation.prompt_reservations < 0:
             raise RuntimeError("prompt reservation accounting underflow")
 
-    def _render_blocks(self, request: PromptRequest) -> list[dict[str, str]]:
+    def _render_prompt(self, request: PromptRequest) -> str:
         if request.phase is PromptPhase.INITIAL:
             assert request.stable_instructions is not None
             assert request.prompt is not None
@@ -628,183 +666,121 @@ class DirectService:
         else:
             assert request.delta is not None
             text = request.delta
-        return [{"type": "text", "text": text}]
-
-    async def _collect_prompt(
-        self, backend_session_id: str, blocks: list[dict[str, str]], timeout_s: float
-    ) -> tuple[list[dict[str, Any]], str]:
-        updates: list[dict[str, Any]] = []
-        event_bytes = 0
-        response_bytes = 0
-        stop_reason: str | None = None
-        event_limit_exceeded = False
-        response_limit_exceeded = False
-        limit_exceeded = False
-        cancel_sent = False
-        async for update in self.acp_client.prompt_blocks(
-            backend_session_id,
-            blocks,
-            timeout_s=timeout_s,
-            event_byte_limit=self.limits.max_event_bytes,
-            event_count_limit=self.limits.max_event_count,
-        ):
-            if update.get("done") is True:
-                candidate = update.get("stopReason")
-                if not isinstance(candidate, str) or candidate not in DIRECT_STOP_REASONS:
-                    raise RuntimeError(
-                        "direct ACP prompt omitted a known non-empty stopReason"
-                    )
-                stop_reason = candidate
-                break
-            encoded = json.dumps(
-                update, ensure_ascii=False, sort_keys=True, default=str
-            ).encode("utf-8")
-            event_bytes += len(encoded)
-            if event_bytes > self.limits.max_event_bytes:
-                event_limit_exceeded = True
-            retained_update = update
-            if update.get("sessionUpdate") == "agent_message_chunk":
-                content = update.get("content", {})
-                if content.get("type") == "text":
-                    text = str(content.get("text", ""))
-                    encoded_text = text.encode("utf-8")
-                    remaining = max(0, self.limits.max_response_bytes - response_bytes)
-                    response_bytes += len(encoded_text)
-                    if response_bytes > self.limits.max_response_bytes:
-                        response_limit_exceeded = True
-                        prefix = self._utf8_prefix(text, remaining)
-                        retained_update = {
-                            **update,
-                            "content": {**content, "text": prefix},
-                            "retention": {
-                                "boundedPrefix": True,
-                                "originalUtf8Bytes": len(encoded_text),
-                            },
-                        }
-            limit_exceeded = event_limit_exceeded or response_limit_exceeded
-            if limit_exceeded and not cancel_sent:
-                cancel_sent = True
-                try:
-                    await self._send_cancel_bounded(backend_session_id)
-                except Exception:  # noqa: BLE001 - ACP boundary may raise any error
-                    raise EvidenceLimitExceeded(
-                        settled_cancelled=False,
-                        retained_updates=updates,
-                        event_bytes=event_bytes,
-                        response_bytes=response_bytes,
-                        event_limit_exceeded=event_limit_exceeded,
-                        response_limit_exceeded=response_limit_exceeded,
-                    ) from None
-            if not event_limit_exceeded:
-                updates.append(retained_update)
-        if not stop_reason:
-            raise RuntimeError("ACP prompt ended without a terminal stop reason")
-        if limit_exceeded:
-            raise EvidenceLimitExceeded(
-                settled_cancelled=stop_reason == "cancelled",
-                retained_updates=updates,
-                event_bytes=event_bytes,
-                response_bytes=response_bytes,
-                event_limit_exceeded=event_limit_exceeded,
-                response_limit_exceeded=response_limit_exceeded,
-            )
-        return updates, stop_reason
+        return text
 
     @staticmethod
-    def _utf8_prefix(value: str, max_bytes: int) -> str:
-        if max_bytes <= 0:
-            return ""
-        return value.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
-
-    def _overflow_evidence(
-        self,
-        session: DirectSession,
-        request: PromptRequest,
-        generation: _GenerationState,
-        error: EvidenceLimitExceeded,
-    ) -> dict[str, Any]:
-        """Preserve the exact bounded prefix without claiming completeness."""
-
-        ordered = [
+    def _ordered_events(observation: NativeObservation) -> list[OrderedEvent]:
+        return [
             OrderedEvent(
                 sequence=index,
-                update_type=str(update.get("sessionUpdate", "unknown")),
-                raw=update,
+                update_type=event.kind,
+                raw=json_object(parse_json(event.payload_json)),
             )
-            for index, update in enumerate(error.retained_updates)
+            for index, event in enumerate(observation.events)
         ]
-        tool_ids: list[str] = []
-        for event in ordered:
-            if event.update_type not in {"tool_call", "tool_call_update"}:
-                continue
-            candidate = event.raw.get("toolCallId") or event.raw.get("id")
-            if candidate is None and isinstance(event.raw.get("toolCall"), dict):
-                candidate = event.raw["toolCall"].get("toolCallId") or event.raw[
-                    "toolCall"
-                ].get("id")
-            if candidate is not None and str(candidate) not in tool_ids:
-                tool_ids.append(str(candidate))
-        return {
-            "logical_session_id": session.logical_session_id,
-            "backend_session_id": session.backend_session_id,
-            "invocation_id": request.invocation_id,
-            "continuity_generation_id": generation.generation_id,
-            "retained_evidence": {
-                "ordered_events": [event.model_dump(mode="json") for event in ordered],
-                "events_complete": not error.event_limit_exceeded,
-                "observed_tool_call_ids": tool_ids,
-                "tool_activity_complete": not error.event_limit_exceeded,
-                "effect_evidence": EvidenceAvailability.UNAVAILABLE.value,
-                "usage_evidence": EvidenceAvailability.UNAVAILABLE.value,
-            },
-            "overflow": {
-                "event_bytes": error.event_bytes,
-                "response_bytes": error.response_bytes,
-                "event_limit_exceeded": error.event_limit_exceeded,
-                "response_limit_exceeded": error.response_limit_exceeded,
-            },
-        }
+
+    def _retained_evidence(
+        self,
+        session: DirectSession,
+        invocation_id: str,
+        generation: _GenerationState,
+        observation: NativeObservation,
+    ) -> JsonObject:
+        return json_object(
+            checked_json(
+                {
+                    "logical_session_id": session.logical_session_id,
+                    "backend_session_id": observation.binding.conversation_id,
+                    "invocation_id": invocation_id,
+                    "continuity_generation_id": generation.generation_id,
+                    "retained_evidence": {
+                        "ordered_events": [
+                            event.model_dump(mode="json")
+                            for event in self._ordered_events(observation)
+                        ],
+                        "events_complete": observation.complete,
+                        "observed_tool_call_ids": list(
+                            dict.fromkeys(
+                                tool.tool_call_id for tool in observation.tools
+                            )
+                        ),
+                        "calls": [
+                            {
+                                "tool_call_id": tool.tool_call_id,
+                                "name": tool.name,
+                                "status": tool.status,
+                                "scope": tool.scope,
+                            }
+                            for tool in observation.tools
+                        ],
+                        "tool_activity_complete": observation.complete,
+                        "effect_evidence": "observed"
+                        if observation.effects
+                        else "unavailable",
+                        "effects": [
+                            {
+                                "tool_call_id": effect.tool_call_id,
+                                "receipt": parse_json(effect.result_json),
+                            }
+                            for effect in observation.effects
+                        ],
+                        "decisions": [
+                            {
+                                "tool_call_id": decision.tool_call_id,
+                                "allowed": decision.allowed,
+                                "policy_digest": decision.policy_digest,
+                            }
+                            for decision in observation.permissions
+                        ],
+                        "usage_evidence": "unavailable",
+                    },
+                }
+            )
+        )
 
     async def _settle_deadline(
         self,
         record: OperationRecord,
         session: DirectSession,
-        collector: asyncio.Task[tuple[list[dict[str, Any]], str]],
+        request: PromptRequest,
+        collector: asyncio.Task[NativeTerminal],
         generation: _GenerationState,
     ) -> None:
-        async with self._state_lock:
-            record.state = OperationState.CANCELLING
-        await self._send_cancel_bounded(session.backend_session_id or "")
+        record.state = OperationState.CANCELLING
+        await self._send_cancel_bounded(session.logical_session_id)
         try:
-            _updates, stop_reason = await asyncio.wait_for(
+            terminal = await asyncio.wait_for(
                 asyncio.shield(collector), self.limits.cancellation_grace_s
             )
         except TimeoutError:
-            collector.cancel()
-            await asyncio.gather(collector, return_exceptions=True)
             await self._quarantine_uncertain(
-                "ACP deadline cancellation did not settle",
+                "native deadline cancellation did not settle",
                 _DeferredSettlement(
                     record,
                     OperationState.IN_DOUBT,
                     error={
                         "code": "deadline_settlement_unknown",
-                        "message": "ACP prompt did not settle after cancellation grace",
+                        "message": "native prompt did not settle after cancellation grace",
                     },
                 ),
             )
         else:
-            if stop_reason == "cancelled":
+            evidence = self._retained_evidence(
+                session, request.invocation_id, generation, terminal.observation
+            )
+            if isinstance(terminal, NativeCancelled):
                 record.set_terminal(
                     OperationState.TIMED_OUT,
+                    result=evidence,
                     error={"code": "execution_deadline", "message": "prompt timed out"},
                 )
             else:
                 await self._quarantine_uncertain(
-                    "ACP deadline cancellation returned a mismatched stop reason",
+                    "native deadline cancellation returned a mismatched terminal",
                     _DeferredSettlement(
                         record,
                         OperationState.IN_DOUBT,
+                        result=evidence,
                         error={
                             "code": "deadline_stop_mismatch",
                             "message": "deadline cancellation did not settle as cancelled",
@@ -815,85 +791,112 @@ class DirectService:
             generation.collector_tasks.pop(record.operation_id, None)
             session.state = SessionState.NON_REUSABLE
 
+    @staticmethod
+    def _has_tool_evidence(event: OrderedEvent) -> bool:
+        """Select raw diagnostics without reconstructing normalized tool state."""
+
+        if event.update_type in {
+            "native.client_tool.invocation",
+            "native.client_tool.result",
+        }:
+            return True
+        if event.update_type != "native.progress.report":
+            return False
+        if event.raw.get("toolCalls"):
+            return True
+        rounds = event.raw.get("editAgentRounds")
+        return isinstance(rounds, list) and any(
+            isinstance(round_value, dict) and bool(round_value.get("toolCalls"))
+            for round_value in rounds
+        )
+
     def _normalize_result(
         self,
         record: OperationRecord,
         session: DirectSession,
         request: PromptRequest,
-        updates: list[dict[str, Any]],
-        stop_reason: str,
+        terminal: NativeCompleted,
         generation: _GenerationState,
     ) -> PromptResult:
-        ordered = [
-            OrderedEvent(
-                sequence=index,
-                update_type=str(update.get("sessionUpdate", "unknown")),
-                raw=update,
+        observation = terminal.observation
+        binding = observation.binding
+        if not isinstance(binding, ConversationBinding):
+            raise RuntimeError("successful native turn has no conversation binding")
+        if (
+            binding.logical_session_id != session.logical_session_id
+            or binding.model_id != session.model_id
+        ):
+            raise RuntimeError(
+                "native terminal binding does not match the admitted session"
             )
-            for index, update in enumerate(updates)
-        ]
-        response_text = "".join(
-            str(update.get("content", {}).get("text", ""))
-            for update in updates
-            if update.get("sessionUpdate") == "agent_message_chunk"
-            and update.get("content", {}).get("type") == "text"
-        )
-        tool_events = [
-            event
-            for event in ordered
-            if event.update_type in {"tool_call", "tool_call_update"}
-        ]
+        ordered = self._ordered_events(observation)
+        tool_events = [event for event in ordered if self._has_tool_evidence(event)]
         permission_events = [
             event
             for event in ordered
-            if event.update_type
-            in {"client_permission_request", "client_callback_denied"}
+            if event.update_type in {"native.client_tool.confirmation"}
         ]
-        tool_ids: list[str] = []
-        for event in tool_events:
-            raw = event.raw
-            candidate = raw.get("toolCallId") or raw.get("id")
-            if candidate is None and isinstance(raw.get("toolCall"), dict):
-                candidate = raw["toolCall"].get("toolCallId") or raw["toolCall"].get(
-                    "id"
-                )
-            if candidate is not None and str(candidate) not in tool_ids:
-                tool_ids.append(str(candidate))
         return PromptResult(
             logical_session_id=session.logical_session_id,
-            backend_session_id=session.backend_session_id or "",
+            backend_session_id=binding.conversation_id,
             invocation_id=request.invocation_id,
             operation_id=record.operation_id,
             continuity_generation_id=generation.generation_id,
             model_id=session.model_id,
-            response_text=response_text,
-            acp_stop_reason=stop_reason,
+            response_text=observation.response_text,
+            stop_reason=terminal.stop_reason,
             events=ordered,
             tool_evidence=ToolEvidence(
                 availability=EvidenceAvailability.OBSERVED,
-                tool_call_ids=tool_ids,
+                tool_call_ids=list(
+                    dict.fromkeys(tool.tool_call_id for tool in observation.tools)
+                ),
+                calls=[
+                    ToolObservation(
+                        tool_call_id=tool.tool_call_id,
+                        name=tool.name,
+                        status=tool.status,
+                        scope=tool.scope,
+                    )
+                    for tool in observation.tools
+                ],
                 events=tool_events,
             ),
             permission_evidence=PermissionEvidence(
                 availability=EvidenceAvailability.OBSERVED,
                 events=permission_events,
+                decisions=[
+                    PermissionObservation(
+                        tool_call_id=decision.tool_call_id,
+                        allowed=decision.allowed,
+                        policy_digest=decision.policy_digest,
+                    )
+                    for decision in observation.permissions
+                ],
             ),
-            effect_evidence=EvidenceAvailability.UNAVAILABLE,
+            effect_evidence=EvidenceAvailability.OBSERVED
+            if observation.effects
+            else EvidenceAvailability.UNAVAILABLE,
+            effect_events=[
+                event
+                for event in ordered
+                if event.update_type == "native.client_tool.result"
+            ],
+            effects=[
+                EffectObservation(
+                    tool_call_id=effect.tool_call_id,
+                    receipt=json_object(parse_json(effect.result_json)),
+                )
+                for effect in observation.effects
+            ],
             usage=UsageEvidence(
-                # ACP v1 does not give this integration a proven normalized
-                # counter shape. Raw updates remain ordered diagnostics only.
-                availability=EvidenceAvailability.UNAVAILABLE,
-                values=None,
+                availability=EvidenceAvailability.UNAVAILABLE, values=None
             ),
-            instruction_submission=(
-                "submitted_once"
-                if request.phase is PromptPhase.INITIAL
-                else "not_resubmitted_same_session"
-            ),
+            instruction_submission="submitted_once"
+            if request.phase is PromptPhase.INITIAL
+            else "not_resubmitted_same_session",
             stable_instruction_digest=session.stable_instruction_digest,
-            output_contract_digest=(
-                request.output_contract_digest
-            ),
+            output_contract_digest=request.output_contract_digest,
         )
 
     async def admit_cancel(
@@ -938,9 +941,7 @@ class DirectService:
                 )
                 return record, True
             target.state = OperationState.CANCELLING
-            self._schedule(
-                self._execute_cancel(record, target, generation), generation
-            )
+            self._schedule(self._execute_cancel(record, target, generation), generation)
             return record, True
 
     async def _execute_cancel(
@@ -952,27 +953,21 @@ class DirectService:
         record.state = OperationState.RUNNING
         session = generation.sessions[target.logical_session_id or ""]
         try:
-            await self._send_cancel_bounded(session.backend_session_id or "")
+            await self._send_cancel_bounded(session.logical_session_id)
             try:
                 await asyncio.wait_for(
                     target.done.wait(), self.limits.cancellation_grace_s
                 )
             except TimeoutError:
-                collector = generation.collector_tasks.pop(
-                    target.operation_id, None
-                )
-                if collector is not None:
-                    collector.cancel()
-                    await asyncio.gather(collector, return_exceptions=True)
                 session.state = SessionState.NON_REUSABLE
                 await self._quarantine_uncertain(
-                    "ACP manual cancellation did not settle",
+                    "native manual cancellation did not settle",
                     _DeferredSettlement(
                         target,
                         OperationState.IN_DOUBT,
                         error={
                             "code": "cancellation_settlement_unknown",
-                            "message": "ACP prompt did not settle after cancellation grace",
+                            "message": "native prompt did not settle after cancellation grace",
                         },
                     ),
                     _DeferredSettlement(
@@ -987,18 +982,18 @@ class DirectService:
             )
         except Exception as exc:  # noqa: BLE001 - cancel failures lose continuity
             logger.error(
-                "Direct ACP cancellation failed: error_type=%s",
+                "Direct native cancellation failed: error_type=%s",
                 type(exc).__name__,
             )
             session.state = SessionState.NON_REUSABLE
             await self._quarantine_uncertain(
-                "ACP cancellation transport failed",
+                "native cancellation transport failed",
                 _DeferredSettlement(
                     target,
                     OperationState.IN_DOUBT,
                     error={
                         "code": "cancel_transport_failed",
-                        "message": "ACP cancellation transport failed",
+                        "message": "native cancellation transport failed",
                     },
                 ),
                 _DeferredSettlement(
@@ -1006,16 +1001,16 @@ class DirectService:
                     OperationState.FAILED,
                     error={
                         "code": "cancel_failed",
-                        "message": "ACP cancellation failed",
+                        "message": "native cancellation failed",
                     },
                 ),
             )
 
-    async def _send_cancel_bounded(self, backend_session_id: str) -> None:
+    async def _send_cancel_bounded(self, logical_session_id: str) -> None:
         """Bound notification drain so a non-reading child cannot hang control."""
 
         await asyncio.wait_for(
-            self.acp_client.cancel_session(backend_session_id),
+            self.native_client.cancel_session(logical_session_id),
             timeout=self.limits.cancellation_grace_s,
         )
 
@@ -1049,9 +1044,7 @@ class DirectService:
             if session.state is SessionState.RETIRED:
                 raise DirectConflict("session is already retired")
             if session.active_operation_id is not None:
-                raise DirectConflict(
-                    "cannot retire a session with active work"
-                )
+                raise DirectConflict("cannot retire a session with active work")
             record, created = generation.ledger.admit(
                 request.operation_id,
                 digest,
@@ -1059,16 +1052,56 @@ class DirectService:
                 request.logical_session_id,
             )
             assert created
+            session.state = SessionState.RETIRING
+            session.active_operation_id = record.operation_id
+            self._schedule(
+                self._execute_retire(record, session, generation), generation
+            )
+            return record, True
+
+    async def _execute_retire(
+        self,
+        record: OperationRecord,
+        session: DirectSession,
+        generation: _GenerationState,
+    ) -> None:
+        record.state = OperationState.RUNNING
+        try:
+            binding = self.native_client.binding(session.logical_session_id)
+            await asyncio.wait_for(
+                self.native_client.retire_session(session.logical_session_id),
+                self.limits.session_creation_timeout_s,
+            )
+            self._require_current_generation(generation)
             session.state = SessionState.RETIRED
             record.set_terminal(
                 OperationState.COMPLETED,
                 result={
                     "logical_session_id": session.logical_session_id,
-                    "backend_session_id": session.backend_session_id,
-                    "backend_close": session.backend_close,
+                    "backend_session_id": binding.conversation_id,
+                    "backend_close": "destroyed"
+                    if isinstance(binding, ConversationBinding)
+                    else "not_created",
                 },
             )
-            return record, True
+        except Exception as exc:
+            logger.error(
+                "Native retirement uncertain: error_type=%s", type(exc).__name__
+            )
+            await self._quarantine_uncertain(
+                "native retirement did not settle",
+                _DeferredSettlement(
+                    record,
+                    OperationState.IN_DOUBT,
+                    error={
+                        "code": "retirement_in_doubt",
+                        "message": "native retirement did not settle",
+                    },
+                ),
+            )
+        finally:
+            if session.active_operation_id == record.operation_id:
+                session.active_operation_id = None
 
     def operation(
         self, operation_id: str, *, protocol_major: int, generation_id: str
@@ -1100,72 +1133,150 @@ class DirectService:
         expected_shutdown: bool = False,
         defer_operation_ids: frozenset[str] = frozenset(),
     ) -> None:
-        """Invalidate continuity; log only proxy-authored, public-safe reasons."""
-
-        tasks_to_cancel: tuple[asyncio.Task[Any], ...]
+        """Revoke admission immediately; publish outcomes only after owned cleanup."""
+        current_task = asyncio.current_task()
+        old_generation = self._generation
+        collectors: dict[str, asyncio.Task[NativeTerminal]] = {}
         async with self._state_lock:
             if not self._available:
-                return
-            old_generation = self._generation
-            old_generation.quarantined = True
-            for session in old_generation.sessions.values():
-                if session.state is not SessionState.RETIRED:
-                    session.state = SessionState.LOST
-            for record in old_generation.ledger.values():
-                if (
-                    record.operation_id not in defer_operation_ids
+                already_closing = True
+                records: tuple[OperationRecord, ...] = ()
+                tasks_to_cancel: tuple[asyncio.Task[NativeTerminal | None], ...] = ()
+            else:
+                already_closing = False
+                self._shutdown_owner = current_task
+                old_generation = self._generation
+                old_generation.quarantined = True
+                self._available = False
+                for session in old_generation.sessions.values():
+                    if session.state is not SessionState.RETIRED:
+                        session.state = SessionState.LOST
+                records = tuple(
+                    record
+                    for record in old_generation.ledger.values()
+                    if record.operation_id not in defer_operation_ids
                     and not record.state.terminal
-                ):
-                    record.set_terminal(
-                        OperationState.IN_DOUBT,
-                        error={
-                            "code": "continuity_lost",
-                            "message": "ACP continuity generation was lost",
-                        },
+                )
+                tasks_to_cancel = tuple(
+                    task
+                    for task in (
+                        *old_generation.execution_tasks,
+                        *old_generation.collector_tasks.values(),
                     )
-            current_task = asyncio.current_task()
-            tasks_to_cancel = tuple(
-                task
-                for task in {
-                    *old_generation.execution_tasks,
-                    *old_generation.collector_tasks.values(),
-                }
-                if task is not current_task
+                    if task is not current_task
+                )
+                for task in tasks_to_cancel:
+                    task.cancel()
+                collectors = dict(old_generation.collector_tasks)
+                old_generation.collector_tasks.clear()
+                self._generation = self._new_generation()
+        if already_closing:
+            if current_task is not self._shutdown_owner:
+                await self._shutdown_done.wait()
+            if self._shutdown_error is not None:
+                raise self._shutdown_error
+            return
+        try:
+            if tasks_to_cancel:
+                await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+            await self.native_client.stop()
+        except Exception as exc:
+            logger.error(
+                "Native child cleanup failed: error_type=%s", type(exc).__name__
             )
-            for task in tasks_to_cancel:
-                task.cancel()
-            old_generation.collector_tasks.clear()
-            self._generation = self._new_generation()
-            self._available = False
-
-        if tasks_to_cancel:
-            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+            self._shutdown_error = RuntimeError("native owned cleanup did not settle")
+            raise self._shutdown_error from exc
+        finally:
+            for record in records:
+                record.set_terminal(
+                    OperationState.IN_DOUBT,
+                    result=self._lost_prompt_evidence(
+                        record, old_generation, collectors
+                    ),
+                    error={
+                        "code": "continuity_lost",
+                        "message": "native continuity generation was lost",
+                    },
+                )
+            self._shutdown_done.set()
         if expected_shutdown:
-            logger.info("Closed ACP continuity generation for shutdown: %s", reason)
+            logger.info("Closed native continuity generation for shutdown: %s", reason)
         else:
-            logger.error("Quarantined ACP continuity generation: %s", reason)
+            logger.error("Quarantined native continuity generation: %s", reason)
+
+    def _lost_prompt_evidence(
+        self,
+        record: OperationRecord,
+        generation: _GenerationState,
+        collectors: dict[str, asyncio.Task[NativeTerminal]],
+    ) -> JsonObject | None:
+        """Preserve observations even when transport closure wins coroutine scheduling."""
+        if record.kind is not OperationKind.PROMPT:
+            return None
+        assert record.logical_session_id is not None
+        assert record.invocation_id is not None
+        session = generation.sessions[record.logical_session_id]
+        observation: NativeObservation | None = None
+        collector = collectors.get(record.operation_id)
+        if collector is not None and collector.done() and not collector.cancelled():
+            error = collector.exception()
+            if isinstance(error, NativeUnsettledError):
+                observation = error.observation
+            elif error is None:
+                observation = collector.result().observation
+        if observation is None:
+            observation = NativeObservation(
+                self.native_client.binding(session.logical_session_id),
+                "",
+                (),
+                (),
+                (),
+                (),
+                False,
+            )
+        return self._retained_evidence(
+            session, record.invocation_id, generation, observation
+        )
 
     async def _quarantine_uncertain(
-        self,
-        reason: str,
-        *settlements: _DeferredSettlement,
+        self, reason: str, *settlements: _DeferredSettlement
     ) -> None:
-        """Quarantine proof state and abort the owned child after uncertainty."""
-
-        await self.mark_generation_lost(
-            reason,
-            defer_operation_ids=frozenset(
-                settlement.record.operation_id for settlement in settlements
-            ),
-        )
-        abort = getattr(self.acp_client, "abort", None)
+        generation = self._generation
+        # Shutdown clears ownership; keep these handles until their final evidence settles.
+        collectors = dict(generation.collector_tasks)
         try:
-            if abort is not None:
-                await abort()
+            await self.mark_generation_lost(
+                reason,
+                defer_operation_ids=frozenset(
+                    item.record.operation_id for item in settlements
+                ),
+            )
+        except Exception as exc:
+            # Failed cleanup preserves uncertainty and closed admission; it never becomes success.
+            logger.error(
+                "Native quarantine cleanup failed: error_type=%s", type(exc).__name__
+            )
         finally:
             for settlement in settlements:
-                settlement.record.set_terminal(
-                    settlement.state,
-                    result=settlement.result,
-                    error=settlement.error,
-                )
+                if settlement.record.state.terminal:
+                    continue
+                result = settlement.result
+                if result is None:
+                    result = self._lost_prompt_evidence(
+                        settlement.record, generation, collectors
+                    )
+                if self._shutdown_error is not None:
+                    settlement.record.set_terminal(
+                        OperationState.IN_DOUBT,
+                        result=result,
+                        error={
+                            "code": "cleanup_settlement_unknown",
+                            "message": "native owned cleanup did not settle",
+                        },
+                    )
+                else:
+                    settlement.record.set_terminal(
+                        settlement.state,
+                        result=result,
+                        error=settlement.error,
+                    )

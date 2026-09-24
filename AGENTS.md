@@ -18,57 +18,26 @@ Python edits. Do not add diagnostic baselines or weaken checks to obtain a pass.
 
 ## Project Overview
 
-This repo connects Meadow to GitHub Copilot's `copilot-language-server` ACP
-interface through the authenticated `/meadow/v1` contract.
+This repo connects Meadow to GitHub Copilot's native IDE interface through
+an authenticated `/meadow/v2` contract. Read [ADR-020](adrs/020-native-ide-backend.md)
+for current lifecycle, tool, permission and evidence ownership. Historical ACP
+ADRs preserve experiments; they do not define the current transport.
 
 ```
-Meadow → Meadow Bridge `/meadow/v1` → copilot-language-server
+Meadow → Meadow Bridge `/meadow/v2` → copilot-language-server --stdio
 ```
-
-## ACP Specification Reference
-
-The Agent Client Protocol specification is at **https://agentclientprotocol.com**.
-The full documentation index (suitable for LLM consumption) is at
-**https://agentclientprotocol.com/llms.txt**.
-
-Key spec pages relevant to this proxy:
-
-| Topic | URL | Notes |
-|-------|-----|-------|
-| Protocol overview | https://agentclientprotocol.com/protocol/overview.md | Core architecture and concepts |
-| Session setup | https://agentclientprotocol.com/protocol/session-setup.md | `session/new` and `session/load` — load replays conversation history |
-| Session list | https://agentclientprotocol.com/protocol/session-list.md | `session/list` — discover existing sessions (stabilized) |
-| Prompt turn | https://agentclientprotocol.com/protocol/prompt-turn.md | `session/prompt` and `session/update` streaming |
-| Session modes | https://agentclientprotocol.com/protocol/session-modes.md | Agent operating modes (Ask, Agent, Plan, etc.) |
-| Session config | https://agentclientprotocol.com/protocol/session-config-options.md | `session/set_config_option` (stabilized) |
-| Initialization | https://agentclientprotocol.com/protocol/initialization.md | Capability negotiation |
-| Terminals | https://agentclientprotocol.com/protocol/terminals.md | Terminal callback handling |
-| File system | https://agentclientprotocol.com/protocol/file-system.md | File read/write callbacks |
-| Schema | https://agentclientprotocol.com/protocol/schema.md | Full type definitions |
-
-RFDs (Requests for Dialog — proposed but not yet stabilized):
-
-| RFD | URL | Status |
-|-----|-----|--------|
-| Session close | https://agentclientprotocol.com/rfds/session-close.md | Proposed — would allow explicit session cleanup |
-| Session resume | https://agentclientprotocol.com/rfds/session-resume.md | Proposed — like load but without history replay |
-| Session delete | https://agentclientprotocol.com/rfds/session-delete.md | Proposed |
-| Request cancellation | https://agentclientprotocol.com/rfds/request-cancellation.md | Proposed — `$/cancel_request` for any JSON-RPC request |
-| Session usage | https://agentclientprotocol.com/rfds/session-usage.md | Proposed — token/context/cost tracking |
-| Proxy chains | https://agentclientprotocol.com/rfds/proxy-chains.md | Proposed — agent extensions via proxies |
-| Custom LLM endpoint | https://agentclientprotocol.com/rfds/custom-llm-endpoint.md | Proposed — configurable LLM providers |
-
-The OpenAPI schema is at https://agentclientprotocol.com/api-reference/openapi.json.
 
 ## Module Architecture
 
 | Module         | Owns                                                                                                                                                           | Does NOT own                                |
 |----------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------|
-| `transport.py` | Owned child lifecycle, NDJSON framing, bounded JSON-RPC correlation/callback tasks, ordered terminal signaling, and unexpected-close reporting | HTTP protocol and settlement policy          |
-| `client.py`    | ACP initialization, exact model acknowledgement, session/prompt primitives, deny-only callback policy                                               | HTTP serving or direct operation identity   |
-| `direct_protocol.py`, `direct_state.py` | Strict Meadow wire shapes, generation-long operation ledger, and state vocabulary                                               | ACP method execution                         |
+| `native_transport.py` | Owned child lifecycle, LSP framing, bounded JSON-RPC correlation/callback tasks, ordered terminal signaling, and unexpected-close reporting | HTTP protocol and settlement policy          |
+| `native_client.py` | Native initialization, catalog, conversation/turn correlation and registered tool callbacks                                               | HTTP serving or direct operation identity   |
+| `direct_protocol.py`, `direct_state.py` | Strict Meadow wire shapes, generation-long operation ledger, and state vocabulary                                               | Native method execution                         |
 | `direct_service.py`, `direct_server.py` | Authenticated direct orchestration, explicit identities, prompt lifetime, settlement, evidence, and resource limits                    | Legacy replay or prompt hashing              |
-| `discovery.py` | Binary resolution for the supported IntelliJ IDEA/PyCharm 2025.3 and 2026.1 plugin paths                                                                        | Protocol, sessions, serving                  |
+| `workspace_tools.py`, `owned_commands.py` | File preconditions, bounded command effects and owned process settlement | Model invocation or HTTP identity |
+| `permission_policy.py`, `permission_handler.py` | Explicit noninteractive session policy and callback decisions | Role parsing or interactive prompts |
+| `discovery.py` | Recursive JetBrains binary discovery and version-reported admission                                                                        | Protocol, sessions, serving                  |
 | `__main__.py`  | Direct bind/auth policy, owned lifecycle, and HTTP wiring                                                                                    | Binary discovery logic                       |
 
 ## Tests
@@ -76,7 +45,7 @@ The OpenAPI schema is at https://agentclientprotocol.com/api-reference/openapi.j
 - Avoid mocks as much as possible
 - Test actual implementations, do not duplicate logic into tests
 - Favor writing property based tests
-- **Unit/property tests** (`test_transport.py`, `test_raw_events.py`, `test_client.py`, `test_model_binding_order.py`, `test_direct_*`, `test_discovery.py`): in-process boundaries, no real subprocess.
+- **Unit/property tests** (`test_native_*`, `test_workspace_tools.py`, `test_owned_commands.py`, `test_raw_events.py`, `test_direct_*`, `test_discovery.py`): bounded protocol fixtures and real local file/process effects; no live model calls.
 - **Integration tests** (`test_integration.py`): Real copilot-language-server. **Fails** (not skips) if binary not found — a missing binary means the environment is misconfigured.
 - **No skips.** Tests must never use `skipif` or `pytest.skip()`. See CODING_STANDARDS.md.
 - Run all: `python -m pytest tests/ -v`
@@ -99,17 +68,18 @@ rows retain evidence only; the listed superseding ADR governs current behavior.
 | [ADR-004](adrs/004-last-user-message-extraction.md) | Historical last-user-message extraction; removed by ADR-018                               |
 | [ADR-005](adrs/005-fail-loud-testing.md)            | Fail-loud testing — no skips (why skips are banned, what they masked)                                         |
 | [ADR-006](adrs/006-binary-discovery.md)             | Version-bounded JetBrains binary discovery and wrong-binary failure evidence                     |
-| [ADR-007](adrs/007-tool-ownership.md)               | ACP agent tool ownership retained; ADR-018 removes permissive callbacks and retains direct denial               |
+| [ADR-007](adrs/007-tool-ownership.md)               | Historical ACP tool ownership; superseded by ADR-020               |
 | [ADR-008](adrs/008-proxy-as-substrate.md)           | Installable command and cwd workspace retained; ADR-018 removes OpenCode startup, ADR-019 owns Meadow Bridge identity                                                    |
 | [ADR-009](adrs/009-intra-process-session-scaling.md)| Retained scaling evidence; direct pool/affinity clauses superseded                                            |
 | [ADR-011](adrs/011-context-injection-boundary.md)   | Historical context-injection boundary; removed by ADR-018                                                                 |
-| [ADR-012](adrs/012-meadow-direct-consumer-protocol.md) | Authenticated direct lifecycle, evidence and authority; ADR-018 removes dual-mode provisions                       |
-| [ADR-014](adrs/014-correlate-direct-session-state.md) | Correlate and validate direct session state without retaining unsupported payloads                         |
-| [ADR-015](adrs/015-order-direct-model-binding-transitions.md) | Bound prior/target model transitions until ordered RPC settlement; preserve exact acknowledgement and post-binding integrity |
+| [ADR-012](adrs/012-meadow-direct-consumer-protocol.md) | Direct lifecycle retained; ACP wire and binding superseded by ADR-020                       |
+| [ADR-014](adrs/014-correlate-direct-session-state.md) | Historical ACP state correlation; native mechanics governed by ADR-020                         |
+| [ADR-015](adrs/015-order-direct-model-binding-transitions.md) | Historical ACP model transitions; native mechanics governed by ADR-020 |
 | [ADR-016](adrs/016-opt-in-raw-acp-event-capture.md) | Explicit raw event diagnostics with ordered capture, bounded queues, and visible failures |
 | [ADR-017](adrs/017-change-relative-typing-and-checkout-gate.md) | Meadow-derived typing, complete checkout validation, snapshot isolation, and no-skips enforcement |
-| [ADR-018](adrs/018-remove-openai-compatible-adapter.md) | Remove the deprecated adapter and consumer-mode selector; retain direct ACP semantics |
-| [ADR-019](adrs/019-meadow-bridge-product-identity.md) | Meadow Bridge identity; direct ACP wire contract retained |
+| [ADR-018](adrs/018-remove-openai-compatible-adapter.md) | Remove the deprecated adapter and consumer-mode selector; native backend governed by ADR-020 |
+| [ADR-019](adrs/019-meadow-bridge-product-identity.md) | Meadow Bridge identity; retained ACP wire clauses superseded by ADR-020 |
+| [ADR-020](adrs/020-native-ide-backend.md) | Current native IDE transport, direct v2, workspace callbacks and explicit policy |
 
 The ADRs explain the *why* behind the module ownership rules in the table
 above. A change that contradicts an accepted ADR requires a new ADR
@@ -120,19 +90,6 @@ superseding it, not a silent deviation.
 User configuration contains network proxy settings only. Meadow owns prompt
 layers; the service has no OpenAI-compatible adapter, context-file injection,
 or consumer-mode selector. See ADR-018 for the removal decision.
-
-## Diagnostic Scripts
-
-Two standalone scripts in `src/` exist for protocol-level debugging — they
-are not part of the proxy package and should not be imported by production
-code:
-
-- **`acp_probe.py`** — Keeps a language-server subprocess alive and sends a
-  sequence of raw JSON-RPC messages. Use to explore the ACP wire protocol
-  directly.
-- **`acp_validate.py`** — Runs the full init → session → prompt lifecycle and
-  prints structured results per step. Use to validate a binary is responsive
-  before debugging the proxy layer.
 
 ## Git Conventions
 

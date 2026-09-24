@@ -1,15 +1,17 @@
 # Meadow Bridge
 
 Connects Meadow to the installed GitHub Copilot `copilot-language-server`
-through its ACP interface and the authenticated `/meadow/v1` HTTP contract.
+through its native IDE interface and the authenticated `/meadow/v2` contract.
 
 ```
-Meadow → Meadow Bridge `/meadow/v1` → copilot-language-server (ACP)
+Meadow → Meadow Bridge `/meadow/v2` → copilot-language-server --stdio
 ```
 
-Copilot owns model access, authentication refresh, and agent-internal tools.
-The service owns its child process, explicit sessions and operations, bounded
-admission, and settlement evidence. It does not implement the native IDE backend.
+Copilot owns model access, authentication refresh and model invocation. Bridge
+owns logical sessions, registered workspace callbacks, explicit noninteractive
+permission decisions, bounded operations and settlement evidence. It uses a
+child process and LSP-framed JSON-RPC. Copilot CLI and MCP servers are not used.
+See [ADR-020](adrs/020-native-ide-backend.md) for the contract and its limits.
 
 ## Dependencies
 
@@ -28,7 +30,7 @@ These must be present in the environment before using the proxy.
 | Dependency                                                | Suggested install                                                     | Purpose                                                                         |
 |-----------------------------------------------------------|-----------------------------------------------------------------------|---------------------------------------------------------------------------------|
 | **Python 3.11+**                                          | System package manager                                                | Runtime for the proxy itself                                                    |
-| **JetBrains IDE with GitHub Copilot plugin** (`copilot-language-server` meeting the configured minimum) | JetBrains Toolbox or standalone installer; plugin via IDE marketplace | Provides the version-admitted ACP binary and cached Copilot authentication |
+| **JetBrains IDE with GitHub Copilot plugin** (`copilot-language-server` meeting the configured minimum) | JetBrains Toolbox or standalone installer; plugin via IDE marketplace | Provides the version-admitted native executable and cached Copilot authentication |
 | **GitHub Copilot subscription**                           | Signed in via the JetBrains plugin                                    | The proxy uses the cached OAuth token at `~/.config/github-copilot/`            |
 
 ## Install
@@ -56,19 +58,38 @@ meadow-bridge \
   --execution-authority trusted-host
 ```
 
-Before direct HTTP readiness, the proxy uses one non-prompted catalog session
-to discover the available models, require an advertised usable default, and
-freeze one model-binding strategy for the child generation. The verified ACP
-`session/set_config_option` path is preferred; only method-not-found selects
-the Copilot `session/set_model` compatibility path. Every Meadow session then
-applies that frozen strategy before becoming ready. Direct readiness is
-negotiated at authenticated `GET /meadow/v1/capabilities`.
-The response identifies the protocol major, continuity generation, canonical
-workspace, exact model catalog, execution authority, resource limits, evidence
-support, and underlying ACP capabilities. Every mutation pins that generation
-and uses explicit logical-session, invocation, and operation IDs.
-Only `/meadow/v1/*` performs consumer work. The OpenAI-compatible adapter and
-its `/v1/*` routes have been removed.
+Before HTTP readiness, Bridge initializes the native server, admits its model
+catalog and registers workspace tools. `GET /meadow/v2/capabilities` identifies
+the protocol, generation, workspace, concrete agent-capable models, execution authority and limits.
+Model-selection aliases such as `auto` are not admitted because they do not pin
+a concrete model identity. Every mutation pins that generation and uses explicit logical-session,
+invocation and operation IDs. There is no v1 or OpenAI-compatible endpoint.
+
+Creating a session returns a stable logical handle immediately, with a null
+backend conversation ID and `binding_state: allocated`. It performs no model
+call. The first prompt creates the native conversation; later invocations use
+that same conversation. Retirement destroys a bound conversation or releases
+an unused allocation. Native conversation destruction does not delete provider
+transcripts. Uncertain requests are reconciled by operation ID, never replayed
+on a replacement session automatically.
+
+Session creation requires an explicit versioned `allow_all` policy. Meadow
+supplies it through its Bridge adapter. Policy decisions and confirmation
+handling live separately from execution so later restrictive policies can be
+added without changing transport ownership. This release never asks a person
+for approval and does not interpret Meadow role permission lists. Copilot may
+omit confirmation callbacks for generic tools; Bridge checks the session
+policy independently before every actual invocation.
+
+Registered tools create files, apply exact-context edits and execute commands.
+Compatible file changes can be grouped in one call. Preconditions reject stale
+content or paths outside the workspace; partial effects are reported. Command
+execution uses the process user's authority and is not a workspace sandbox.
+Windows defaults to Windows PowerShell 5.1 and POSIX to `/bin/sh`; `--shell`
+selects a supported shell executable, including PowerShell 7. Duration, output
+and owned process lifetime are bounded; truncation is explicit in the receipt.
+Commands run in the foreground. Cancellation settles the owned POSIX process
+group or Windows Job; deliberately detached background services are unsupported.
 
 `confined-container` may bind `0.0.0.0` only inside an actual container runtime
 with both the runtime marker and the managed launch attestation
@@ -79,22 +100,23 @@ port publishing, so a standalone operator must provide an equally private
 transport (or authenticated TLS) and truthfully supply the launcher
 attestation. Merely setting the environment variable on a host is rejected.
 
-Direct mode does not accept `--system-prompt` or context-file injection. Meadow
-owns stable instructions, the current prompt (including legal routes), the prose
-output contract, and correction deltas. The proxy reports first-turn injection;
-it does not claim a provider-native system or developer role.
-Later results report that stable instructions were not resubmitted on the same
-ACP session; they do not claim behavioral recall. Event bytes, event count,
-response bytes, request bytes, sessions, operations, queued prompts, and
-deadlines are all negotiated and fail closed at their respective boundaries.
-Prompt-scoped `usage_update` and `session_info_update` payloads remain bounded,
-ordered raw diagnostics in direct v1. The proxy advertises usage reporting as
-unsupported and never reinterprets booleans, negative values, or unknown fields
-as normalized token counters. Recognized state updates outside a prompt are
-boundedly correlated, structurally validated and logged, then discarded unless
-they enforce the acknowledged model.
+Meadow owns stable instructions, prompt layers, output contracts and correction
+deltas. Bridge submits stable instructions once and distinguishes native
+conversation binding from successful instruction submission. It does not claim
+a provider-native system role or guaranteed behavioral recall.
 
-The current working directory (or `--cwd`) becomes the ACP workspace.
+Tool observations distinguish server and Bridge ownership. Permission decisions
+carry the session policy digest. Effect receipts cover Bridge callbacks only;
+they do not attest every native tool effect. Ordered native progress remains
+available as diagnostic evidence. Normalized token usage, transparent recovery,
+native output schemas and cross-session parallel prompts are not advertised.
+Native built-in read/search tools remain available; catalog replacement and
+role-derived policy translation are future work.
+
+The current working directory (or `--cwd`) is the workspace. Request, response,
+event, session, operation and queue limits are negotiated at admission. Native
+terminal progress and matching RPC results must agree, and owned effects must
+settle, before an operation is reported complete.
 
 The proxy combines named candidates from running processes with a recursive
 search below the platform JetBrains data directory, rejects reported language-
@@ -160,18 +182,20 @@ They **fail** (not skip) if the binary is not found — see
 uv run --no-sync --no-env-file pytest tests/ --ignore=tests/test_integration.py -v
 ```
 The live direct integration probe requires the advertised
-`gpt-5.3-codex` model, proves exact advertised-model binding through the public
-Meadow contract, verifies that its catalog gate rejects an unadvertised
-control, and exercises two turns on one continuity generation.
+`gpt-5.6-sol` model. It checks advertised-model admission, rejection of an
+unadvertised control, deferred native creation, real create/edit/command
+callbacks, retained context across two turns and native retirement through the
+public Meadow contract.
 It also needs usable cached Copilot authentication. Missing prerequisites fail
 the complete gate; a unit-only run is useful development feedback, not checkout
 completion.
 
-### Completed Windows qualification
+### Prior release Windows qualification
 
 On 2026-09-24 UTC, revision
 [`3613648`](https://github.com/jonathanmiddleton/acp_proxy/commit/361364850040b1ba04ddcb2752a2b3f27c46e6a9)
-completed `python -u scripts/checkout_gate.py` natively on Windows with
+completed the pre-native-backend `python -u scripts/checkout_gate.py` natively
+on Windows with
 **exit 0: all five checks passed**. The full suite passed **390 tests**, with
 no skips or deselections, including real Copilot integration and native process
 control. Locked dependency synchronization, change-relative Mypy/Pyrefly,
@@ -197,18 +221,20 @@ When the language server needs an HTTP network proxy, configure
 `https_proxy` and `http_proxy` with its URL (for example,
 `"http://proxy-host:port"`).
 
-The proxy injects these into the language server subprocess environment
-only — the global environment is not modified. Shell environment variables
+Bridge applies these settings to the language-server and command subprocess
+environments; it does not modify the global environment. Discovered Copilot
+OAuth credentials are injected only into the language-server environment. Shell environment variables
 (`HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`) take precedence over config file
 values if both are set.
 
 ### GitHub environment forwarding
 
 The proxy forwards every environment variable whose name begins with `GH` or
-`GITHUB` unchanged to the `copilot-language-server` subprocess. This includes
+`GITHUB` to the `copilot-language-server` subprocess. This includes
 `GH_COPILOT_TOKEN` and `GITHUB_COPILOT_TOKEN`; if both are present, both are
 forwarded. Names are matched case-insensitively for stable Windows behavior,
-and no aliases are synthesized.
+and no aliases are synthesized. `GITHUB_COPILOT_ACP_USE_CLI` is the explicit
+exception: Bridge forces it to `0` for the native child.
 
 For CLI startup, an explicit non-empty `GH_COPILOT_TOKEN` or
 `GITHUB_COPILOT_TOKEN` remains authoritative. If neither is set, the proxy
@@ -217,9 +243,10 @@ loads the single prior OAuth `accessToken` from the GitHub Copilot
 Windows uses `%LOCALAPPDATA%\github-copilot\oauth.json` (with the conventional
 `%USERPROFILE%\AppData\Local` fallback). On macOS, it uses an absolute
 `$XDG_CONFIG_HOME/github-copilot/oauth.json` when configured and otherwise
-`$HOME/.config/github-copilot/oauth.json`. Automatic file discovery is limited
-to these verified Windows and macOS layouts; other platforms must use one of
-the explicit token variables. The file must contain exactly one OAuth account
+`$HOME/.config/github-copilot/oauth.json`. Automatic home-directory discovery is
+limited to these verified Windows and macOS layouts. Other POSIX platforms can
+use an explicit absolute `XDG_CONFIG_HOME` for a projected credential file, or
+one of the explicit token variables. The file must contain exactly one OAuth account
 so the proxy never guesses between identities. Authority and endpoint routing
 remain owned by the surrounding `GH*`/`GITHUB*` environment and network
 proxy settings; those values are forwarded unchanged. Missing, malformed, empty,
@@ -228,17 +255,6 @@ Credential values are never logged, and the language server remains
 responsible for exchanging the durable OAuth credential for and refreshing its
 short-lived Copilot service token.
 
-## ACP Specification
-
-The [Agent Client Protocol](https://agentclientprotocol.com) standardizes
-communication between code editors and coding agents. The full documentation
-index is at https://agentclientprotocol.com/llms.txt.
-
-Key references: [session setup](https://agentclientprotocol.com/protocol/session-setup.md)
-(`session/new`, `session/load`),
-[prompt turn](https://agentclientprotocol.com/protocol/prompt-turn.md),
-[schema](https://agentclientprotocol.com/protocol/schema.md).
-
 ## Options
 
 | Flag              | Default           | Description                                                                    |
@@ -246,10 +262,12 @@ Key references: [session setup](https://agentclientprotocol.com/protocol/session
 | `--binary`        | auto-discovered   | Path to `copilot-language-server`                                              |
 | `--host`          | 127.0.0.1         | Address on which the HTTP server listens                                       |
 | `--port`          | 8765              | Port for the HTTP server                                                       |
-| `--cwd`           | current directory | Working directory for ACP sessions (default: `cwd` where meadow_bridge is executed |
+| `--cwd`           | current directory | Workspace root (default: command working directory) |
 | `--log-level`     | WARNING           | DEBUG, INFO, WARNING, ERROR; environment override supported            |
 | `--log-file`      | logs/meadow-bridge.log    | Log file path (always DEBUG level)                                             |
-| `--raw-event-file` | disabled        | Separate opt-in NDJSON capture of full ACP updates and prompt boundaries       |
+| `--raw-event-file` | disabled        | Separate opt-in NDJSON native protocol capture       |
+| `--metadata-file` | disabled | Managed readiness metadata destination, removed on shutdown |
+| `--shell` | platform default | Supported command shell executable; optional PowerShell 7 selection |
 | `--execution-authority` | none        | Required direct profile: `trusted-host` or `confined-container`                |
 
 The default bind is loopback. Trusted-host direct mode rejects non-loopback
@@ -258,27 +276,22 @@ an observable runtime container boundary.
 
 ## Raw event diagnostics
 
-Pass `--raw-event-file /absolute/path/events.jsonl` to retain complete decoded
-`session/update` envelopes before client validation or projection, including
-outer and nested `_meta`, message IDs, content, and unknown fields. The parent
-directory must exist. Ordinary logs continue to contain protocol metadata.
+Pass `--raw-event-file /absolute/path/events.jsonl` to retain decoded native
+JSON-RPC messages separately from ordinary payload-safe logs. The parent
+directory must exist. Capture is disabled by default. Captured prompt, tool and
+response content can contain sensitive workspace information; protect these
+artifacts accordingly. HTTP credentials, child environment and stderr are not
+part of this capture.
 
 Each NDJSON record has `version`, `capture_id`, `sequence`, `timestamp`, and
-`kind`. `session_update` and `prompt_response` records carry the full JSON-RPC
-`message`. `prompt_request` records capture dispatch intent with `request_id`
-and `session_id`; `prompt_response` records carry the same identifiers and the
-terminal result or error. Prompt bodies, HTTP credentials, and child stderr
-are outside this capture. Agent output may itself contain sensitive content.
+`kind`. Native inbound and outbound records retain the JSON-RPC message.
+`capture_start` and `capture_end` delimit clean writer lifetimes. Existing
+complete files are appended with a fresh capture ID and sequence; an incomplete
+last record fails startup. Missing terminal protocol evidence or a missing
+`capture_end` means the artifact is incomplete. Records are flushed without
+rotation. A bounded queue keeps disk I/O off the event loop; overflow or I/O
+failure revokes continuity and makes shutdown fail.
 
-Capture is disabled by default. Existing complete files are appended with a
-new `capture_id` and sequence starting at zero, preserving resumed-run evidence.
-`capture_start` and `capture_end` delimit each clean writer lifetime. A missing
-prompt response means settlement was not observed; a missing `capture_end`
-means the capture is incomplete. An unterminated existing record fails startup.
-Records are flushed without truncation or rotation. A bounded writer queue
-keeps filesystem I/O off the event loop; overflow or I/O failure reports an
-error, revokes transport continuity, and makes proxy shutdown fail.
-
-Meadow's `meadow_bridge.capture_raw_events: true` setting passes a run-owned file at
-`<run-log-directory>/acp-events-<run_id>.jsonl`. Both the host proxy installation
-and any selected container image must include this option.
+Meadow's `meadow_bridge.capture_raw_events: true` setting supplies a run-owned
+capture file. The host installation and selected container image must include
+the same native backend version.

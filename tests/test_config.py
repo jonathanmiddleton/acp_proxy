@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from meadow_bridge.config import (
     build_subprocess_env,
@@ -103,7 +106,9 @@ class TestBuildSubprocessEnv:
             # Preserve PATH so the env is usable
             env = build_subprocess_env(cfg)
         assert env["HTTPS_PROXY"] == "http://proxy:8080"
-        assert env["https_proxy"] == "http://proxy:8080"
+        assert env.get("https_proxy") == (
+            None if sys.platform == "win32" else "http://proxy:8080"
+        )
 
     def test_env_var_takes_precedence_over_config(self) -> None:
         cfg = {"https_proxy": "http://from-config:8080"}
@@ -128,7 +133,9 @@ class TestBuildSubprocessEnv:
         ):
             env = build_subprocess_env(None)
         assert env["HTTP_PROXY"] == "http://disk-proxy:3128"
-        assert env["http_proxy"] == "http://disk-proxy:3128"
+        assert env.get("http_proxy") == (
+            None if sys.platform == "win32" else "http://disk-proxy:3128"
+        )
 
     def test_all_proxy_vars_applied(self) -> None:
         cfg = {
@@ -139,11 +146,17 @@ class TestBuildSubprocessEnv:
         with patch.dict(os.environ, {}, clear=True):
             env = build_subprocess_env(cfg)
         assert env["HTTP_PROXY"] == "http://proxy:3128"
-        assert env["http_proxy"] == "http://proxy:3128"
+        assert env.get("http_proxy") == (
+            None if sys.platform == "win32" else "http://proxy:3128"
+        )
         assert env["HTTPS_PROXY"] == "http://proxy:3129"
-        assert env["https_proxy"] == "http://proxy:3129"
+        assert env.get("https_proxy") == (
+            None if sys.platform == "win32" else "http://proxy:3129"
+        )
         assert env["NO_PROXY"] == "localhost,127.0.0.1"
-        assert env["no_proxy"] == "localhost,127.0.0.1"
+        assert env.get("no_proxy") == (
+            None if sys.platform == "win32" else "localhost,127.0.0.1"
+        )
 
     def test_non_string_values_in_config_ignored(self) -> None:
         cfg = {"https_proxy": 12345, "http_proxy": "http://proxy:3128"}
@@ -157,10 +170,58 @@ class TestBuildSubprocessEnv:
         with patch.dict(os.environ, {}, clear=True):
             env = build_subprocess_env(cfg)
         assert env["HTTPS_PROXY"] == "http://proxy:8080"
-        assert env["https_proxy"] == "http://proxy:8080"
+        assert env.get("https_proxy") == (
+            None if sys.platform == "win32" else "http://proxy:8080"
+        )
 
     def test_does_not_modify_os_environ(self) -> None:
         cfg = {"https_proxy": "http://proxy:8080"}
         original_env = dict(os.environ)
         build_subprocess_env(cfg)
         assert dict(os.environ) == original_env
+
+
+@pytest.mark.parametrize("explicit_key", ["HTTPS_PROXY", "https_proxy", "HtTpS_PrOxY"])
+def test_windows_composition_preserves_explicit_values_without_case_duplicates(
+    explicit_key: str,
+) -> None:
+    inherited = {
+        explicit_key: "http://explicit:9090",
+        "Path": "inherited-path",
+        "GITHUB_COPILOT_TOKEN": "inherited-copilot-token",
+        "GH_TOKEN": "inherited-github-token",
+    }
+    before = dict(inherited)
+    with (
+        patch("sys.platform", "win32"),
+        patch("meadow_bridge.config.os.environ", inherited),
+    ):
+        env = build_subprocess_env({
+            "https_proxy": "http://configured:8080",
+            "HTTP_PROXY": "http://configured:3128",
+            "no_proxy": "localhost,127.0.0.1",
+        })
+    assert env == {
+        "HTTPS_PROXY": "http://explicit:9090",
+        "HTTP_PROXY": "http://configured:3128",
+        "NO_PROXY": "localhost,127.0.0.1",
+        "PATH": "inherited-path",
+        "GITHUB_COPILOT_TOKEN": "inherited-copilot-token",
+        "GH_TOKEN": "inherited-github-token",
+    }
+    assert inherited == before
+
+
+def test_posix_composition_preserves_distinct_case_sensitive_values() -> None:
+    inherited = {
+        "HTTPS_PROXY": "http://explicit-upper:9090",
+        "https_proxy": "http://explicit-lower:8080",
+        "Path": "case-sensitive-path",
+        "GH_TOKEN": "inherited-github-token",
+    }
+    with (
+        patch("sys.platform", "linux"),
+        patch("meadow_bridge.config.os.environ", inherited),
+    ):
+        env = build_subprocess_env({"https_proxy": "http://configured:3128"})
+    assert env == inherited

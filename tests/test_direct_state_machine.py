@@ -4,24 +4,28 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Any
 
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from meadow_bridge.client import ModelInfo
+from meadow_bridge.native_types import NativeTerminal
+from tests.test_direct_server import FakeNativeClient
 from meadow_bridge.direct_protocol import (
     CancelRequest,
     CreateSessionRequest,
     DirectLimits,
     PromptRequest,
     PromptPhase,
+    PermissionPolicy,
     RetireSessionRequest,
 )
-from meadow_bridge.direct_service import DirectBusy, DirectGenerationMismatch, DirectService
+from meadow_bridge.direct_service import (
+    DirectBusy,
+    DirectGenerationMismatch,
+    DirectService,
+)
 from meadow_bridge.direct_state import (
     DirectConflict,
     DirectLimitExceeded,
@@ -29,58 +33,42 @@ from meadow_bridge.direct_state import (
 )
 
 
-@dataclass(frozen=True)
-class _Descriptor:
-    session_id: str
-    model_id: str
+class _TraceNative(FakeNativeClient):
+    """Observable native boundary used by generated production lifecycle traces."""
 
-
-class _TraceAcp:
     def __init__(self) -> None:
-        self.models = [ModelInfo("gpt-5.3-codex", "GPT-5.3 Codex")]
-        self.protocol_version = 1
-        self.agent_info = {"name": "trace", "version": "1"}
-        self.agent_capabilities: dict[str, Any] = {}
-        self.is_alive = True
-        self.created: list[str] = []
+        super().__init__()
         self.prompted: list[str] = []
-        self.cancelled: list[str] = []
-        self.block_prompts = False
         self.prompt_started = asyncio.Event()
-        self.release_prompts = asyncio.Event()
+        self.release_prompts = self.release_prompt
 
-    async def create_session_exact(self, _cwd: str, model_id: str) -> _Descriptor:
-        session_id = f"backend-{len(self.created)}"
-        self.created.append(session_id)
-        return _Descriptor(session_id, model_id)
-
-    async def prompt_blocks(
+    async def run_turn(
         self,
-        session_id: str,
-        _blocks: list[dict[str, str]],
+        logical_id: str,
+        text: str,
         *,
         timeout_s: float,
         event_byte_limit: int,
         event_count_limit: int,
-    ) -> AsyncIterator[dict[str, Any]]:
-        self.prompted.append(session_id)
+        response_byte_limit: int,
+    ) -> NativeTerminal:
+        self.prompted.append(logical_id)
         self.prompt_started.set()
-        if self.block_prompts:
-            await self.release_prompts.wait()
-        yield {
-            "sessionUpdate": "agent_message_chunk",
-            "content": {"type": "text", "text": "ok"},
-        }
-        yield {
-            "done": True,
-            "stopReason": (
-                "cancelled" if session_id in self.cancelled else "end_turn"
-            ),
-        }
+        return await super().run_turn(
+            logical_id,
+            text,
+            timeout_s=timeout_s,
+            event_byte_limit=event_byte_limit,
+            event_count_limit=event_count_limit,
+            response_byte_limit=response_byte_limit,
+        )
 
-    async def cancel_session(self, session_id: str) -> None:
-        self.cancelled.append(session_id)
-        self.release_prompts.set()
+
+@dataclass
+class _ReferenceSession:
+    ready: bool = True
+    initialized: bool = False
+    invocation: str | None = None
 
 
 Action = tuple[str, int]
@@ -113,7 +101,7 @@ def test_generated_direct_lifecycle_trace(actions: list[Action]) -> None:
 
 
 async def _exercise_trace(actions: list[Action]) -> None:
-    fake = _TraceAcp()
+    fake = _TraceNative()
     limits = DirectLimits(max_sessions=2, max_operations=10)
     service = DirectService(
         fake,
@@ -127,7 +115,7 @@ async def _exercise_trace(actions: list[Action]) -> None:
     stable_digest = hashlib.sha256(stable.encode()).hexdigest()
     contract = "complete prose contract"
     contract_digest = hashlib.sha256(contract.encode()).hexdigest()
-    model: dict[int, dict[str, Any]] = {}
+    model: dict[int, _ReferenceSession] = {}
     last_prompt: dict[int, str] = {}
     admitted_operations = 0
     prompt_effects = 0
@@ -155,7 +143,7 @@ async def _exercise_trace(actions: list[Action]) -> None:
 
         if kind == "create":
             request = CreateSessionRequest(
-                protocol_major=1,
+                protocol_major=2,
                 continuity_generation_id=service.continuity_generation_id,
                 operation_id=operation_id,
                 logical_session_id=logical_id,
@@ -164,6 +152,7 @@ async def _exercise_trace(actions: list[Action]) -> None:
                 title="Actor",
                 model_id="gpt-5.3-codex",
                 stable_instruction_digest=stable_digest,
+                permission_policy=PermissionPolicy(version=1, mode="allow_all"),
             )
             if state is not None:
                 with pytest.raises(DirectConflict):
@@ -179,20 +168,16 @@ async def _exercise_trace(actions: list[Action]) -> None:
                 assert created
                 assert (await service.wait_for_operation(record)).state == "completed"
                 admitted_operations += 1
-                model[slot] = {
-                    "ready": True,
-                    "initialized": False,
-                    "invocation": None,
-                }
+                model[slot] = _ReferenceSession()
         elif kind in {"initial", "invocation", "correction", "continuation"}:
             phase = kind
             invocation = (
                 f"invocation-{step}"
                 if phase in {"initial", "invocation"}
-                else (state or {}).get("invocation") or "missing-invocation"
+                else (state.invocation if state else None) or "missing-invocation"
             )
-            prompt_kwargs: dict[str, Any] = {
-                "protocol_major": 1,
+            prompt_kwargs: dict[str, object] = {
+                "protocol_major": 2,
                 "continuity_generation_id": service.continuity_generation_id,
                 "operation_id": operation_id,
                 "invocation_id": invocation,
@@ -213,17 +198,17 @@ async def _exercise_trace(actions: list[Action]) -> None:
                 )
             else:
                 prompt_kwargs["delta"] = f"{phase} delta"
-            prompt_request = PromptRequest(**prompt_kwargs)
+            prompt_request = PromptRequest.model_validate(prompt_kwargs)
             phase_is_valid = bool(
                 state
-                and state["ready"]
+                and state.ready
                 and (
-                    (phase == "initial" and not state["initialized"])
-                    or (phase == "invocation" and state["initialized"])
+                    (phase == "initial" and not state.initialized)
+                    or (phase == "invocation" and state.initialized)
                     or (
                         phase in {"correction", "continuation"}
-                        and state["initialized"]
-                        and state["invocation"] is not None
+                        and state.initialized
+                        and state.invocation is not None
                     )
                 )
             )
@@ -240,15 +225,15 @@ async def _exercise_trace(actions: list[Action]) -> None:
                 admitted_operations += 1
                 prompt_effects += 1
                 assert state is not None
-                state["initialized"] = True
-                state["invocation"] = invocation
+                state.initialized = True
+                state.invocation = invocation
                 last_prompt[slot] = operation_id
         elif kind == "cancel":
             target = last_prompt.get(slot)
             if target is None:
                 continue
             cancel_request = CancelRequest(
-                protocol_major=1,
+                protocol_major=2,
                 continuity_generation_id=service.continuity_generation_id,
                 operation_id=operation_id,
                 target_operation_id=target,
@@ -263,12 +248,12 @@ async def _exercise_trace(actions: list[Action]) -> None:
                 admitted_operations += 1
         else:
             retire_request = RetireSessionRequest(
-                protocol_major=1,
+                protocol_major=2,
                 continuity_generation_id=service.continuity_generation_id,
                 operation_id=operation_id,
                 logical_session_id=logical_id,
             )
-            if not state or not state["ready"]:
+            if not state or not state.ready:
                 with pytest.raises(DirectStateError):
                     await service.admit_retire(retire_request)
             elif admitted_operations >= limits.max_operations:
@@ -279,10 +264,10 @@ async def _exercise_trace(actions: list[Action]) -> None:
                 assert created
                 assert (await service.wait_for_operation(record)).state == "completed"
                 admitted_operations += 1
-                state["ready"] = False
+                state.ready = False
 
         assert len(fake.created) == len(model)
-        assert len(set(fake.created)) == len(fake.created)
+        assert set(fake.bindings) == {f"session-{slot}" for slot in model}
         assert len(fake.prompted) == prompt_effects
         assert fake.cancelled == []
 
@@ -291,9 +276,7 @@ SAFE_ID = st.builds(
     lambda first, rest: first + rest,
     st.sampled_from("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"),
     st.text(
-        alphabet=(
-            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._~-"
-        ),
+        alphabet=("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._~-"),
         min_size=0,
         max_size=24,
     ),
@@ -313,15 +296,13 @@ def test_generated_concurrent_idempotency_cancel_and_isolation_trace(
 ) -> None:
     """ADI-04/05/10/15: generated interleavings match observable effects."""
 
-    asyncio.run(
-        _exercise_concurrent_trace(operation_id, cancel_active, terminal_wins)
-    )
+    asyncio.run(_exercise_concurrent_trace(operation_id, cancel_active, terminal_wins))
 
 
 async def _exercise_concurrent_trace(
     operation_id: str, cancel_active: bool, terminal_wins: bool
 ) -> None:
-    fake = _TraceAcp()
+    fake = _TraceNative()
     fake.block_prompts = True
     service = DirectService(
         fake,
@@ -341,7 +322,7 @@ async def _exercise_concurrent_trace(
 
     for index in range(3):
         create = CreateSessionRequest(
-            protocol_major=1,
+            protocol_major=2,
             continuity_generation_id=service.continuity_generation_id,
             operation_id=f"create-{index}",
             logical_session_id=f"session-{index}",
@@ -350,13 +331,14 @@ async def _exercise_concurrent_trace(
             title="Actor",
             model_id="gpt-5.3-codex",
             stable_instruction_digest=stable_digest,
+            permission_policy=PermissionPolicy(version=1, mode="allow_all"),
         )
         record, _ = await service.admit_create(create)
         assert (await service.wait_for_operation(record)).state == "completed"
 
     def prompt_request(op_id: str, invocation: str) -> PromptRequest:
         return PromptRequest(
-            protocol_major=1,
+            protocol_major=2,
             continuity_generation_id=service.continuity_generation_id,
             operation_id=op_id,
             invocation_id=invocation,
@@ -400,7 +382,7 @@ async def _exercise_concurrent_trace(
         fake.release_prompts.set()
         assert (await service.wait_for_operation(first)).state == "completed"
     cancel = CancelRequest(
-        protocol_major=1,
+        protocol_major=2,
         continuity_generation_id=service.continuity_generation_id,
         operation_id=f"{operation_id}-cancel",
         target_operation_id=target.operation_id,
@@ -416,18 +398,14 @@ async def _exercise_concurrent_trace(
         service.wait_for_operation(first),
         service.wait_for_operation(queued),
     )
-    assert (first_view.state == "cancelled") is (
-        cancel_active and not terminal_won
-    )
+    assert (first_view.state == "cancelled") is (cancel_active and not terminal_won)
     assert (queued_view.state == "cancelled") is (not cancel_active)
     assert fake.cancelled == (
-        ["backend-0"] if cancel_active and not terminal_won else []
+        ["session-0"] if cancel_active and not terminal_won else []
     )
 
-    isolated_request = prompt_request(
-        f"{operation_id}-isolated", "invocation-two"
-    )
+    isolated_request = prompt_request(f"{operation_id}-isolated", "invocation-two")
     isolated, created = await service.admit_prompt("session-2", isolated_request)
     assert created
     assert (await service.wait_for_operation(isolated)).state == "completed"
-    assert fake.prompted[-1] == "backend-2"
+    assert fake.prompted[-1] == "session-2"
