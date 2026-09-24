@@ -1,2 +1,0 @@
-docs/journal.md filter=git-crypt diff=git-crypt
-tmp/** filter=git-crypt diff=git-crypt
