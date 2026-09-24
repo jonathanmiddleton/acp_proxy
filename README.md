@@ -167,6 +167,17 @@ It also needs usable cached Copilot authentication. Missing prerequisites fail
 the complete gate; a unit-only run is useful development feedback, not checkout
 completion.
 
+### Completed Windows qualification
+
+On 2026-09-24 UTC, revision
+[`3613648`](https://github.com/jonathanmiddleton/acp_proxy/commit/361364850040b1ba04ddcb2752a2b3f27c46e6a9)
+completed `python -u scripts/checkout_gate.py` natively on Windows with
+**exit 0: all five checks passed**. The full suite passed **390 tests**, with
+no skips or deselections, including real Copilot integration and native process
+control. Locked dependency synchronization, change-relative Mypy/Pyrefly,
+Ruff, and checkout preservation all passed. The canonical comparison base
+remained unchanged, and the gate left the validated checkout clean.
+
 ## Configuration
 
 On first run, the proxy creates a default config at `~/.meadow_bridge/config.json`:
