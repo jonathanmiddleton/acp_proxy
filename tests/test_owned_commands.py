@@ -1,10 +1,13 @@
 """Real command, pipe, and descendant lifetime obligations."""
 
 import asyncio
+from collections.abc import Mapping
+import importlib
 import os
 from pathlib import Path
 import shlex
 import sys
+import threading
 
 import pytest
 
@@ -40,6 +43,58 @@ async def _ready(path: Path) -> None:
     async with asyncio.timeout(5):
         while not path.exists():
             await asyncio.sleep(0.01)
+
+
+def test_stop_reads_exit_code_after_tree_and_pipe_settlement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-stop running observation cannot supply the settled exit status."""
+    class SettlingProcess:
+        """Process I/O boundary whose closed pipes precede root termination."""
+
+        def __init__(self, argv: tuple[str, ...], cwd: Path, env: Mapping[str, str]) -> None:
+            self.exit_code: int | None = None
+            self.closed = False
+            self.observations: list[int | None] = []
+            processes.append(self)
+
+        def read_stdout(self, max_bytes: int) -> bytes:
+            return b""
+
+        def read_stderr(self, max_bytes: int) -> bytes:
+            return b""
+
+        def poll(self) -> int | None:
+            self.observations.append(self.exit_code)
+            return self.exit_code
+
+        def stop(self) -> None:
+            self.exit_code = 37
+
+        def tree_stopped(self) -> bool:
+            return self.exit_code is not None
+
+        def close(self) -> None:
+            assert self.tree_stopped()
+            self.closed = True
+
+    processes: list[SettlingProcess] = []
+    suffix, name = (
+        ("windows", "WindowsCommand") if sys.platform == "win32"
+        else ("linux", "LinuxCommand") if sys.platform == "linux"
+        else ("posix", "PosixCommand")
+    )
+    monkeypatch.setattr(importlib.import_module(f"meadow_bridge._owned_command_{suffix}"), name, SettlingProcess)
+    stop = threading.Event()
+    stop.set()
+    result = OwnedCommands(os.environ)._run(CommandSpec("unused", tmp_path, 10), stop)
+    assert result.exit_code == 37
+    assert result.stdout == result.stderr == b""
+    assert not result.timed_out
+    assert len(processes) == 1
+    assert processes[0].observations[0] is None
+    assert processes[0].observations[-1] == 37
+    assert processes[0].closed
 
 
 @pytest.mark.asyncio

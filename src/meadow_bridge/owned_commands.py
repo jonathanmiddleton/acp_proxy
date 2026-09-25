@@ -255,6 +255,8 @@ class OwnedCommands:
                     process.stop()
                 if stopped and process.tree_stopped():
                     if stdout.eof and stderr.eof:
+                        # Settlement can supersede the running observation before stop.
+                        code = process.poll()
                         assert code is not None
                         return CommandResult(
                             bytes(stdout.data),
