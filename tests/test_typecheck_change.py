@@ -17,7 +17,7 @@ LEGACY_SOURCE = 'def legacy() -> int:\n    return "existing error"\n'
 PYREFLY_CONFIGURATION = (
     '[tool.pyrefly]\n'
     'preset = "legacy"\n'
-    'python_version = "3.11"\n'
+    'python_version = "3.13"\n'
     'search_path = ["src", "."]\n'
     '[tool.pyrefly.errors]\n'
     'no-any-return = "error"\n'

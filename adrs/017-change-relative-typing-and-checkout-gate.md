@@ -11,6 +11,11 @@
 > Historical observations below are retained; only remaining direct ACP
 > provisions govern the current service.
 
+> **2026-09-25 amendment:** The supported Python range is now
+> `>=3.13.3,<3.14`, with type-checker and Ruff targets set to Python 3.13.
+> This replaces the adoption-time Python floor below; the complete checkout
+> gate and its proof obligations remain unchanged.
+
 ## Context
 
 ACP Proxy is about to evolve alongside Meadow. Its standards require type
@@ -22,7 +27,7 @@ cleanup into the tooling adoption.
 Meadow already has a change-relative validator and a checkout gate that retain
 full command logs and detect source mutations during validation. The proxy can
 reuse those algorithms while adapting its canonical branch and `src/` layout.
-Its Python 3.11 floor, live Copilot tests, and no-skips rule remain binding.
+At adoption, its Python 3.11 floor, live Copilot tests, and no-skips rule remained binding.
 
 ## Decision
 

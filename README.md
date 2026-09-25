@@ -29,7 +29,7 @@ These must be present in the environment before using the proxy.
 
 | Dependency                                                | Suggested install                                                     | Purpose                                                                         |
 |-----------------------------------------------------------|-----------------------------------------------------------------------|---------------------------------------------------------------------------------|
-| **Python 3.11+**                                          | System package manager                                                | Runtime for the proxy itself                                                    |
+| **Python 3.13.3 or later within Python 3.13**               | System package manager                                                | Runtime for the proxy itself                                                    |
 | **JetBrains IDE with GitHub Copilot plugin** (`copilot-language-server` meeting the configured minimum) | JetBrains Toolbox or standalone installer; plugin via IDE marketplace | Provides the version-admitted native executable and cached Copilot authentication |
 | **GitHub Copilot subscription**                           | Signed in via the JetBrains plugin                                    | The proxy uses the cached OAuth token at `~/.config/github-copilot/`            |
 

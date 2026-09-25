@@ -11,7 +11,7 @@ adoption decision and migration boundary.
 
 ## Python and Static Types
 
-- **Python 3.11+** is required. Keep syntax and APIs compatible with that floor.
+- **Python 3.13.3 or later within Python 3.13** is required. Keep syntax and APIs compatible with that floor.
 - **Type hints everywhere.** Annotate function signatures, return types, and
   non-trivial local values. Public methods and classes need docstrings.
 - **Pydantic** owns HTTP request/response validation. Internal semantic values

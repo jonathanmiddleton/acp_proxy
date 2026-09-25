@@ -2,7 +2,7 @@
 name = "meadow-bridge"
 version = "0.4.1"
 description = "Authenticated Meadow integration with the GitHub Copilot native IDE interface"
-requires-python = ">=3.11"
+requires-python = ">=3.13.3,<3.14"
 dependencies = [
     "fastapi>=0.135.0",
     "uvicorn~=0.44.0",
@@ -30,13 +30,13 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.13"
 strict = true
 mypy_path = "$MYPY_CONFIG_FILE_DIR/src"
 
 [tool.pyrefly]
 preset = "legacy"
-python-version = "3.11"
+python-version = "3.13"
 search-path = ["src", "."]
 
 [tool.pyrefly.errors]
@@ -44,7 +44,7 @@ no-any-return = "error"
 redundant-cast = "warn"
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py313"
 extend-exclude = [".agents", ".codex", ".meadow", "tmp"]
 
 [tool.ruff.lint]

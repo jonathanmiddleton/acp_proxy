@@ -790,7 +790,7 @@ def _pyrefly_bootstrap_arguments(root: Path) -> tuple[str, ...]:
             "--preset", "legacy",
             "--error", "no-any-return",
             "--warn", "redundant-cast",
-            "--python-version", "3.11",
+            "--python-version", "3.13",
             "--search-path", str(root / "src"),
             "--search-path", str(root),
         )
@@ -830,7 +830,7 @@ def _run_checker_scope(
         argv = (
             executable,
             "--strict",
-            "--python-version", "3.11",
+            "--python-version", "3.13",
             "--output=json",
             "--no-pretty",
             "--python-executable",
