@@ -11,7 +11,7 @@ surfacing, resilience policy, and testing philosophy.
 Required completion validation is
 `python3 scripts/checkout_gate.py`; `--list` prints its inventory. The gate
 synchronizes the locked development environment, runs Mypy/Pyrefly
-change-relative validation against `refs/heads/main`, all tests, and Ruff, and
+change-relative validation against `refs/heads/master`, all tests, and Ruff, and
 requires the checkout to remain unchanged. Focused checks do not replace it.
 During development, run `python3 scripts/typecheck_change.py` after bounded
 Python edits. Do not add diagnostic baselines or weaken checks to obtain a pass.

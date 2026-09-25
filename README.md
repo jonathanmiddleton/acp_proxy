@@ -160,7 +160,7 @@ and Ruff, then verifies that validation left the checkout unchanged. It retains
 full command logs and reports every failed check. `--list` shows its inventory.
 
 Typing compares the working tree (including staged, unstaged, and untracked
-work) with the merge base of `HEAD` and the local `refs/heads/main`. Keep that
+work) with the merge base of `HEAD` and the local `refs/heads/master`. Keep that
 canonical ref available in your clone. New diagnostics and existing diagnostics
 inside changed declarations fail; unchanged diagnostics elsewhere are not a
 checked-in baseline or a claim of repository-wide strict cleanliness.

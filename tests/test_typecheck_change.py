@@ -55,7 +55,7 @@ def checkout(tmp_path: Path) -> Path:
     )
     (root / ".gitignore").write_text("__pycache__/\n.mypy_cache/\n", encoding="utf-8")
     subprocess.run(
-        ("git", "init", "--quiet", "--initial-branch=main", str(root)), check=True,
+        ("git", "init", "--quiet", "--initial-branch=master", str(root)), check=True,
     )
     _commit(root)
     return root
@@ -249,7 +249,7 @@ def test_configuration_severity_changes_remain_effective(
     assert "new diagnostic" in result.stdout
 
 
-def test_default_main_covers_committed_changes_despite_feature_upstream(
+def test_default_master_covers_committed_changes_despite_feature_upstream(
     checkout: Path, checker_environment: dict[str, str],
 ) -> None:
     _git(checkout, "switch", "--quiet", "--create", "feature")
@@ -261,11 +261,11 @@ def test_default_main_covers_committed_changes_despite_feature_upstream(
     result = _validate(checkout, checker_environment)
 
     _assert_both_failed(result)
-    assert "relative to refs/heads/main" in result.stdout
+    assert "relative to refs/heads/master" in result.stdout
     assert "new diagnostic" in result.stdout
 
 
-def test_missing_main_requires_an_explicit_comparison_base(
+def test_missing_master_requires_an_explicit_comparison_base(
     checkout: Path, checker_environment: dict[str, str],
 ) -> None:
     _git(checkout, "branch", "--move", "feature")
@@ -273,7 +273,7 @@ def test_missing_main_requires_an_explicit_comparison_base(
     result = _validate(checkout, checker_environment)
 
     assert result.returncode == 2
-    assert "canonical comparison ref refs/heads/main is unavailable" in result.stderr
+    assert "canonical comparison ref refs/heads/master is unavailable" in result.stderr
     assert "pass --base" in result.stderr
     explicit = _validate(checkout, checker_environment, "--base", "HEAD")
     assert explicit.returncode == 0, explicit.stdout + explicit.stderr

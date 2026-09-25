@@ -30,7 +30,7 @@ python3 scripts/checkout_gate.py
 
 The gate synchronizes the locked development environment before invoking
 `scripts/typecheck_change.py`. The validator resolves the merge base of `HEAD`
-and the canonical local ref `refs/heads/main`, independent of the current
+and the canonical local ref `refs/heads/master`, independent of the current
 branch's upstream. It includes committed branch changes, staged and unstaged
 edits, and untracked Python files. Both checkers compare structured diagnostics
 in cohesive affected scopes at the base and in the working tree, requiring:
@@ -50,7 +50,7 @@ The maintained scope includes `src/`, `tests/`, `scripts/`, and experiment
 Python. Source changes also validate maintained consumers. For focused work,
 run `python3 scripts/typecheck_change.py` after each bounded edit. Its
 `--base <revision>` option deliberately inspects a different boundary; it does
-not replace the complete checkout gate, which always uses `refs/heads/main`.
+not replace the complete checkout gate, which always uses `refs/heads/master`.
 
 ### Checkout completion
 

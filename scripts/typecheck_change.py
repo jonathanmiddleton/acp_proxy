@@ -12,7 +12,7 @@ Git directory. Current analysis uses a disposable copy of that cache and shadow
 copies of edited sources so timestamp-preserving edits are still revalidated.
 
 By default, the validator compares the current branch with
-``refs/heads/main``. Pass ``--base <revision>`` only when deliberately
+``refs/heads/master``. Pass ``--base <revision>`` only when deliberately
 inspecting a different change boundary. Both snapshots resolve the src-layout
 package from their own source tree, including before typing was configured.
 """
@@ -36,7 +36,7 @@ import tomllib
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_COMPARISON_REF = "refs/heads/main"
+DEFAULT_COMPARISON_REF = "refs/heads/master"
 CONFIG_PATHS = frozenset({"mypy.ini", "pyrefly.toml", "pyproject.toml"})
 IGNORED_PYTHON_PREFIXES = ("tickets/", ".codex/", ".agents")
 REMOVED_SUBPROCESS_ENV = (

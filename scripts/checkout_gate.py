@@ -10,7 +10,7 @@ bounded console excerpt plus the full log path.
 
 Change-relative typing and root-project validation are separate suites with
 separate log directories. Change-relative typing compares the checkout with
-``refs/heads/main``. Tests include the real copilot-language-server integration
+``refs/heads/master``. Tests include the real copilot-language-server integration
 suite and run serially to bound external service load.
 
 Run ``python3 scripts/checkout_gate.py`` (or ``python`` on Windows).
@@ -33,7 +33,7 @@ from pathlib import Path
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-CANONICAL_CHANGE_BASE = "refs/heads/main"
+CANONICAL_CHANGE_BASE = "refs/heads/master"
 UV = ("uv", "--cache-dir", ".uv-cache")
 UV_RUN = UV + ("run", "--no-sync", "--no-env-file")
 PASS = "PASS"

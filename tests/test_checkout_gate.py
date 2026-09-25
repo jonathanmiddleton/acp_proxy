@@ -113,7 +113,7 @@ def gate_checkout(tmp_path: Path) -> GateCheckout:
         "raise SystemExit(result.returncode)\n",
     )
     checkout = GateCheckout(root, executables, tmp_path / "calls.txt", git)
-    checkout.git_command("init", "--initial-branch=main")
+    checkout.git_command("init", "--initial-branch=master")
     checkout.git_command("add", ".")
     checkout.git_command(
         "-c",

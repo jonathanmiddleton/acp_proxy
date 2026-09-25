@@ -16,6 +16,10 @@
 > This replaces the adoption-time Python floor below; the complete checkout
 > gate and its proof obligations remain unchanged.
 
+> **2026-09-25 branch amendment:** The repository default branch is now
+> `master`. The canonical comparison ref is `refs/heads/master`; no fallback
+> to the former `main` ref or a feature branch upstream is provided.
+
 ## Context
 
 ACP Proxy is about to evolve alongside Meadow. Its standards require type
@@ -38,7 +42,7 @@ the entire test suite, Ruff, and content-sensitive checkout preservation.
 Every step reports its own outcome and retains complete output. The proxy has
 no Meadow prototype suite. Its tests run serially to bound live Copilot load.
 
-The typing validator compares the merge base of `HEAD` and `refs/heads/main`
+The typing validator compares the merge base of `HEAD` and `refs/heads/master`
 with the working tree, including staged, unstaged, and untracked work. Mypy
 runs in strict mode; Pyrefly mirrors Meadow's legacy migration preset with
 `no-any-return` errors. A change must introduce no new diagnostics and leave
@@ -72,7 +76,7 @@ gate still requires the sanctioned language server and usable authentication.
 - Gate and validator tests use real temporary Git repositories and process
   boundaries. Real checker regressions cover snapshot isolation, affected
   declarations, configuration adoption, and cache behavior.
-- A clone must retain the canonical local `main` ref and install `uv`.
+- A clone must retain the canonical local `master` ref and install `uv`.
   Intentional dependency changes update `uv.lock` before the gate runs.
 
 ## Rejected Alternatives
