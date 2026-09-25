@@ -36,8 +36,8 @@ These must be present in the environment before using the proxy.
 ## Install
 
 ```bash
-git clone https://github.com/jonathanmiddleton/acp_proxy.git
-cd acp_proxy
+git clone https://github.com/jonathanmiddleton/meadow-bridge.git
+cd meadow-bridge
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
@@ -202,7 +202,7 @@ completion.
 ### Prior release Windows qualification
 
 On 2026-09-24 UTC, revision
-[`3613648`](https://github.com/jonathanmiddleton/acp_proxy/commit/361364850040b1ba04ddcb2752a2b3f27c46e6a9)
+[`3613648`](https://github.com/jonathanmiddleton/meadow-bridge/commit/361364850040b1ba04ddcb2752a2b3f27c46e6a9)
 completed the pre-native-backend `python -u scripts/checkout_gate.py` natively
 on Windows with
 **exit 0: all five checks passed**. The full suite passed **390 tests**, with
