@@ -79,6 +79,10 @@ def turn(request):
             else: raise ValueError('unexpected callback wait message')
     progress('begin')
     mode = config.get('mode')
+    if mode == 'many-reports':
+        for index in range(5000): progress('report', reply=str(index)+';')
+        end()
+        return
     if mode == 'overflow':
         progress('report', reply='Ω'*200)
         message = receive()
@@ -163,8 +167,8 @@ async def _running(tmp_path: Path, config: JsonObject) -> AsyncIterator[NativeCl
 
 
 async def _turn(client: NativeClient, text: str = 'fresh text', *, event_bytes: int = 100_000,
-                event_count: int = 1000, response_bytes: int = 100_000) -> NativeTerminal:
-    return await client.run_turn('logical', text, 5, event_bytes, event_count, response_bytes)
+                response_bytes: int = 100_000) -> NativeTerminal:
+    return await client.run_turn('logical', text, 5, event_bytes, response_bytes)
 
 
 def _requests(tmp_path: Path) -> list[JsonObject]:
@@ -364,15 +368,26 @@ async def test_early_native_end_waits_for_admitted_effect_and_callback_reply(tmp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('limits', [{'event_bytes':150}, {'event_count':1}, {'response_bytes':10}])
+async def test_many_small_progress_events_preserve_complete_response(tmp_path: Path) -> None:
+    """Chunking alone cannot terminate an otherwise bounded native response."""
+    async with _running(tmp_path, {'mode':'many-reports'}) as client:
+        result = await _turn(client, event_bytes=2_000_000)
+        assert isinstance(result, NativeCompleted)
+        assert result.observation.complete
+        assert len(result.observation.events) == 5002
+        assert result.observation.response_text == ''.join(str(index)+';' for index in range(5000))
+        assert result.observation.events[0].kind == 'native.progress.begin'
+        assert result.observation.events[-1].kind == 'native.progress.end'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('limits', [{'event_bytes':150}, {'response_bytes':10}])
 async def test_evidence_overflow_retains_bounded_prefix_and_requires_native_cancel(tmp_path: Path, limits: dict[str, int]) -> None:
     async with _running(tmp_path, {'mode':'overflow'}) as client:
         result = await _turn(client, event_bytes=limits.get('event_bytes', 100_000),
-                             event_count=limits.get('event_count', 1000),
                              response_bytes=limits.get('response_bytes', 100_000))
         assert isinstance(result, NativeCancelled)
         assert result.reason == 'evidence_limit' and not result.observation.complete
-        assert len(result.observation.events) <= limits.get('event_count', 1000)
         assert sum(len(event.payload_json.encode()) for event in result.observation.events) <= limits.get('event_bytes',100_000)
         assert len(result.observation.response_text.encode()) <= limits.get('response_bytes',100_000)
 

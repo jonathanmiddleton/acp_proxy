@@ -49,7 +49,6 @@ class _TraceNative(FakeNativeClient):
         *,
         timeout_s: float,
         event_byte_limit: int,
-        event_count_limit: int,
         response_byte_limit: int,
     ) -> NativeTerminal:
         self.prompted.append(logical_id)
@@ -59,7 +58,6 @@ class _TraceNative(FakeNativeClient):
             text,
             timeout_s=timeout_s,
             event_byte_limit=event_byte_limit,
-            event_count_limit=event_count_limit,
             response_byte_limit=response_byte_limit,
         )
 

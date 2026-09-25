@@ -103,12 +103,12 @@ def test_direct_requests_reject_coerced_protocol_major(
         CreateSessionRequest.model_validate(payload)
 
 
-@pytest.mark.parametrize("invalid_count", [True, 4096.0, "4096"])
-def test_direct_limits_reject_coerced_numeric_types(invalid_count: object) -> None:
+@pytest.mark.parametrize("invalid_bytes", [True, 4096.0, "4096"])
+def test_direct_limits_reject_coerced_numeric_types(invalid_bytes: object) -> None:
     """ADI-15: admission bounds cannot change meaning through coercion."""
 
     with pytest.raises(ValidationError):
-        DirectLimits.model_validate({"max_event_count": invalid_count})
+        DirectLimits.model_validate({"max_http_response_bytes": invalid_bytes})
 
 
 @given(stable=st.text(max_size=200), prompt=TEXT, contract=TEXT)

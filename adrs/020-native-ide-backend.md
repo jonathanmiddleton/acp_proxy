@@ -3,6 +3,10 @@
 **Status:** Accepted; implementation tracked in the [delivery plan](../docs/native-ide-implementation-plan.md)  
 **Date:** 2026-09-23
 
+> **Resource-bound refinement:** [ADR-021](021-byte-bounded-diagnostic-results.md)
+> removes per-turn event-count admission and governs byte-bounded evidence and
+> exact HTTP-result delivery. Other native-backend obligations remain unchanged.
+
 ## Context
 
 The installed Copilot language server exposes an IDE conversation interface

@@ -1,6 +1,6 @@
 [project]
 name = "meadow-bridge"
-version = "0.4.0"
+version = "0.4.1"
 description = "Authenticated Meadow integration with the GitHub Copilot native IDE interface"
 requires-python = ">=3.11"
 dependencies = [

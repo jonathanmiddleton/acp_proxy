@@ -118,6 +118,15 @@ event, session, operation and queue limits are negotiated at admission. Native
 terminal progress and matching RPC results must agree, and owned effects must
 settle, before an operation is reported complete.
 
+Ordered events have a 16 MiB serialized-payload budget per turn, without an
+event-count ceiling; response text remains bounded at 2,000,000 UTF-8 bytes.
+The separately advertised `max_http_response_bytes` defaults to 128 MiB and
+bounds the exact encoded HTTP body, including repeated diagnostic receipts.
+An oversized body returns `response_too_large` with the operation's actual
+state and byte counts. The complete ledger result remains intact and the
+operation is not replayed. Bridge 0.4.1 and its strict consumers must deploy
+together. See [ADR-021](adrs/021-byte-bounded-diagnostic-results.md).
+
 The proxy combines named candidates from running processes with a recursive
 search below the platform JetBrains data directory, rejects reported language-
 server versions below `MIN_COPILOT_LANGUAGE_SERVER_VERSION` in

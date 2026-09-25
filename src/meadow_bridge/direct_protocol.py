@@ -56,8 +56,8 @@ class DirectLimits(StrictModel):
     max_request_bytes: int = Field(default=1_000_000, ge=1)
     max_prompt_bytes: int = Field(default=500_000, ge=1)
     max_response_bytes: int = Field(default=2_000_000, ge=1)
-    max_event_bytes: int = Field(default=4_000_000, ge=1)
-    max_event_count: int = Field(default=4096, ge=1)
+    max_event_bytes: int = Field(default=16 * 1024 * 1024, ge=1)
+    max_http_response_bytes: int = Field(default=128 * 1024 * 1024, ge=4096)
     max_sessions: int = Field(
         default=64,
         ge=1,

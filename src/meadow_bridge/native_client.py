@@ -46,7 +46,6 @@ class _Turn:
     session: _Session
     token: str
     event_byte_limit: int
-    event_count_limit: int
     response_byte_limit: int
     request: PendingRequest | None = None
     begun: bool = False
@@ -217,15 +216,15 @@ class NativeClient:
         return session
 
     async def run_turn(self, logical_id: str, text: str, timeout_s: float,
-                       event_byte_limit: int, event_count_limit: int,
+                       event_byte_limit: int,
                        response_byte_limit: int) -> NativeTerminal:
         """Submit new text once, retaining correlation through effect settlement."""
         if not self.is_alive or self._active is not None:
             raise NativeProtocolError("Native prompts must be globally serialized")
-        if min(timeout_s, event_byte_limit, event_count_limit, response_byte_limit) <= 0:
+        if min(timeout_s, event_byte_limit, response_byte_limit) <= 0:
             raise ValueError("Native prompt limits must be positive")
         session = self._session(logical_id)
-        context = _Turn(session, str(uuid4()), event_byte_limit, event_count_limit, response_byte_limit)
+        context = _Turn(session, str(uuid4()), event_byte_limit, response_byte_limit)
         self._active = context
         common: JsonObject = {
             "workDoneToken": context.token, "chatMode": "Agent",
@@ -305,7 +304,7 @@ class NativeClient:
     def _retain(self, context: _Turn, kind: str, value: JsonObject) -> bool:
         encoded = json_text(value)
         size = len(encoded.encode("utf-8"))
-        if context.overflow or len(context.events) >= context.event_count_limit or context.event_bytes + size > context.event_byte_limit:
+        if context.overflow or context.event_bytes + size > context.event_byte_limit:
             context.overflow = True
             self._schedule_cancel(context)
             return False

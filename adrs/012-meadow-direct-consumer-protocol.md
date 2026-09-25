@@ -4,6 +4,10 @@
 > the ACP-specific transport, callback, binding, and wire provisions below.
 > Historical evidence is retained; consult ADR-020 for current ownership.
 
+> **Resource-bound supersession:** [ADR-021](021-byte-bounded-diagnostic-results.md)
+> replaces the cumulative per-turn event-count requirement with byte bounds and
+> an actual encoded HTTP-response limit. Historical clauses below remain evidence.
+
 **Status:** Accepted; out-of-prompt session-state retention partially
 superseded by [ADR-014](014-correlate-direct-session-state.md); pending-model
 integrity partially superseded by

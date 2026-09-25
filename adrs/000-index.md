@@ -36,3 +36,4 @@ See [GUIDE.md](GUIDE.md) for how and when to write ADRs.
 - [ADR-019: Meadow Bridge Product Identity](019-meadow-bridge-product-identity.md) — product naming retained; native v2 supersedes retained ACP wire clauses
 
 - [ADR-020: Native IDE backend and explicit workspace callbacks](020-native-ide-backend.md) — current v2 transport, stable logical sessions, noninteractive policy and observed effects
+- [ADR-021: Byte-bounded diagnostic results](021-byte-bounded-diagnostic-results.md) — byte-bounded ordered evidence and exact HTTP-result delivery without per-turn event-count cancellation

@@ -88,7 +88,6 @@ class NativeSessionClient(Protocol):
         *,
         timeout_s: float,
         event_byte_limit: int,
-        event_count_limit: int,
         response_byte_limit: int,
     ) -> NativeTerminal: ...
     async def cancel_session(self, logical_id: str) -> None: ...
@@ -499,7 +498,6 @@ class DirectService:
                         + self.limits.cancellation_grace_s
                         + 1,
                         event_byte_limit=self.limits.max_event_bytes,
-                        event_count_limit=self.limits.max_event_count,
                         response_byte_limit=self.limits.max_response_bytes,
                     )
                 )

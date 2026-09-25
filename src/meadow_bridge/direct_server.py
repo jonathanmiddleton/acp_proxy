@@ -13,16 +13,42 @@ from .direct_protocol import (
     PATH_SAFE_IDENTIFIER_PATTERN,
     CancelRequest,
     CreateSessionRequest,
+    OperationView,
     PromptRequest,
     RetireSessionRequest,
 )
 from .direct_service import DirectBusy, DirectGenerationMismatch, DirectService
+from .json_types import JsonObject
 from .direct_state import (
     DirectConflict,
     DirectLimitExceeded,
     DirectNotFound,
     DirectStateError,
 )
+
+
+def _bounded_response(
+    content: JsonObject,
+    *,
+    max_bytes: int,
+    status_code: int = 200,
+    operation: OperationView | None = None,
+) -> JSONResponse:
+    """Bound the exact body sent without changing an operation's settled result."""
+    response = JSONResponse(content=content, status_code=status_code)
+    actual_bytes = len(response.body)
+    if actual_bytes <= max_bytes:
+        return response
+    error: JsonObject = {
+        "code": "response_too_large",
+        "message": "encoded response exceeds negotiated byte limit",
+        "actual_bytes": actual_bytes,
+        "max_bytes": max_bytes,
+    }
+    if operation is not None:
+        error.update(operation_id=operation.operation_id, operation_state=operation.state)
+    # DirectLimits reserves at least 4096 bytes for this content-free error.
+    return JSONResponse(status_code=500, content={"error": error})
 
 
 def _error(status: int, code: str, message: str) -> JSONResponse:
@@ -45,6 +71,21 @@ def create_direct_app(service: DirectService) -> FastAPI:
         RequestBodyLimitMiddleware, max_bytes=service.limits.max_request_bytes
     )
 
+    def operation_response(view: OperationView, *, status_code: int = 200) -> JSONResponse:
+        return _bounded_response(
+            view.model_dump(mode="json"),
+            max_bytes=service.limits.max_http_response_bytes,
+            status_code=status_code,
+            operation=view,
+        )
+
+    def error_response(status: int, code: str, message: str) -> JSONResponse:
+        return _bounded_response(
+            {"error": {"code": code, "message": message}},
+            max_bytes=service.limits.max_http_response_bytes,
+            status_code=status,
+        )
+
     async def authenticate(
         authorization: str | None = Header(default=None),
     ) -> None:
@@ -57,46 +98,50 @@ def create_direct_app(service: DirectService) -> FastAPI:
     async def authentication_error(
         _request: Request, _exc: DirectAuthenticationError
     ) -> JSONResponse:
-        return _error(401, "unauthorized", "authentication required")
+        return error_response(401, "unauthorized", "authentication required")
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(
         _request: Request, _exc: RequestValidationError
     ) -> JSONResponse:
-        return _error(422, "invalid_direct_request", "request does not match the strict direct schema")
+        return error_response(422, "invalid_direct_request", "request does not match the strict direct schema")
 
     @app.exception_handler(DirectStateError)
     async def state_error(_request: Request, exc: DirectStateError) -> JSONResponse:
         if isinstance(exc, DirectNotFound):
-            return _error(404, "not_found", str(exc))
+            return error_response(404, "not_found", str(exc))
         if isinstance(exc, DirectLimitExceeded):
-            return _error(429, "resource_limit", str(exc))
+            return error_response(429, "resource_limit", str(exc))
         if isinstance(exc, DirectBusy):
-            return _error(409, "session_busy", str(exc))
+            return error_response(409, "session_busy", str(exc))
         if isinstance(exc, DirectGenerationMismatch):
-            return _error(409, "generation_or_protocol_mismatch", str(exc))
+            return error_response(409, "generation_or_protocol_mismatch", str(exc))
         if isinstance(exc, DirectConflict):
-            return _error(409, "conflict", str(exc))
-        return _error(400, "direct_protocol_error", str(exc))
+            return error_response(409, "conflict", str(exc))
+        return error_response(400, "direct_protocol_error", str(exc))
 
     @app.get("/health")
     async def health() -> JSONResponse:
-        return JSONResponse(
+        return _bounded_response(
             {
                 "status": "ok",
                 "protocol_major": 2,
-            }
+            },
+            max_bytes=service.limits.max_http_response_bytes,
         )
 
     @app.get("/meadow/v2/capabilities", dependencies=[Depends(authenticate)])
     async def capabilities() -> JSONResponse:
-        return JSONResponse(service.capabilities.model_dump(mode="json"))
+        return _bounded_response(
+            service.capabilities.model_dump(mode="json"),
+            max_bytes=service.limits.max_http_response_bytes,
+        )
 
     @app.post("/meadow/v2/sessions", dependencies=[Depends(authenticate)])
     async def create_session(request: CreateSessionRequest) -> JSONResponse:
         record, _ = await service.admit_create(request)
         view = await service.wait_for_operation(record)
-        return JSONResponse(view.model_dump(mode="json"))
+        return operation_response(view)
 
     @app.post(
         "/meadow/v2/sessions/{logical_session_id}/requests",
@@ -112,7 +157,7 @@ def create_direct_app(service: DirectService) -> FastAPI:
     ) -> JSONResponse:
         record, _ = await service.admit_prompt(logical_session_id, request)
         view = await service.wait_for_operation(record)
-        return JSONResponse(view.model_dump(mode="json"))
+        return operation_response(view)
 
     @app.get(
         "/meadow/v2/operations/{operation_id}",
@@ -138,7 +183,7 @@ def create_direct_app(service: DirectService) -> FastAPI:
                 generation_id=continuity_generation_id,
             )
         )
-        return JSONResponse(view.model_dump(mode="json"))
+        return operation_response(view)
 
     @app.post(
         "/meadow/v2/operations/{target_operation_id}/cancel",
@@ -156,7 +201,7 @@ def create_direct_app(service: DirectService) -> FastAPI:
             raise DirectConflict("cancel path and target_operation_id disagree")
         record, _ = await service.admit_cancel(request)
         view = await service.wait_for_operation(record)
-        return JSONResponse(view.model_dump(mode="json"))
+        return operation_response(view)
 
     @app.post(
         "/meadow/v2/sessions/{logical_session_id}/retire",
@@ -175,7 +220,7 @@ def create_direct_app(service: DirectService) -> FastAPI:
         record, _ = await service.admit_retire(request)
         view = await service.wait_for_operation(record)
         status = 200 if view.state == "completed" else 409
-        return JSONResponse(view.model_dump(mode="json"), status_code=status)
+        return operation_response(view, status_code=status)
 
     return app
 

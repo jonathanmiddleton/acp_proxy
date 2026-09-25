@@ -80,6 +80,7 @@ rows retain evidence only; the listed superseding ADR governs current behavior.
 | [ADR-018](adrs/018-remove-openai-compatible-adapter.md) | Remove the deprecated adapter and consumer-mode selector; native backend governed by ADR-020 |
 | [ADR-019](adrs/019-meadow-bridge-product-identity.md) | Meadow Bridge identity; retained ACP wire clauses superseded by ADR-020 |
 | [ADR-020](adrs/020-native-ide-backend.md) | Current native IDE transport, direct v2, workspace callbacks and explicit policy |
+| [ADR-021](adrs/021-byte-bounded-diagnostic-results.md) | Byte-bounded diagnostic evidence and actual encoded HTTP-result delivery |
 
 The ADRs explain the *why* behind the module ownership rules in the table
 above. A change that contradicts an accepted ADR requires a new ADR

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import hashlib
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 from starlette.types import Message, Scope, Receive, Send
 from httpx import ASGITransport, AsyncClient
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
@@ -37,11 +39,12 @@ from meadow_bridge.direct_protocol import (
     CancelRequest,
     CreateSessionRequest,
     DirectLimits,
+    OperationView,
     PromptRequest,
     PromptResult,
     RetireSessionRequest,
 )
-from meadow_bridge.direct_server import RequestBodyLimitMiddleware, create_direct_app
+from meadow_bridge.direct_server import RequestBodyLimitMiddleware, _bounded_response, create_direct_app
 from meadow_bridge.direct_service import DirectGenerationMismatch, DirectService
 from meadow_bridge.direct_state import DirectConflict, DirectLimitExceeded
 
@@ -52,7 +55,7 @@ class FakeNativeClient:
     """Typed native boundary double; lifecycle and reconciliation remain production code."""
 
     def __init__(self) -> None:
-        self.models = (NativeModel("gpt-5.3-codex", "GPT-5.3 Codex"),)
+        self.models: tuple[NativeModel, ...] = (NativeModel("gpt-5.3-codex", "GPT-5.3 Codex"),)
         self.server_info = NativeServerInfo("fake-copilot", "1.0")
         self.created: list[tuple[str, str]] = []
         self.bindings: dict[str, NativeBinding] = {}
@@ -100,7 +103,6 @@ class FakeNativeClient:
         *,
         timeout_s: float,
         event_byte_limit: int,
-        event_count_limit: int,
         response_byte_limit: int,
     ) -> NativeTerminal:
         binding = self.bindings[logical_id]
@@ -530,6 +532,126 @@ async def test_permission_outcome_is_request_scoped_ordered_evidence(
         "events": [result["events"][0]],
         "decisions": [],
     }
+
+
+@pytest.mark.asyncio
+async def test_long_admission_diagnostic_uses_negotiated_response_budget(tmp_path: Path) -> None:
+    """The reserved overflow-error size is not a second diagnostic cutoff."""
+    fake = FakeNativeClient()
+    fake.models = tuple(NativeModel(f"model-{index:04d}", "Model") for index in range(500))
+    service = DirectService(
+        fake, cwd=str(tmp_path), launch_secret=TOKEN, execution_authority="trusted-host",
+        limits=DirectLimits(max_http_response_bytes=16384),
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=create_direct_app(service)), base_url="http://direct.test"
+    ) as client:
+        response = await client.post(
+            "/meadow/v2/sessions", headers=_auth(),
+            json=_create_body(service, operation="create", session="session"),
+        )
+    assert 4096 < len(response.content) <= 16384
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "conflict"
+    assert "model-0000" in response.json()["error"]["message"]
+    assert "model-0499" in response.json()["error"]["message"]
+    assert fake.created == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("http_limit", [8192, 65536])
+async def test_http_limit_counts_complete_encoded_receipts_without_changing_settlement(
+    tmp_path: Path, http_limit: int,
+) -> None:
+    """Delivery bounds include every receipt copy and leave execution replay-safe."""
+    receipt: JsonObject = {"stdout": "Ω\"\\" * 1000}
+
+    class ReceiptClient(FakeNativeClient):
+        async def run_turn(
+            self, logical_id: str, text: str, *, timeout_s: float,
+            event_byte_limit: int, response_byte_limit: int,
+        ) -> NativeTerminal:
+            terminal = await super().run_turn(
+                logical_id, text, timeout_s=timeout_s,
+                event_byte_limit=event_byte_limit, response_byte_limit=response_byte_limit,
+            )
+            return NativeCompleted(replace(
+                terminal.observation,
+                events=(NativeEvent("native.client_tool.result", json_text({
+                    "toolCallId": "tool", "result": receipt,
+                })),),
+                tools=(NativeToolObservation("tool", "workspace_run_command", "completed", "bridge"),),
+                effects=(NativeEffectObservation("tool", json_text(receipt)),),
+            ))
+
+    fake = ReceiptClient()
+    service = DirectService(
+        fake, cwd=str(tmp_path), launch_secret=TOKEN, execution_authority="trusted-host",
+        limits=DirectLimits(max_http_response_bytes=http_limit),
+    )
+    await _settle_creation(service, "create", "session")
+    request = _prompt_body(service, operation="prompt", invocation="invocation")
+    async with AsyncClient(
+        transport=ASGITransport(app=create_direct_app(service)), base_url="http://direct.test"
+    ) as client:
+        response = await client.post(
+            "/meadow/v2/sessions/session/requests", json=request, headers=_auth(),
+        )
+        record = service.operation(
+            "prompt", protocol_major=2, generation_id=service.continuity_generation_id,
+        )
+        view = service.operation_view(record)
+        encoded = JSONResponse(view.model_dump(mode="json")).body
+        replay = await client.post(
+            "/meadow/v2/sessions/session/requests", json=request, headers=_auth(),
+        )
+        status = await client.get(
+            "/meadow/v2/operations/prompt", headers=_auth(),
+            params={"protocol_major": 2, "continuity_generation_id": service.continuity_generation_id},
+        )
+    assert view.state == "completed"
+    retained = PromptResult.model_validate(view.result)
+    assert retained.effects[0].receipt == receipt
+    assert retained.events[0].raw == {"toolCallId": "tool", "result": receipt}
+    assert retained.tool_evidence.events == retained.effect_events == retained.events
+    assert len(fake.prompts) == 1
+    assert response.content == replay.content == status.content
+    assert len(response.content) <= http_limit
+    if len(encoded) <= http_limit:
+        assert response.status_code == 200
+        assert response.content == encoded
+    else:
+        assert response.status_code == 500
+        assert response.json()["error"] == {
+            "code": "response_too_large",
+            "message": "encoded response exceeds negotiated byte limit",
+            "operation_id": "prompt",
+            "operation_state": "completed",
+            "actual_bytes": len(encoded),
+            "max_bytes": http_limit,
+        }
+
+
+@pytest.mark.parametrize("headroom", [-1, 0])
+def test_http_boundary_uses_exact_bytes_for_failed_operation_envelope(headroom: int) -> None:
+    """An existing non-success status is retained only when its entire body fits."""
+    view = OperationView(
+        operation_id="retire", kind="retire_session", state="failed",
+        error={"code": "retirement_failed", "detail": "Ω\"\\" * 1000},
+    )
+    content = view.model_dump(mode="json")
+    encoded = JSONResponse(content, status_code=409).body
+    limit = len(encoded) + headroom
+    response = _bounded_response(
+        content, max_bytes=limit, status_code=409, operation=view,
+    )
+    assert len(response.body) <= limit
+    assert JSONResponse(view.model_dump(mode="json"), status_code=409).body == encoded
+    if headroom == 0:
+        assert response.status_code == 409
+        assert response.body == encoded
+    else:
+        assert response.status_code == 500
 
 
 @pytest.mark.asyncio
@@ -1540,7 +1662,6 @@ async def test_first_turn_cancellation_before_binding_uses_logical_identity(
             *,
             timeout_s: float,
             event_byte_limit: int,
-            event_count_limit: int,
             response_byte_limit: int,
         ) -> NativeTerminal:
             self.prompts.append((logical_id, text))
@@ -1711,7 +1832,6 @@ async def test_uncertain_turn_preserves_native_observations(
             *,
             timeout_s: float,
             event_byte_limit: int,
-            event_count_limit: int,
             response_byte_limit: int,
         ) -> NativeTerminal:
             prior = self.binding(logical_id)
